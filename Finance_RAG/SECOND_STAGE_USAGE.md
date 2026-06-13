@@ -2,16 +2,25 @@
 
 ## 环境
 
-虚拟环境位置：
+当前主开发环境：
 
-```powershell
-D:\git-repository\Agent\.venv
+```bash
+/home/pjx/miniconda3/envs/FinAgent
 ```
 
-建议直接使用解释器路径运行，避免 PowerShell 激活脚本策略问题：
+建议在 WSL2 中运行：
 
-```powershell
-D:\git-repository\Agent\.venv\Scripts\python.exe -B -c "from Finance_RAG import rag; print('ok')"
+```bash
+cd /home/pjx/git-repository/Agent
+conda activate FinAgent
+python -B -c "from Finance_RAG import rag; print('ok')"
+```
+
+当前已验证：
+
+```text
+faiss-gpu 1.14.3: GPU API 可用，get_num_gpus() == 1
+torch 2.11.0+cu128: torch.cuda.is_available() == True
 ```
 
 ## Embedding Provider
@@ -22,8 +31,8 @@ D:\git-repository\Agent\.venv\Scripts\python.exe -B -c "from Finance_RAG import 
 
 只用于 smoke test，不具备语义召回能力。
 
-```powershell
-$env:FINANCE_RAG_EMBEDDING_PROVIDER="mock"
+```bash
+export FINANCE_RAG_EMBEDDING_PROVIDER="mock"
 ```
 
 也可以在调用时传：
@@ -36,12 +45,12 @@ update_docs([...], embed_model="mock")
 
 推荐用于第一版真实 RAG。
 
-```powershell
-$env:DASHSCOPE_API_KEY="sk-..."
-$env:FINANCE_RAG_EMBEDDING_PROVIDER="dashscope"
-$env:FINANCE_RAG_EMBEDDING_MODEL="text-embedding-v4"
-$env:FINANCE_RAG_EMBEDDING_DIMENSIONS="1024"
-$env:FINANCE_RAG_EMBEDDING_BATCH_SIZE="10"
+```bash
+export DASHSCOPE_API_KEY="sk-..."
+export FINANCE_RAG_EMBEDDING_PROVIDER="dashscope"
+export FINANCE_RAG_EMBEDDING_MODEL="text-embedding-v4"
+export FINANCE_RAG_EMBEDDING_DIMENSIONS="1024"
+export FINANCE_RAG_EMBEDDING_BATCH_SIZE="10"
 ```
 
 官方 OpenAI 兼容 base URL：
@@ -54,20 +63,27 @@ https://dashscope.aliyuncs.com/compatible-mode/v1
 
 Mock + FAISS：
 
-```powershell
-D:\git-repository\Agent\.venv\Scripts\python.exe -B -c "from Finance_RAG.rag import update_docs, retrieve_documents; f='1Q26汽车电子收入预计同比翻倍，海外IDM布局渐完整.pdf'; print(update_docs([f], exp_name='smoke_stage2_mock', embed_model='mock')); print(len(retrieve_documents('汽车电子业务增长情况如何？', exp_name='smoke_stage2_mock', embed_model='mock', top_k=3)))"
+```bash
+python -B -c "from Finance_RAG.rag import update_docs, retrieve_documents; f='1Q26汽车电子收入预计同比翻倍，海外IDM布局渐完整.pdf'; print(update_docs([f], exp_name='smoke_stage2_mock', embed_model='mock')); print(len(retrieve_documents('汽车电子业务增长情况如何？', exp_name='smoke_stage2_mock', embed_model='mock', top_k=3)))"
+```
+
+如需强制使用 FAISS GPU：
+
+```bash
+export FINANCE_RAG_FAISS_DEVICE="gpu"
+export FINANCE_RAG_FAISS_GPU_ID="0"
 ```
 
 真实百炼 embedding：
 
-```powershell
-$env:DASHSCOPE_API_KEY="sk-..."
-$env:FINANCE_RAG_EMBEDDING_PROVIDER="dashscope"
-D:\git-repository\Agent\.venv\Scripts\python.exe -B -c "from Finance_RAG.rag import update_docs, retrieve_documents; f='1Q26汽车电子收入预计同比翻倍，海外IDM布局渐完整.pdf'; print(update_docs([f], exp_name='dashscope_v4_1024_test')); print(len(retrieve_documents('汽车电子业务增长情况如何？', exp_name='dashscope_v4_1024_test', top_k=3)))"
+```bash
+export DASHSCOPE_API_KEY="sk-..."
+export FINANCE_RAG_EMBEDDING_PROVIDER="dashscope"
+python -B -c "from Finance_RAG.rag import update_docs, retrieve_documents; f='1Q26汽车电子收入预计同比翻倍，海外IDM布局渐完整.pdf'; print(update_docs([f], exp_name='dashscope_v4_1024_test')); print(len(retrieve_documents('汽车电子业务增长情况如何？', exp_name='dashscope_v4_1024_test', top_k=3)))"
 ```
 
 ## 注意
 
 - `text-embedding-v4` 批次大小上限为 10，代码默认按 10 分批。
 - 新建 FAISS 索引时，如果配置了 `FINANCE_RAG_EMBEDDING_DIMENSIONS`，不会为了探测维度额外调用一次 embedding API。
-- Windows 下当前使用 `faiss-cpu`；embedding 主线走百炼 API。
+- 当前 WSL2 `FinAgent` 已支持 `faiss-gpu`；代码默认 device 仍为 `cpu`，需要通过 `FINANCE_RAG_FAISS_DEVICE=gpu` 显式启用。

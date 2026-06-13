@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+.env
+.env.*
+!*.env.example
+
+Finance_RAG/Data/logs/
+Finance_RAG/Data/knowledge_base/info.db
+Finance_RAG/Data/knowledge_base/*/content/
+Finance_RAG/Data/knowledge_base/*/raw_resolve/
+Finance_RAG/Data/knowledge_base/*/vector_store/

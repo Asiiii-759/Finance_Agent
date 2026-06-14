@@ -10,6 +10,7 @@ import sys
 sys.path.append("..") 
 from Finance_RAG.utils import build_logger
 from Finance_RAG.settings import Settings
+from Finance_RAG.schemas.metadata import FinanceMetadataExtractor
 
 logger = build_logger()
 
@@ -78,6 +79,7 @@ class StructuredDocumentBuilder:
     def __init__(self):
         self.detector = DocumentDetector()
         self.parser = VisionLayoutParser()
+        self.metadata_extractor = FinanceMetadataExtractor()
         self.ignore_labels = {"header_image", "header", "footer_image", "footer", "number", "aside_text","doc_title"}
         self.noise_patterns = [
             re.compile(r"^[\u4e00-\u9fa5]{0,4}(?:分析师|研究员|联系人)[：:\s]+[\u4e00-\u9fa5]{2,4}"),
@@ -148,13 +150,17 @@ class StructuredDocumentBuilder:
             return {}
         global_meta = self._extract_global_meta(raw_pages)
         global_meta["file_name"] = file_name
+        global_meta["parser_name"] = "local_paddleocr_vl"
+        global_meta["parser_version"] = "PaddleOCR-VL-1.5"
+        global_meta["parse_status"] = "parsed"
         cleaned_blocks = self._clean_and_preserve_pages(raw_pages)
         grouped_blocks = self._reorder_and_group(cleaned_blocks)
-        
-        return {
+
+        data = {
             "document_info": global_meta,
-            "parsed_blocks": grouped_blocks
+            "parsed_blocks": grouped_blocks,
         }
+        return self.metadata_extractor.enrich_legacy_document(data)
 
     def _extract_global_meta(self, raw_pages: List[Dict[str, Any]]) -> Dict[str, Any]:
         """提取全局信息"""

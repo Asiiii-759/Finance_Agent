@@ -82,18 +82,25 @@ def _parse_pdf_to_json(kb_file: KnowledgeFile) -> bool:
     """
     JSON 缺失时才触发 PDF 解析。
 
-    这里懒加载 PaddleOCR 相关依赖，避免本地没有 OCR/vLLM 环境时连导入 RAG 模块都失败。
+    这里懒加载解析 provider，避免本地没有 OCR/vLLM 或 API token 时连导入 RAG 模块都失败。
     """
+    parser_provider = os.getenv("FINANCE_RAG_PARSER_PROVIDER", "local_paddleocr").strip().lower()
     try:
-        from Finance_RAG.parser_chunk_search.pdf_parser import StructuredDocumentBuilder
+        if parser_provider in {"paddleocr_api", "api", "paddle_api"}:
+            from Finance_RAG.parsers.paddle_ocr_api import PaddleOcrApiParser
+
+            parser = PaddleOcrApiParser()
+        else:
+            from Finance_RAG.parser_chunk_search.pdf_parser import StructuredDocumentBuilder
+
+            parser = StructuredDocumentBuilder()
     except Exception as exc:
         raise RuntimeError(
             "解析 JSON 不存在，且当前环境无法加载 PDF 解析器。"
-            "请先提供 raw_resolve 中的同名 JSON，或安装/配置 OCR 解析依赖。"
+            "请先提供 raw_resolve 中的同名 JSON，或安装/配置 OCR 解析依赖/API token。"
         ) from exc
 
-    builder = StructuredDocumentBuilder()
-    parsed_data = builder.parse_pdf(kb_file.filepath, save_json=True)
+    parsed_data = parser.parse_pdf(kb_file.filepath, save_json=True)
     return bool(parsed_data)
 
 

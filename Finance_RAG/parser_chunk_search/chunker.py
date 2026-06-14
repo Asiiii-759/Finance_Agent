@@ -380,14 +380,22 @@ class BaseBlockSplitter:
 
         self._base_meta = {
             "doc_source": doc_info.get("doc_source", "") if doc_info.get("doc_source", "") != "未知机构" else "",
-            "file_name": doc_info.get("file_name", "")
+            "file_name": doc_info.get("file_name", ""),
+            "parser_name": doc_info.get("parser_name", ""),
+            "parser_version": doc_info.get("parser_version", ""),
+            "parse_status": doc_info.get("parse_status", ""),
+            "document_title": doc_info.get("document_title"),
+            "document_date": doc_info.get("document_date"),
+            "publish_date": doc_info.get("publish_date"),
+            "report_type": doc_info.get("report_type", "unknown"),
+            "metadata_extraction": doc_info.get("metadata_extraction", {}),
         }
         
         final_chunks = []
         global_chunk_id = 0
         
-        grouped_blocks = groupby(parsed_blocks, key=lambda b: b.get("block_label"))
-        for label, group_iter in grouped_blocks:
+        grouped_blocks = groupby(parsed_blocks, key=lambda b: (b.get("block_label"), b.get("paragraph_title", "")))
+        for (label, paragraph_title), group_iter in grouped_blocks:
             group = list(group_iter)
             if label == "text":
                 group_start = group[0].get("global_start", 0)
@@ -401,7 +409,8 @@ class BaseBlockSplitter:
                         part_index=0,
                         global_start=coord[0],
                         global_end=coord[1],
-                        note=""
+                        note="",
+                        paragraph_title=paragraph_title,
                         ))
                     global_chunk_id += 1
             elif label == "table&chart":
@@ -418,12 +427,23 @@ class BaseBlockSplitter:
                             part_index=index + 1,
                             global_start=coord[0],
                             global_end=coord[1],
-                            note=note
+                            note=note,
+                            paragraph_title=block.get("paragraph_title", ""),
                         ))
                     global_chunk_id += 1
         return final_chunks
 
-    def _format_chunk(self, content: str, label: str, chunk_id: int, part_index: int, global_start: int, global_end: int, note: str) -> Dict:
+    def _format_chunk(
+        self,
+        content: str,
+        label: str,
+        chunk_id: int,
+        part_index: int,
+        global_start: int,
+        global_end: int,
+        note: str,
+        paragraph_title: str = "",
+    ) -> Dict:
         """组装最终字典，保证每个 chunk 都有完全一致的 metadata 结构"""
         return {
             "metadata": {
@@ -433,7 +453,8 @@ class BaseBlockSplitter:
                 "label": label,
                 "global_start": global_start,
                 "global_end": global_end,
-                "note": note
+                "note": note,
+                "paragraph_title": paragraph_title,
             },
             "content": content
         }
@@ -614,8 +635,9 @@ class KnowledgeFile:
     def file2docs(self, refresh: bool = False) -> Dict:
         """只负责把文件读进内存"""
         if self.docs is None or refresh:
-            with open(self.jsonPath, "r", encoding="utf-8") as f:
-                self.docs = json.load(f)
+            from Finance_RAG.parsers.resolved_json import ResolvedJsonParser
+
+            self.docs = ResolvedJsonParser(enrich_metadata=True).parse_json(self.jsonPath)
         return self.docs
 
     def docs2texts(

@@ -8,4 +8,5 @@ jieba>=0.42.1
 rank-bm25>=0.2.2
 sentencepiece>=0.2.0
 PyMuPDF>=1.24.0
+requests>=2.32.0
 tqdm>=4.66.0

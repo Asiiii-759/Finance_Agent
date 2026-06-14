@@ -263,6 +263,47 @@ PaddleOCR API 校准流程：
 4. 对比已有 `raw_resolve` JSON，确认 `global_start/global_end`、页码、段落标题、表格文本是否可稳定生成。
 5. 只在 converter 稳定后，再考虑批量重新解析。
 
+当前校准脚本：
+
+```bash
+cd /home/pjx/git-repository/Agent
+conda activate FinAgent
+export PADDLEOCR_API_TOKEN="..."
+
+# 不传 PDF 时，会默认选择 content 目录里体积最小的 2 个 PDF。
+python -m Finance_RAG.calibration.paddle_ocr_probe --limit 2
+
+# 也可以显式指定 1-2 个代表性 PDF。
+python -m Finance_RAG.calibration.paddle_ocr_probe \
+  "Finance_RAG/Data/knowledge_base/Finance/content/商业航天行业点评：SpaceX百万颗算力卫星申请，太空光伏、激光通信产业迎来新机遇.pdf"
+```
+
+输出位置：`Finance_RAG/Data/calibration/paddleocr_api/`，该目录已加入 `.gitignore`。
+
+每个 PDF 会保存：
+- `raw.jsonl`：PaddleOCR API 原始 JSONL 返回。
+- `legacy.json`：转换到当前 chunker 可消费的结构。
+- `summary.json`：不含正文全文的结构摘要，包括 `document_info` key、块标签分布、前几个块的形状、metadata 候选和 warning。
+
+当前代码落地状态：
+- 已新增 `Finance_RAG/schemas/document.py`，提供 `ParsedDocument / ParsedBlock / DocumentParser` 抽象，旧 JSON 和新 parser 都先转换到兼容 chunker 的结构化文档。
+- 已新增 `Finance_RAG/schemas/metadata.py`，提供 `FinanceMetadataExtractor / MetadataCandidate / MetadataExtractionReport`。
+- 已新增顶层 `Finance_RAG/parsers/`，其中 `ResolvedJsonParser` 读取现有 `raw_resolve` JSON 并补充 metadata 抽取报告，`PaddleOcrApiParser` 负责 PaddleOCR API。
+- 已新增 `Finance_RAG/calibration/paddle_ocr_probe.py`，用于 1-2 个 PDF 的真实 API 小样本校准。
+- `Finance_RAG/document.py`、`Finance_RAG/metadata_extractor.py`、`Finance_RAG/parser_chunk_search/parsers/*` 只保留兼容入口，后续新代码优先使用 `schemas/` 和 `parsers/`。
+- 缺 JSON 时可通过 `FINANCE_RAG_PARSER_PROVIDER=paddleocr_api` 调用 API；token 只从 `PADDLEOCR_API_TOKEN` 读取。
+- `FinanceMetadataExtractor` 只输出候选实体、证据和置信度，不把公司、行业、作者等字段强行当作确定事实。
+- chunk metadata 已开始携带 `document_title / document_date / publish_date / report_type / metadata_extraction`，便于后续检索结果和评估使用。
+
+因此最终 `DocumentMetadata / RetrievedChunk / RetrievalResult` 先不继续固化。下一步应先用 4-5 份 PDF 校准 PaddleOCR API 和规则抽取结果，再根据“实际能稳定得到的字段”收敛 schema。
+
+已用少量现有 `raw_resolve` JSON 做结构摘要校准，结论如下：
+- 旧 JSON 的 `document_info` 通常只有 `doc_source / doc_title / file_name`，日期、作者、公司、行业不是稳定字段。
+- `doc_source` 可能被 OCR 识别成错误句子，例如英文的模糊图片提示，因此机构只能作为候选并需要过滤。
+- `doc_title` 可能是 `未命名文档`，也可能缺失；此时应回退到文件名，不应回退到图表标题。
+- 文件名里可能包含 `94.8%` 这类小数，不能用普通 `Path.stem` 盲目截断，只能剥离明确的文件扩展名。
+- 行业关键词目前只适合作为低置信候选，不能用于硬过滤；股票代码可作为 `company_or_security` 候选，但不等于主公司。
+
 ### Tool Layer
 
 后续 agent 应只调用工具层：
@@ -307,11 +348,13 @@ python -B -m unittest discover -s Finance_RAG/tests -v
 
 下一步优先级：
 
-1. 在代码中落地 `EntityCandidate / DocumentMetadata / ChunkMetadata / RetrievedChunk / RetrievalResult / RetrievalTrace`。
-2. 用稳定 schema 包装当前 `retrieve_documents(...)` 返回值，短期保留旧 dict 结果兼容。
-3. 封装 `FinanceRAGTool.search(...)`，供后续 agent 直接调用。
-4. 将 `qwen3-rerank` 接入统一检索入口；当前已有独立 `rerank_documents(...)`，但 `retrieve_documents(...)` 尚未内置 rerank 开关。
-5. 用真实百炼 embedding 跑 2-3 篇文档的小规模入库。
-6. 构造最小评测集：`question + gold_spans`，并用 `evaluation.py` 跑 `coverage@k / iou@k / hit@k`。
+1. 用 4-5 份代表性 PDF 跑 `PaddleOcrApiParser`，保存并检查 API 原始返回和转换后的 legacy JSON。
+2. 对比 `FinanceMetadataExtractor` 的候选实体、证据和置信度，调整规则，删掉无法稳定获得的理想字段。
+3. 根据校准结果再落地 `DocumentMetadata / ChunkMetadata / RetrievedChunk / RetrievalResult / RetrievalTrace`。
+4. 用稳定 schema 包装当前 `retrieve_documents(...)` 返回值，短期保留旧 dict 结果兼容。
+5. 封装 `FinanceRAGTool.search(...)`，供后续 agent 直接调用。
+6. 将 `qwen3-rerank` 接入统一检索入口；当前已有独立 `rerank_documents(...)`，但 `retrieve_documents(...)` 尚未内置 rerank 开关。
+7. 用真实百炼 embedding 跑 2-3 篇文档的小规模入库。
+8. 构造最小评测集：`question + gold_spans`，并用 `evaluation.py` 跑 `coverage@k / iou@k / hit@k`。
 
 Milvus 暂不在当前阶段实现。后续如需要规模化，再按 `VectorStore` 接口新增 Milvus 后端。

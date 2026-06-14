@@ -135,6 +135,157 @@ query
 Finance_RAG/evaluation.py
 ```
 
+## Agentic RAG 扩展规划
+
+当前模块应继续保持为 RAG Core：负责文档解析、切块、入库、检索、rerank 和评估。后续 agentic RAG 不应直接耦合 `KBService`、`NativeFAISS` 或 chunker 内部字段，而应通过稳定工具层接入。
+
+推荐分层：
+
+```text
+RAG Core
+  parser -> chunker -> indexer -> retriever -> reranker -> evaluator
+
+RAG Tool Layer
+  FinanceRAGTool.search(...) -> RetrievalResult
+  citation / evidence formatting
+  stable JSON schema for agent
+
+Agentic RAG Orchestrator
+  query rewrite
+  multi-query retrieval
+  query decomposition
+  retrieval self-check
+  answer grounding check
+  retry / broaden / narrow retrieval
+```
+
+原则：
+- agent 只能依赖稳定工具接口，不直接依赖底层向量库、切块器或 SQLite repository。
+- agentic 策略作为编排层新增，不塞进 RAG Core。
+- 每次确认采用新的检索策略、metadata 策略或 parser provider 后，必须同步更新本文档。
+
+### 渐进式 Schema
+
+当前已有 `raw_resolve` JSON 信息不完整，因此 schema 不能设计成“所有字段都必须拿到”。下一阶段采用渐进式 schema：核心字段必须稳定，增强字段允许为空或候选化。
+
+第一版必须落地：
+
+```text
+DocumentMetadata
+  doc_id, kb_name, source_type, source_uri
+  file_name, file_ext, file_size, file_mtime, imported_at, content_hash
+  parser_name, parser_version, parse_status
+  document_title?, document_date?, publish_date?, report_type?
+
+ChunkMetadata
+  chunk_id, doc_id, kb_name, file_name, source_type, content_type
+  source_page?, block_label?, paragraph_title?
+  global_start, global_end
+
+RetrievedChunk
+  id, content, metadata, rank, score, scores
+
+RetrievalResult
+  query, chunks, filters, top_k, rerank_model?, trace?
+```
+
+第二阶段再补充候选实体：
+
+```text
+EntityCandidate
+  name, normalized_name?, entity_type, code?, market?
+  confidence, evidence, evidence_span?
+
+DocumentMetadata extras
+  organization?, authors?, companies[], industries[], tickers[], tags[]
+```
+
+原则：
+- `?` 字段允许为空，`[]` 字段允许为空列表。
+- 公司、行业、股票代码只作为候选实体，不作为强事实字段。
+- 每个候选实体必须带 `confidence` 和 `evidence`。
+- `scores` 支持 `vector / bm25 / rrf / rerank / final` 等多路分数，避免后续融合策略变化时破坏接口。
+
+### 金融研报 Metadata 策略
+
+金融研报不能假设一定对应单一公司。公司、股票代码、行业、发布机构都应作为候选实体保存，而不是强行写成单值字段。
+
+第一版不依赖额外 LLM 校验，先用规则和证据来源做保守抽取：
+- 文件名、文档标题、首页/封面、段落标题、正文高频实体、股票代码模式、表格标题都可以作为候选来源。
+- `evidence` 记录候选实体来自哪里，例如 `filename/title/cover/body_frequency/ticker_regex/parser_json/manual`。
+- `confidence` 根据来源组合粗略打分，例如标题命中高于正文高频，股票代码命中高于普通公司名命中。
+- `report_type` 允许 `company / industry / macro / strategy / thematic / unknown`，行业研报可以没有主公司。
+- 高置信候选可用于过滤；低置信候选只参与 rerank、提示或 trace，不作为硬过滤条件。
+
+时间字段分层：
+- `file_mtime`：本地文件修改时间，只代表文件状态。
+- `imported_at`：进入知识库的时间。
+- `document_date`：文档内部出现的日期，例如封面报告日期。
+- `publish_date`：发布机构声明的发布日期；无法可靠解析则为空。
+
+agent 和评估应优先使用 `document_date/publish_date`，不要把 `file_mtime` 误当研报发布时间。
+
+### 文档解析 Provider
+
+当前 PDF 解析优先复用 `raw_resolve` JSON，JSON 缺失时才调用外部解析。后续应抽象 parser provider，避免 OCR API、Word、Excel 等新来源挤进当前 PDF parser。
+
+建议接口：
+
+```text
+DocumentSource
+  source_type, uri, file_name, metadata_hint
+
+DocumentParserProvider
+  supports(source) -> bool
+  parse(source) -> ParsedDocument
+
+ParsedDocument
+  document_metadata, blocks, full_text, parser_trace
+```
+
+建议 provider 路线：
+1. `ResolvedJsonParser`：复用当前 `raw_resolve` JSON，作为第一优先级。
+2. `PaddleOcrApiParser`：调用 PaddleOCR API，替代本地 PaddleOCR 大模型。
+3. `LocalPaddleOcrParser`：保留为可选本地 provider，不作为默认依赖。
+4. `DocxParser` / `ExcelParser`：后续新增 Word/Excel 数据源时接入。
+
+`PaddleOcrApiParser` 设计约束：
+- API token 不写入代码和文档，统一从环境变量读取，例如 `PADDLEOCR_API_TOKEN`。
+- 默认模型为 `PaddleOCR-VL-1.6`，但模型名也应通过环境变量覆盖。
+- 解析结果优先保存原始 JSONL/Markdown 产物，再转换为项目统一的 `ParsedDocument`。
+- 需要记录 `job_id / model / optional_payload / start_time / end_time / page_count / parser_trace`，方便失败重试和成本核算。
+- 每天页数额度有限，第一轮只抽 4-5 个 PDF 做结构校准，不直接全量重跑。
+
+PaddleOCR API 校准流程：
+1. 选取 4-5 份代表性 PDF：公司研报、行业研报、宏观/策略报告、表格较多报告、图表较多报告。
+2. 保存 API 原始返回，检查 markdown、图片、表格、页码、标题层级是否稳定。
+3. 编写 converter，将 API 返回转为统一 `ParsedDocument.blocks`。
+4. 对比已有 `raw_resolve` JSON，确认 `global_start/global_end`、页码、段落标题、表格文本是否可稳定生成。
+5. 只在 converter 稳定后，再考虑批量重新解析。
+
+### Tool Layer
+
+后续 agent 应只调用工具层：
+
+```text
+FinanceRAGTool.search(
+  query,
+  kb_name="Finance",
+  exp_name="default",
+  top_k=5,
+  filters=None,
+  search_mode="rrf",
+  rerank=False,
+  return_trace=True,
+) -> RetrievalResult
+```
+
+工具层职责：
+- 统一调用 `retrieve_documents(...)` 和可选 rerank。
+- 将当前 dict 结果转换为 `RetrievedChunk`。
+- 补齐 document metadata、score breakdown 和 retrieval trace。
+- 为后续 agent 提供稳定 JSON schema。
+
 ## 测试
 
 运行：
@@ -156,10 +307,11 @@ python -B -m unittest discover -s Finance_RAG/tests -v
 
 下一步优先级：
 
-1. 用真实百炼 embedding 跑 2-3 篇文档的小规模入库。
-2. 构造最小评测集：`question + gold_spans`。
-3. 用 `evaluation.py` 跑 `coverage@k / iou@k / hit@k`。
+1. 在代码中落地 `EntityCandidate / DocumentMetadata / ChunkMetadata / RetrievedChunk / RetrievalResult / RetrievalTrace`。
+2. 用稳定 schema 包装当前 `retrieve_documents(...)` 返回值，短期保留旧 dict 结果兼容。
+3. 封装 `FinanceRAGTool.search(...)`，供后续 agent 直接调用。
 4. 将 `qwen3-rerank` 接入统一检索入口；当前已有独立 `rerank_documents(...)`，但 `retrieve_documents(...)` 尚未内置 rerank 开关。
-5. 封装 `FinanceRAGTool`，供后续 agent 直接调用。
+5. 用真实百炼 embedding 跑 2-3 篇文档的小规模入库。
+6. 构造最小评测集：`question + gold_spans`，并用 `evaluation.py` 跑 `coverage@k / iou@k / hit@k`。
 
 Milvus 暂不在当前阶段实现。后续如需要规模化，再按 `VectorStore` 接口新增 Milvus 后端。

@@ -26,6 +26,7 @@ class PaddleOCRClient:
     poll_interval_seconds: float = 2.0
     max_poll_requests: int = 120
     max_file_bytes: int = 25 * 1024 * 1024
+    max_pages: int = 500
     max_result_bytes: int = 10_000_000
     transport: httpx.BaseTransport | None = field(default=None, repr=False, compare=False)
 
@@ -45,12 +46,12 @@ class PaddleOCRClient:
             raise ValueError("PaddleOCR polling limits are invalid")
         if not 1_024 <= self.max_file_bytes <= 100_000_000:
             raise ValueError("PaddleOCR file limit is outside the supported range")
+        if not 1 <= self.max_pages <= 10_000:
+            raise ValueError("PaddleOCR page limit is outside the supported range")
         if not 1_024 <= self.max_result_bytes <= 50_000_000:
             raise ValueError("PaddleOCR result limit is outside the supported range")
 
-    def extract_document(self, file_path: Path, expected_pages: int) -> Mapping[int, str]:
-        if not 1 <= expected_pages <= 10_000:
-            raise ValueError("PaddleOCR expected page count is invalid")
+    def extract_document(self, file_path: Path) -> Mapping[int, str]:
         if file_path.stat().st_size > self.max_file_bytes:
             raise ValueError("PaddleOCR input exceeds the file limit")
         content = file_path.read_bytes()
@@ -88,7 +89,7 @@ class PaddleOCRClient:
             transport=self.transport,
         ) as result_client:
             raw_result = _bounded_get(result_client, result_url, self.max_result_bytes)
-        return _parse_page_markdown(raw_result, expected_pages)
+        return _parse_page_markdown(raw_result, self.max_pages)
 
     def _poll(self, client: httpx.Client, job_id: str) -> str:
         status_url = f"{self.job_url.rstrip('/')}/{job_id}"
@@ -147,7 +148,7 @@ def _bounded_get(client: httpx.Client, url: str, limit: int) -> bytes:
     return b"".join(chunks)
 
 
-def _parse_page_markdown(raw: bytes, expected_pages: int) -> dict[int, str]:
+def _parse_page_markdown(raw: bytes, max_pages: int) -> dict[int, str]:
     try:
         lines = raw.decode("utf-8").splitlines()
     except UnicodeDecodeError as exc:
@@ -172,8 +173,8 @@ def _parse_page_markdown(raw: bytes, expected_pages: int) -> dict[int, str]:
             text = markdown.get("text") if isinstance(markdown, Mapping) else None
             if not isinstance(text, str):
                 raise ValueError("PaddleOCR page has no Markdown text")
-            if page_number > expected_pages:
-                raise ValueError("PaddleOCR returned more pages than the PDF contains")
+            if page_number > max_pages:
+                raise ValueError("PaddleOCR returned more pages than the configured limit")
             pages[page_number] = text
             page_number += 1
     return pages

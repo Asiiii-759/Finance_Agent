@@ -81,6 +81,7 @@ class FinanceAnalysisService:
                 job_url=config.paddleocr_job_url,
                 model=config.paddleocr_model,
                 max_file_bytes=config.max_upload_bytes,
+                max_pages=config.max_pdf_pages,
             )
             if config.paddleocr_access_token
             else None
@@ -494,6 +495,10 @@ class FinanceAnalysisService:
             )
 
         explicit_document_entities = _normalized_entities(entities or [])
+        if document_paths and self.pdf_ocr_provider is None:
+            raise ValueError("PaddleOCR is required for PDF document analysis")
+        if document_paths and self.pdf_ocr_network_access and not network_allowed:
+            raise ValueError("PDF parsing requires server and request network authorization")
         current_document_contexts = [
             parse_pdf_document(
                 Path(path),
@@ -502,7 +507,7 @@ class FinanceAnalysisService:
                 max_file_bytes=self.config.max_upload_bytes,
                 max_text_characters=self.config.max_pdf_text_characters,
                 display_name=self._upload_display_name(Path(path)),
-                ocr_provider=(self.pdf_ocr_provider if not self.pdf_ocr_network_access or network_allowed else None),
+                ocr_provider=self.pdf_ocr_provider,
             )
             for path in (document_paths or [])
         ]
@@ -564,16 +569,11 @@ class FinanceAnalysisService:
                                 "span_basis": "page",
                                 "extraction_method": page["extraction_method"],
                                 "page_text_characters": page["text_characters"],
-                                "page_image_count": page["image_count"],
                             },
                         )
                     )
             if not ingested_chunks:
-                if self.pdf_ocr_provider and self.pdf_ocr_network_access and not network_allowed:
-                    raise ValueError("uploaded PDF requires OCR; server and request network authorization are required")
-                if self.pdf_ocr_provider:
-                    raise ValueError("uploaded PDF has no extractable text after OCR")
-                raise ValueError("uploaded PDF has no extractable text; configure a trusted OCR provider")
+                raise ValueError("PaddleOCR returned no extractable PDF text")
             corpus_adapter = RetrievalEvidenceAdapter(corpus)
             harness.register(
                 retrieval_harness_tool(
@@ -1143,6 +1143,10 @@ class FinanceAnalysisService:
         if not 1 <= len(document_paths) <= self.config.max_upload_files:
             raise ValueError("personal knowledge upload count is invalid")
         network_allowed = self.config.allow_network and allow_network
+        if self.pdf_ocr_provider is None:
+            raise ValueError("PaddleOCR is required for personal PDF ingestion")
+        if self.pdf_ocr_network_access and not network_allowed:
+            raise ValueError("personal PDF parsing requires server and request network authorization")
         tenant_key, user_key = _personal_principal_ids(tenant_id, user_id)
         results = []
         for value in document_paths:
@@ -1154,12 +1158,10 @@ class FinanceAnalysisService:
                 max_file_bytes=self.config.max_upload_bytes,
                 max_text_characters=self.config.max_pdf_text_characters,
                 display_name=self._upload_display_name(path),
-                ocr_provider=(self.pdf_ocr_provider if not self.pdf_ocr_network_access or network_allowed else None),
+                ocr_provider=self.pdf_ocr_provider,
             )
             if not parsed.get("pages"):
-                if self.pdf_ocr_provider and self.pdf_ocr_network_access and not network_allowed:
-                    raise ValueError("personal PDF requires OCR; server and request network authorization are required")
-                raise ValueError("personal PDF has no extractable text")
+                raise ValueError("PaddleOCR returned no extractable personal PDF text")
             results.append(self.personal_knowledge_store.add_document(tenant_key, user_key, parsed))
         return results
 

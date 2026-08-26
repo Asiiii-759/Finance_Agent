@@ -1,0 +1,118 @@
+services:
+  mas-finance-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MAS_HOST: 0.0.0.0
+      MAS_PORT: 8000
+      MAS_OUTPUT_DIR: /app/outputs
+      MAS_UPLOAD_DIR: /app/uploads
+      MAS_DB_PATH: /app/data/mas_finance.db
+      MAS_DATABASE_URL: postgresql+psycopg://mas_user:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/mas_finance
+      MAS_REDIS_URL: redis://redis:6379/0
+      MAS_REDIS_QUEUE_NAME: finance-analysis
+      MAS_MARKET_DATA_PROVIDER: ${MAS_MARKET_DATA_PROVIDER:-offline}
+      MAS_ALLOW_NETWORK: ${MAS_ALLOW_NETWORK:-false}
+      MAS_SEC_USER_AGENT: ${MAS_SEC_USER_AGENT:-}
+      ALPHAVANTAGE_API_KEY: ${ALPHAVANTAGE_API_KEY:-}
+      FRED_API_KEY: ${FRED_API_KEY:-}
+      FRED_BASE_URL: ${FRED_BASE_URL:-https://api.stlouisfed.org}
+      BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
+      MAS_EMBEDDING_ENDPOINT: ${MAS_EMBEDDING_ENDPOINT:-}
+      MAS_EMBEDDING_MODEL: ${MAS_EMBEDDING_MODEL:-}
+      MAS_EMBEDDING_API_KEY: ${MAS_EMBEDDING_API_KEY:-}
+      MAS_EMBEDDING_TIMEOUT_SECONDS: ${MAS_EMBEDDING_TIMEOUT_SECONDS:-30}
+      MAS_THREAD_MEMORY_ENABLED: ${MAS_THREAD_MEMORY_ENABLED:-true}
+      MAS_THREAD_MEMORY_TTL_SECONDS: ${MAS_THREAD_MEMORY_TTL_SECONDS:-604800}
+      MAS_PERSONAL_MEMORY_ENABLED: ${MAS_PERSONAL_MEMORY_ENABLED:-true}
+      MAS_PERSONAL_KNOWLEDGE_ENABLED: ${MAS_PERSONAL_KNOWLEDGE_ENABLED:-true}
+      MAS_MAX_PERSONAL_KNOWLEDGE_DOCUMENTS: ${MAS_MAX_PERSONAL_KNOWLEDGE_DOCUMENTS:-100}
+      MAS_PLANNING_EVIDENCE_CHARACTERS: ${MAS_PLANNING_EVIDENCE_CHARACTERS:-24000}
+      MAS_SYNTHESIS_EVIDENCE_CHARACTERS: ${MAS_SYNTHESIS_EVIDENCE_CHARACTERS:-48000}
+      MAS_SYNTHESIS_OUTPUT_TOKENS: ${MAS_SYNTHESIS_OUTPUT_TOKENS:-4096}
+      MAS_SESSION_DOCUMENT_TTL_SECONDS: ${MAS_SESSION_DOCUMENT_TTL_SECONDS:-3600}
+      MAS_MAX_SESSION_DOCUMENT_SESSIONS: ${MAS_MAX_SESSION_DOCUMENT_SESSIONS:-100}
+      MAS_MAX_PDF_TEXT_CHARACTERS: ${MAS_MAX_PDF_TEXT_CHARACTERS:-5000000}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-flash}
+      PADDLEOCR_ACCESS_TOKEN: ${PADDLEOCR_ACCESS_TOKEN:-}
+      PADDLEOCR_JOB_URL: ${PADDLEOCR_JOB_URL:-https://paddleocr.aistudio-app.com/api/v2/ocr/jobs}
+      PADDLEOCR_MODEL: ${PADDLEOCR_MODEL:-PaddleOCR-VL-1.6}
+      MAS_API_KEY: ${MAS_API_KEY:-}
+    volumes:
+      - mas_outputs:/app/outputs
+      - mas_data:/app/data
+      - mas_uploads:/app/uploads
+    depends_on:
+      - postgres
+      - redis
+
+  mas-finance-worker:
+    build: .
+    command: ["python", "start_worker.py"]
+    environment:
+      MAS_OUTPUT_DIR: /app/outputs
+      MAS_UPLOAD_DIR: /app/uploads
+      MAS_DB_PATH: /app/data/mas_finance.db
+      MAS_DATABASE_URL: postgresql+psycopg://mas_user:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/mas_finance
+      MAS_REDIS_URL: redis://redis:6379/0
+      MAS_REDIS_QUEUE_NAME: finance-analysis
+      MAS_MARKET_DATA_PROVIDER: ${MAS_MARKET_DATA_PROVIDER:-offline}
+      MAS_ALLOW_NETWORK: ${MAS_ALLOW_NETWORK:-false}
+      MAS_SEC_USER_AGENT: ${MAS_SEC_USER_AGENT:-}
+      ALPHAVANTAGE_API_KEY: ${ALPHAVANTAGE_API_KEY:-}
+      FRED_API_KEY: ${FRED_API_KEY:-}
+      FRED_BASE_URL: ${FRED_BASE_URL:-https://api.stlouisfed.org}
+      BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:-}
+      MAS_EMBEDDING_ENDPOINT: ${MAS_EMBEDDING_ENDPOINT:-}
+      MAS_EMBEDDING_MODEL: ${MAS_EMBEDDING_MODEL:-}
+      MAS_EMBEDDING_API_KEY: ${MAS_EMBEDDING_API_KEY:-}
+      MAS_EMBEDDING_TIMEOUT_SECONDS: ${MAS_EMBEDDING_TIMEOUT_SECONDS:-30}
+      MAS_THREAD_MEMORY_ENABLED: ${MAS_THREAD_MEMORY_ENABLED:-true}
+      MAS_THREAD_MEMORY_TTL_SECONDS: ${MAS_THREAD_MEMORY_TTL_SECONDS:-604800}
+      MAS_PERSONAL_MEMORY_ENABLED: ${MAS_PERSONAL_MEMORY_ENABLED:-true}
+      MAS_PERSONAL_KNOWLEDGE_ENABLED: ${MAS_PERSONAL_KNOWLEDGE_ENABLED:-true}
+      MAS_MAX_PERSONAL_KNOWLEDGE_DOCUMENTS: ${MAS_MAX_PERSONAL_KNOWLEDGE_DOCUMENTS:-100}
+      MAS_PLANNING_EVIDENCE_CHARACTERS: ${MAS_PLANNING_EVIDENCE_CHARACTERS:-24000}
+      MAS_SYNTHESIS_EVIDENCE_CHARACTERS: ${MAS_SYNTHESIS_EVIDENCE_CHARACTERS:-48000}
+      MAS_SYNTHESIS_OUTPUT_TOKENS: ${MAS_SYNTHESIS_OUTPUT_TOKENS:-4096}
+      MAS_SESSION_DOCUMENT_TTL_SECONDS: ${MAS_SESSION_DOCUMENT_TTL_SECONDS:-3600}
+      MAS_MAX_SESSION_DOCUMENT_SESSIONS: ${MAS_MAX_SESSION_DOCUMENT_SESSIONS:-100}
+      MAS_MAX_PDF_TEXT_CHARACTERS: ${MAS_MAX_PDF_TEXT_CHARACTERS:-5000000}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-flash}
+      PADDLEOCR_ACCESS_TOKEN: ${PADDLEOCR_ACCESS_TOKEN:-}
+      PADDLEOCR_JOB_URL: ${PADDLEOCR_JOB_URL:-https://paddleocr.aistudio-app.com/api/v2/ocr/jobs}
+      PADDLEOCR_MODEL: ${PADDLEOCR_MODEL:-PaddleOCR-VL-1.6}
+    volumes:
+      - mas_outputs:/app/outputs
+      - mas_data:/app/data
+      - mas_uploads:/app/uploads
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: mas_finance
+      POSTGRES_USER: mas_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+volumes:
+  mas_outputs:
+  mas_data:
+  mas_uploads:
+  postgres_data:

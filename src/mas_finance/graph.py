@@ -1,0 +1,579 @@
+"""LangGraph runtime for the financial research agent.
+
+The graph contains only business stages. Tool execution is an operation of the
+planning stage and is always paired with the ToolHarness policy boundary; the
+harness is infrastructure, not a graph node.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from typing import Any, Literal, cast
+
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
+from typing_extensions import TypedDict
+
+from .agent import (
+    AdaptivePlanner,
+    AgentPhase,
+    CoverageAssessor,
+    DeterministicSynthesizer,
+    Planner,
+    ResearchGap,
+    ResearchOutcome,
+    ResearchPlan,
+    ResearchRequest,
+    ResearchState,
+    StopReason,
+    Synthesizer,
+    ToolObservation,
+    ToolTask,
+    _merge_audit_events,
+    _safe_gap_code,
+    reconcile_conflicts,
+    render_report,
+)
+from .calculator import derive_standard_ratios
+from .contracts import EvidenceBundle, stable_id
+from .harness import ExecutionPolicy, SideEffect, ToolContext, ToolHarness, ToolSpec
+from .research import FinancialQueryAnalyzer
+from .validators import Severity, validate_research_output
+
+
+class FinancialGraphState(TypedDict, total=False):
+    request: dict[str, Any]
+    research: dict[str, Any]
+
+
+class FinancialResearchAgent:
+    """Four-stage financial agent backed by one LangGraph runtime."""
+
+    def __init__(
+        self,
+        harness: ToolHarness,
+        *,
+        planner: Planner | None = None,
+        synthesizer: Synthesizer | None = None,
+        assessor: CoverageAssessor | None = None,
+        scope_analyzer: FinancialQueryAnalyzer | None = None,
+        checkpointer: BaseCheckpointSaver[Any] | None = None,
+        allowed_capabilities: frozenset[str] = frozenset(
+            {
+                "document.search",
+                "market.read",
+                "regulatory.read",
+                "macro.read",
+                "calculation",
+                "knowledge.read",
+                "web.search",
+            }
+        ),
+    ) -> None:
+        self.harness = harness
+        self.planner = planner or AdaptivePlanner()
+        self.synthesizer = synthesizer or DeterministicSynthesizer()
+        self.assessor = assessor or CoverageAssessor()
+        self.scope_analyzer = scope_analyzer or FinancialQueryAnalyzer()
+        self.allowed_capabilities = allowed_capabilities
+        self.checkpointer = checkpointer or InMemorySaver()
+        self.available_tools = {
+            spec.name: spec for spec in self.harness.tool_specs() if spec.capability in self.allowed_capabilities
+        }
+        self.graph = self._build_graph()
+
+    def _build_graph(self) -> Any:
+        builder = StateGraph(FinancialGraphState)
+        # LangGraph 1.2's contravariant node Protocol does not accept bound
+        # methods under mypy even though their runtime signatures match.
+        builder.add_node("intent", cast(Any, self._intent_node))
+        builder.add_node("planning", cast(Any, self._planning_node))
+        builder.add_node("validation", cast(Any, self._validation_node))
+        builder.add_node("final_generation", cast(Any, self._final_generation_node))
+        builder.add_edge(START, "intent")
+        builder.add_edge("intent", "planning")
+        builder.add_conditional_edges(
+            "planning",
+            self._route_after_planning,
+            {"planning": "planning", "validation": "validation"},
+        )
+        builder.add_conditional_edges(
+            "validation",
+            self._route_after_validation,
+            {"planning": "planning", "final_generation": "final_generation", "end": END},
+        )
+        builder.add_edge("final_generation", "validation")
+        return builder.compile(checkpointer=self.checkpointer)
+
+    def run(self, request: ResearchRequest, *, resume: bool = False) -> ResearchOutcome:
+        config = self._config(request)
+        snapshot = self.graph.get_state(config)
+        if resume:
+            if not snapshot.values:
+                raise ValueError("no LangGraph checkpoint exists for this run")
+            persisted = self._state(snapshot.values)
+            if persisted.request.to_dict() != request.to_dict():
+                raise ValueError("checkpoint request does not match resume request")
+            self._prime_harness(persisted)
+            result = self.graph.invoke(None, config)
+        else:
+            if snapshot.values:
+                raise ValueError("a LangGraph checkpoint already exists for this run")
+            result = self.graph.invoke({"request": request.to_dict()}, config)
+        state = self._state(result)
+        return self._outcome(state)
+
+    def get_state(self, request: ResearchRequest) -> ResearchState | None:
+        values = self.graph.get_state(self._config(request)).values
+        return self._state(values) if values else None
+
+    def state_history(self, request: ResearchRequest) -> tuple[ResearchState, ...]:
+        return tuple(
+            self._state(snapshot.values)
+            for snapshot in self.graph.get_state_history(self._config(request))
+            if snapshot.values and "research" in snapshot.values
+        )
+
+    def _intent_node(self, graph_state: FinancialGraphState) -> dict[str, Any]:
+        request = ResearchRequest.from_dict(graph_state["request"])
+        self.harness.clear_run(request.run_id)
+        state = ResearchState(
+            request=request,
+            scope=self.scope_analyzer.analyze(request),
+            phase=AgentPhase.INTENT,
+        )
+        return {"research": state.to_dict()}
+
+    def _planning_node(self, graph_state: FinancialGraphState) -> dict[str, Any]:
+        state = self._state(graph_state)
+        state.phase = AgentPhase.PLANNING
+        if state.stop_reason is not None:
+            return self._update(state)
+        if len(state.observations) >= state.request.max_tool_calls:
+            self._mark_tool_budget_exhausted(state)
+            return self._update(state)
+
+        observed = {item.task.task_id for item in state.observations}
+        plan = self._unfinished_plan(state, observed)
+        if plan is None:
+            if state.iteration >= state.request.max_iterations:
+                state.stop_reason = StopReason.MAX_ITERATIONS
+                return self._update(state)
+            plan = self._validated_plan(self.planner.plan(state, self.available_tools), state)
+            context_manifest = getattr(self.planner, "context_manifest", lambda: None)()
+            if context_manifest:
+                state.context_manifests.append(
+                    {"phase": "planning", "iteration": state.iteration + 1, **context_manifest}
+                )
+            state.audit_events = _merge_audit_events(
+                state.audit_events,
+                self.harness.audit_events(state.request.run_id),
+            )
+            self._consume_planner_diagnostics(state)
+            if not plan.tasks:
+                state.plans.append(plan)
+                state.iteration = plan.iteration
+                if not plan.ready_for_validation:
+                    self._mark_no_available_action(state)
+                return self._update(state)
+            state.plans.append(plan)
+            state.iteration = plan.iteration
+
+        task = next(item for item in plan.tasks if item.task_id not in observed)
+        result = self.harness.invoke(
+            task.tool_name,
+            task.arguments,
+            self._tool_context(state.request, self.available_tools),
+        )
+        observation = ToolObservation(
+            task=task,
+            iteration=state.iteration,
+            result=result.to_dict(),
+            network_access=self.available_tools[task.tool_name].network_access,
+        )
+        state.observations.append(observation)
+        self._consume(observation, state)
+        state.audit_events = _merge_audit_events(
+            state.audit_events,
+            self.harness.audit_events(state.request.run_id),
+        )
+        if result.status.value == "budget_exhausted":
+            self._mark_tool_budget_exhausted(state)
+        return self._update(state)
+
+    def _validation_node(self, graph_state: FinancialGraphState) -> dict[str, Any]:
+        state = self._state(graph_state)
+        state.phase = AgentPhase.VALIDATING
+        if state.report:
+            validation = validate_research_output(
+                bundle=state.bundle,
+                report=state.report,
+                gaps=(gap.to_dict() for gap in state.gaps),
+            )
+            state.validation_issues = [issue.to_dict() for issue in validation.issues]
+            if any(issue.severity == Severity.ERROR for issue in validation.issues):
+                state.phase = AgentPhase.FAILED
+                state.stop_reason = StopReason.VALIDATION_FAILED
+                state.report = render_report(state)
+            elif not state.bundle.evidence:
+                state.phase = AgentPhase.FAILED
+                state.stop_reason = StopReason.NO_EVIDENCE
+            else:
+                state.phase = AgentPhase.COMPLETED
+            return self._update(state)
+
+        derive_standard_ratios(state.bundle)
+        state.coverage = self.assessor.assess(state.request, state.bundle, state.scope)
+        self._resolve_recovered_gaps(state)
+        planner_finish_required = bool(getattr(self.planner, "requires_explicit_finish", False))
+        model_declared_finish = bool(state.plans and state.plans[-1].ready_for_validation)
+        if (
+            state.coverage.complete
+            and state.bundle.evidence
+            and (
+                not planner_finish_required
+                or model_declared_finish
+                or state.iteration >= state.request.max_iterations
+            )
+        ):
+            state.stop_reason = StopReason.COVERAGE_SATISFIED
+        elif state.stop_reason is None and state.iteration >= state.request.max_iterations:
+            state.stop_reason = StopReason.MAX_ITERATIONS
+        return self._update(state)
+
+    def _final_generation_node(self, graph_state: FinancialGraphState) -> dict[str, Any]:
+        state = self._state(graph_state)
+        state.phase = AgentPhase.FINAL_GENERATION
+        if not state.bundle.evidence:
+            state.stop_reason = StopReason.NO_EVIDENCE
+        derive_standard_ratios(state.bundle)
+        state.bundle.claims.clear()
+        claims = reconcile_conflicts(
+            state.bundle,
+            self.synthesizer.synthesize(
+                state.request,
+                state.bundle,
+                research_context={
+                    "scope": state.scope.to_dict() if state.scope else None,
+                    "coverage": state.coverage.to_dict() if state.coverage else None,
+                    "unresolved_gaps": [gap.to_dict() for gap in state.gaps if not gap.resolved],
+                    "stop_reason": state.stop_reason.value if state.stop_reason else None,
+                },
+            ),
+        )
+        diagnostics = getattr(self.synthesizer, "diagnostics", lambda: ())()
+        context_manifest = getattr(self.synthesizer, "context_manifest", lambda: None)()
+        if context_manifest:
+            state.context_manifests.append(
+                {"phase": "final_generation", "iteration": state.iteration, **context_manifest}
+            )
+        for item in diagnostics:
+            state.gaps.append(
+                ResearchGap(
+                    code=_safe_gap_code(item.get("code") or "synthesis_degraded"),
+                    message=str(item.get("message") or "Synthesis degraded.")[:2_000],
+                    resolvable=False,
+                )
+            )
+        for claim in claims:
+            state.bundle.add_claim(claim)
+        state.audit_events = _merge_audit_events(
+            state.audit_events,
+            self.harness.audit_events(state.request.run_id),
+        )
+        state.report = render_report(state)
+        return self._update(state)
+
+    def _route_after_planning(self, graph_state: FinancialGraphState) -> Literal["planning", "validation"]:
+        state = self._state(graph_state)
+        if state.stop_reason is None and state.plans:
+            observed = {item.task.task_id for item in state.observations}
+            if any(task.task_id not in observed for task in state.plans[-1].tasks):
+                return "planning"
+        return "validation"
+
+    def _route_after_validation(
+        self,
+        graph_state: FinancialGraphState,
+    ) -> Literal["planning", "final_generation", "end"]:
+        state = self._state(graph_state)
+        if state.phase in {AgentPhase.COMPLETED, AgentPhase.FAILED}:
+            return "end"
+        return "final_generation" if state.stop_reason is not None else "planning"
+
+    def _validated_plan(self, plan: ResearchPlan, state: ResearchState) -> ResearchPlan:
+        invalid = [task for task in plan.tasks if task.tool_name not in self.available_tools]
+        for task in invalid:
+            state.gaps.append(
+                ResearchGap(
+                    code="planner_tool_denied",
+                    message="Planner selected a tool outside the agent capability allowlist.",
+                    entity=task.entity,
+                    tool_name=task.tool_name,
+                    task_id=task.task_id,
+                    requirement_key=task.requirement_key,
+                )
+            )
+        attempted = {item.task.task_id for item in state.observations}
+        seen: set[str] = set()
+        tasks: list[ToolTask] = []
+        for task in plan.tasks:
+            if task.tool_name not in self.available_tools:
+                continue
+            if task.task_id in attempted:
+                state.gaps.append(
+                    ResearchGap(
+                        code="repeated_planner_action",
+                        message="Planner repeated an already observed tool action; it was not executed again.",
+                        entity=task.entity,
+                        requirement_key=task.requirement_key,
+                        tool_name=task.tool_name,
+                        task_id=task.task_id,
+                        resolvable=True,
+                    )
+                )
+                continue
+            if task.task_id in seen:
+                state.gaps.append(
+                    ResearchGap(
+                        code="duplicate_planner_task",
+                        message="Planner emitted a duplicate task; it was not executed.",
+                        entity=task.entity,
+                        requirement_key=task.requirement_key,
+                        tool_name=task.tool_name,
+                        task_id=task.task_id,
+                        resolved=True,
+                    )
+                )
+                continue
+            seen.add(task.task_id)
+            tasks.append(task)
+        return ResearchPlan(
+            iteration=plan.iteration,
+            rationale=plan.rationale,
+            tasks=tuple(tasks),
+            ready_for_validation=plan.ready_for_validation or bool(plan.tasks and not tasks and not invalid),
+        )
+
+    def _consume_planner_diagnostics(self, state: ResearchState) -> None:
+        diagnostics = getattr(self.planner, "diagnostics", lambda: ())()
+        existing = {(gap.code, gap.message) for gap in state.gaps}
+        for item in diagnostics:
+            code = _safe_gap_code(item.get("code") or "planner_degraded")
+            message = str(item.get("message") or "Planner degraded.")[:2_000]
+            if (code, message) not in existing:
+                state.gaps.append(ResearchGap(code=code, message=message, resolvable=False))
+
+    def _mark_no_available_action(self, state: ResearchState) -> None:
+        state.coverage = self.assessor.assess(state.request, state.bundle, state.scope)
+        if state.coverage.complete and state.bundle.evidence:
+            state.stop_reason = StopReason.COVERAGE_SATISFIED
+            return
+        requirements = {item.key: item for item in state.scope.requirements} if state.scope else {}
+        unsupported = {
+            key: requirements[key]
+            for key in state.coverage.missing
+            if key in requirements and requirements[key].category == "unsupported"
+        }
+        for key, requirement in unsupported.items():
+            state.gaps.append(
+                ResearchGap(
+                    code=_safe_gap_code(requirement.parameters.get("gap_code", "unsupported_research_scope")),
+                    message=requirement.reason,
+                    entity=requirement.entity,
+                    requirement_key=key,
+                    resolvable=False,
+                )
+            )
+        if not requirements:
+            state.gaps.append(
+                ResearchGap(
+                    code="unsupported_research_scope",
+                    message="The question did not map to a supported evidence requirement.",
+                    resolvable=False,
+                )
+            )
+        for key in state.coverage.missing:
+            if key not in unsupported:
+                state.gaps.append(
+                    ResearchGap(
+                        code="requirement_provider_unavailable",
+                        message=f"No authorized untried tool can satisfy requirement {key}.",
+                        requirement_key=key,
+                        resolvable=False,
+                    )
+                )
+        state.stop_reason = StopReason.NO_AVAILABLE_ACTION
+
+    @staticmethod
+    def _unfinished_plan(state: ResearchState, observed: set[str]) -> ResearchPlan | None:
+        if state.plans and any(task.task_id not in observed for task in state.plans[-1].tasks):
+            return state.plans[-1]
+        return None
+
+    @staticmethod
+    def _mark_tool_budget_exhausted(state: ResearchState) -> None:
+        if not any(gap.code == "tool_call_budget_exhausted" for gap in state.gaps):
+            state.gaps.append(
+                ResearchGap(
+                    code="tool_call_budget_exhausted",
+                    message="The research tool-call budget was exhausted before evidence coverage completed.",
+                    resolvable=False,
+                )
+            )
+        state.stop_reason = StopReason.TOOL_BUDGET_EXHAUSTED
+
+    @staticmethod
+    def _consume(observation: ToolObservation, state: ResearchState) -> None:
+        result = observation.result
+        if not result.get("ok"):
+            state.gaps.append(
+                ResearchGap(
+                    code=_safe_gap_code(result.get("error_code") or "tool_error"),
+                    message=str(result.get("error_message") or "Tool call failed.")[:2_000],
+                    entity=observation.task.entity,
+                    requirement_key=observation.task.requirement_key,
+                    tool_name=observation.task.tool_name,
+                    task_id=observation.task.task_id,
+                    resolvable=True,
+                )
+            )
+            return
+        data = result.get("data")
+        if not isinstance(data, Mapping) or not isinstance(data.get("bundle"), Mapping):
+            state.gaps.append(
+                ResearchGap(
+                    code="invalid_tool_contract",
+                    message="Tool did not return an evidence bundle.",
+                    entity=observation.task.entity,
+                    requirement_key=observation.task.requirement_key,
+                    tool_name=observation.task.tool_name,
+                    task_id=observation.task.task_id,
+                    resolvable=True,
+                )
+            )
+            return
+        incoming = EvidenceBundle.from_dict(data["bundle"])
+        state.bundle.merge(incoming)
+        for value in data.get("gaps") or ():
+            if isinstance(value, Mapping):
+                state.gaps.append(
+                    ResearchGap(
+                        code=_safe_gap_code(value.get("code")),
+                        message=str(value.get("message") or "Data is incomplete.")[:2_000],
+                        entity=observation.task.entity,
+                        requirement_key=observation.task.requirement_key,
+                        tool_name=observation.task.tool_name,
+                        task_id=observation.task.task_id,
+                        resolvable=bool(value.get("recoverable_by_coverage", False)),
+                    )
+                )
+
+    @staticmethod
+    def _resolve_recovered_gaps(state: ResearchState) -> None:
+        if state.coverage is None:
+            return
+        missing = set(state.coverage.missing)
+        task_by_id = {item.task.task_id: item.task for item in state.observations}
+        updated: list[ResearchGap] = []
+        for gap in state.gaps:
+            task = task_by_id.get(gap.task_id or "")
+            requirement = task.requirement_key or f"{task.category}:{task.entity or 'query'}" if task else None
+            recovered = gap.resolvable and requirement is not None and requirement not in missing
+            updated.append(
+                ResearchGap(
+                    code=gap.code,
+                    message=gap.message,
+                    entity=gap.entity,
+                    requirement_key=gap.requirement_key,
+                    tool_name=gap.tool_name,
+                    task_id=gap.task_id,
+                    resolvable=gap.resolvable,
+                    resolved=gap.resolved or recovered,
+                )
+            )
+        state.gaps = updated
+
+    @staticmethod
+    def _tool_context(request: ResearchRequest, available: Mapping[str, ToolSpec]) -> ToolContext:
+        return ToolContext(
+            run_id=request.run_id,
+            thread_id=request.thread_id,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+            policy=ExecutionPolicy(
+                allowed_capabilities=frozenset(spec.capability for spec in available.values()),
+                allowed_side_effects=frozenset({SideEffect.READ_ONLY}),
+                allow_network=request.allow_network,
+                max_tool_calls=request.max_tool_calls,
+                max_network_calls=request.max_network_calls,
+                max_model_calls=request.max_model_calls,
+            ),
+        )
+
+    def _prime_harness(self, state: ResearchState) -> None:
+        tool_calls, network_calls, model_calls, sequence = self._audit_usage(state.audit_events)
+        self.harness.prime_run(
+            state.request.run_id,
+            tool_calls=tool_calls,
+            network_calls=network_calls,
+            model_calls=model_calls,
+            sequence=sequence,
+        )
+
+    def _outcome(self, state: ResearchState) -> ResearchOutcome:
+        state.audit_events = _merge_audit_events(
+            state.audit_events,
+            self.harness.audit_events(state.request.run_id),
+        )
+        tool_calls, network_calls, model_calls, _ = self._audit_usage(state.audit_events)
+        return ResearchOutcome(
+            state=state,
+            audit_events=tuple(state.audit_events),
+            budget_usage={
+                "tool_calls": tool_calls,
+                "network_attempts": network_calls,
+                "model_calls": model_calls,
+            },
+        )
+
+    @staticmethod
+    def _audit_usage(events: Sequence[Mapping[str, Any]]) -> tuple[int, int, int, int]:
+        tool_calls = sum(
+            1 for item in events if item.get("capability") != "model.generate" and bool(item.get("budget_consumed"))
+        )
+        model_calls = sum(
+            1 for item in events if item.get("capability") == "model.generate" and bool(item.get("budget_consumed"))
+        )
+        network_calls = sum(
+            int(item.get("network_attempts") or 0) for item in events if item.get("capability") != "model.generate"
+        )
+        sequence = max(
+            (int(str(item["call_id"]).rsplit(":", 1)[-1]) for item in events if item.get("call_id")),
+            default=0,
+        )
+        return tool_calls, network_calls, model_calls, sequence
+
+    @staticmethod
+    def _state(graph_state: Mapping[str, Any]) -> ResearchState:
+        return ResearchState.from_dict(graph_state["research"])
+
+    @staticmethod
+    def _update(state: ResearchState) -> dict[str, Any]:
+        return {"research": state.to_dict()}
+
+    @staticmethod
+    def _config(request: ResearchRequest) -> dict[str, Any]:
+        thread_id = stable_id(
+            "run",
+            {
+                "tenant_id": request.tenant_id,
+                "thread_id": request.thread_id,
+                "run_id": request.run_id,
+            },
+        )
+        return {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": request.max_tool_calls * 2 + request.max_iterations * 2 + 8,
+        }

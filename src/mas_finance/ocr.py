@@ -1,0 +1,196 @@
+"""Bounded adapter for PaddleOCR document parsing.
+
+Only page Markdown is consumed. Remote image assets are deliberately ignored.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+import httpx
+
+
+@dataclass(frozen=True)
+class PaddleOCRClient:
+    access_token: str = field(repr=False)
+    job_url: str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+    model: str = "PaddleOCR-VL-1.6"
+    request_timeout_seconds: float = 30.0
+    poll_interval_seconds: float = 2.0
+    max_poll_requests: int = 120
+    max_file_bytes: int = 25 * 1024 * 1024
+    max_result_bytes: int = 10_000_000
+    transport: httpx.BaseTransport | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        _validate_https_url(self.job_url, field_name="PaddleOCR job URL", allow_query=False)
+        if (
+            not self.access_token
+            or len(self.access_token) > 4_096
+            or any(ord(character) < 32 or ord(character) == 127 for character in self.access_token)
+        ):
+            raise ValueError("PaddleOCR access token is invalid")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", self.model):
+            raise ValueError("PaddleOCR model name is invalid")
+        if not 0.1 <= self.request_timeout_seconds <= 120:
+            raise ValueError("PaddleOCR request timeout is outside the supported range")
+        if not 0 <= self.poll_interval_seconds <= 30 or not 1 <= self.max_poll_requests <= 600:
+            raise ValueError("PaddleOCR polling limits are invalid")
+        if not 1_024 <= self.max_file_bytes <= 100_000_000:
+            raise ValueError("PaddleOCR file limit is outside the supported range")
+        if not 1_024 <= self.max_result_bytes <= 50_000_000:
+            raise ValueError("PaddleOCR result limit is outside the supported range")
+
+    def extract_document(self, file_path: Path, expected_pages: int) -> Mapping[int, str]:
+        if not 1 <= expected_pages <= 10_000:
+            raise ValueError("PaddleOCR expected page count is invalid")
+        if file_path.stat().st_size > self.max_file_bytes:
+            raise ValueError("PaddleOCR input exceeds the file limit")
+        content = file_path.read_bytes()
+        if not content.startswith(b"%PDF-"):
+            raise ValueError("PaddleOCR input must be a PDF")
+        headers = {"Authorization": f"bearer {self.access_token}"}
+        with httpx.Client(
+            timeout=self.request_timeout_seconds,
+            follow_redirects=False,
+            transport=self.transport,
+            headers=headers,
+        ) as client:
+            response = client.post(
+                self.job_url,
+                data={
+                    "model": self.model,
+                    "optionalPayload": json.dumps(
+                        {
+                            "useDocOrientationClassify": False,
+                            "useDocUnwarping": False,
+                            "useChartRecognition": False,
+                        }
+                    ),
+                },
+                files={"file": (file_path.name, content, "application/pdf")},
+            )
+            response.raise_for_status()
+            job_id = _job_id(response)
+            result_url = self._poll(client, job_id)
+        # Result objects commonly live on a different signed storage host.
+        # Use a fresh client so the PaddleOCR bearer token is never forwarded.
+        with httpx.Client(
+            timeout=self.request_timeout_seconds,
+            follow_redirects=False,
+            transport=self.transport,
+        ) as result_client:
+            raw_result = _bounded_get(result_client, result_url, self.max_result_bytes)
+        return _parse_page_markdown(raw_result, expected_pages)
+
+    def _poll(self, client: httpx.Client, job_id: str) -> str:
+        status_url = f"{self.job_url.rstrip('/')}/{job_id}"
+        for attempt in range(self.max_poll_requests):
+            response = client.get(status_url)
+            response.raise_for_status()
+            data = _response_data(response, "PaddleOCR status")
+            state = data.get("state")
+            if state == "done":
+                result = data.get("resultUrl")
+                result_url = result.get("jsonUrl") if isinstance(result, Mapping) else None
+                if not isinstance(result_url, str):
+                    raise ValueError("PaddleOCR completed job has no JSON result URL")
+                _validate_https_url(result_url, field_name="PaddleOCR result URL")
+                return result_url
+            if state == "failed":
+                raise RuntimeError("PaddleOCR document parsing failed")
+            if state not in {"pending", "running"}:
+                raise ValueError("PaddleOCR returned an unknown job state")
+            if attempt + 1 < self.max_poll_requests and self.poll_interval_seconds:
+                time.sleep(self.poll_interval_seconds)
+        raise TimeoutError("PaddleOCR polling limit was exhausted")
+
+
+def _job_id(response: httpx.Response) -> str:
+    data = _response_data(response, "PaddleOCR submission")
+    job_id = data.get("jobId")
+    if not isinstance(job_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,256}", job_id):
+        raise ValueError("PaddleOCR submission has no valid job id")
+    return job_id
+
+
+def _response_data(response: httpx.Response, label: str) -> Mapping[str, Any]:
+    if len(response.content) > 1_000_000:
+        raise ValueError(f"{label} response exceeds the byte limit")
+    try:
+        payload = json.loads(response.content, parse_constant=_reject_json_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} returned invalid JSON") from exc
+    data = payload.get("data") if isinstance(payload, Mapping) else None
+    if not isinstance(data, Mapping):
+        raise ValueError(f"{label} response has no data object")
+    return data
+
+
+def _bounded_get(client: httpx.Client, url: str, limit: int) -> bytes:
+    with client.stream("GET", url) as response:
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_bytes():
+            total += len(chunk)
+            if total > limit:
+                raise ValueError("PaddleOCR JSONL result exceeds the byte limit")
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _parse_page_markdown(raw: bytes, expected_pages: int) -> dict[int, str]:
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ValueError("PaddleOCR JSONL result is not UTF-8") from exc
+    pages: dict[int, str] = {}
+    page_number = 1
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line, parse_constant=_reject_json_constant)
+        except json.JSONDecodeError as exc:
+            raise ValueError("PaddleOCR JSONL contains invalid JSON") from exc
+        result = payload.get("result") if isinstance(payload, Mapping) else None
+        if not isinstance(result, Mapping):
+            raise ValueError("PaddleOCR JSONL line has no result object")
+        layouts = result.get("layoutParsingResults")
+        if not isinstance(layouts, list):
+            raise ValueError("PaddleOCR result has no layoutParsingResults list")
+        for layout in layouts:
+            markdown = layout.get("markdown") if isinstance(layout, Mapping) else None
+            text = markdown.get("text") if isinstance(markdown, Mapping) else None
+            if not isinstance(text, str):
+                raise ValueError("PaddleOCR page has no Markdown text")
+            if page_number > expected_pages:
+                raise ValueError("PaddleOCR returned more pages than the PDF contains")
+            pages[page_number] = text
+            page_number += 1
+    return pages
+
+
+def _validate_https_url(url: str, *, field_name: str, allow_query: bool = True) -> None:
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or (parsed.query and not allow_query)
+    ):
+        raise ValueError(f"{field_name} must be a credential-free HTTPS URL")
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant is forbidden: {value}")

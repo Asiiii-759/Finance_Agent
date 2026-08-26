@@ -245,7 +245,7 @@ adapter 是一个有意保留的例外：它让离线请求得到明确的 `mark
 | 平面 | 用途 | 是否是事实来源 |
 |---|---|---|
 | LangGraph checkpoint | run 恢复、历史、下一节点 | 保存既有证据，但不跨 run 自动召回 |
-| Thread memory | previous query、entity/symbol、gap code | 否，只作消歧提示 |
+| Conversation memory | 有界旧摘要、最近 user/tool/assistant 事件、实体关系 | 否，只作多轮理解与消歧提示 |
 | Session documents | 显式短期保留的 PDF 页文本 | 是，需本次显式召回 |
 | Long-term RAG | 经过 ACL/retention 管理的持久知识 | 是，经 retrieval adapter 引用 |
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -17,10 +18,12 @@ from mas_finance.harness import (
     function_tool,
 )
 from mas_finance.memory_store import (
+    ConversationEventKind,
+    EntityRelation,
     InMemoryStore,
     MemoryNamespace,
     SQLiteMemoryStore,
-    ThreadContextMemory,
+    build_conversation_window,
 )
 
 
@@ -180,17 +183,9 @@ class MemoryTests(unittest.TestCase):
         self.assertFalse(store.delete(namespace, "first"))
         self.assertEqual([item.key for item in store.list(namespace)], ["second"])
 
-    def test_thread_context_deserialization_does_not_coerce_types(self) -> None:
-        with self.assertRaisesRegex(ValueError, "invalid types"):
-            ThreadContextMemory.from_dict(
-                {
-                    "previous_query": "query",
-                    "entities": [123],
-                    "symbols": {},
-                    "last_status": "failed",
-                    "unresolved_gap_codes": [],
-                }
-            )
+    def test_entity_relation_deserialization_does_not_coerce_types(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be strings"):
+            EntityRelation.from_dict({"subject": 123, "predicate": "has_symbol", "object": "AAPL"})
 
     def test_namespace_isolation_and_defensive_copy(self) -> None:
         store = InMemoryStore()
@@ -201,6 +196,9 @@ class MemoryTests(unittest.TestCase):
         value["watchlist"].append("MSFT")
 
         self.assertEqual(store.get(alice, "state").value, {"watchlist": ["AAPL"]})
+
+        with self.assertRaisesRegex(ValueError, "invalid memory namespace"):
+            MemoryNamespace("tenant-a", "alice", "conversation_history", "")
         self.assertIsNone(store.get(bob, "state"))
 
         fetched = store.get(alice, "state")
@@ -232,6 +230,57 @@ class MemoryTests(unittest.TestCase):
                 )
             )
             self.assertEqual(reopened.delete_namespace(namespace), 1)
+
+    def test_conversation_history_is_durable_compacted_and_explicitly_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "memory.db"
+            namespace = MemoryNamespace("tenant-a", "alice", "conversation_history", "thread-1")
+            store = SQLiteMemoryStore(path)
+            for index in range(16):
+                kind = ConversationEventKind.USER_MESSAGE if index % 2 == 0 else ConversationEventKind.ASSISTANT_MESSAGE
+                store.append_conversation_event(
+                    namespace,
+                    event_id=f"event-{index}",
+                    kind=kind,
+                    content=f"message {index} " + "x" * 700,
+                    occurred_at=f"2026-08-26T12:{index:02d}:00+08:00",
+                    run_id=f"run-{index // 2}",
+                    entities=("Apple", "Microsoft") if kind is ConversationEventKind.USER_MESSAGE else (),
+                    relations=(EntityRelation("Apple", "co_mentioned", "Microsoft"),) if index == 0 else (),
+                )
+
+            context = build_conversation_window(store, namespace, max_characters=6_000, recent_event_count=4)
+            self.assertLessEqual(len(json.dumps(context, ensure_ascii=False, sort_keys=True)), 6_000)
+            self.assertEqual(context["focus_entities"], ["Apple", "Microsoft"])
+            self.assertGreater(context["manifest"]["covered_through_sequence"], 0)
+            self.assertEqual(len(store.list_conversation_events(namespace)), 16)
+
+            reopened = SQLiteMemoryStore(path)
+            self.assertEqual(len(reopened.list_conversation_events(namespace)), 16)
+            self.assertIsNotNone(reopened.get_conversation_summary(namespace))
+            self.assertEqual(
+                reopened.list_conversation_events(namespace)[0],
+                reopened.append_conversation_event(
+                    namespace,
+                    event_id="event-0",
+                    kind=ConversationEventKind.USER_MESSAGE,
+                    content="message 0 " + "x" * 700,
+                    occurred_at="2026-08-26T12:00:00+08:00",
+                    run_id="run-0",
+                    entities=("Apple", "Microsoft"),
+                    relations=(EntityRelation("Apple", "co_mentioned", "Microsoft"),),
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "conflicts"):
+                reopened.append_conversation_event(
+                    namespace,
+                    event_id="event-0",
+                    kind=ConversationEventKind.USER_MESSAGE,
+                    content="different content",
+                    run_id="run-0",
+                )
+            self.assertEqual(reopened.delete_conversation(namespace), {"events": 16, "summaries": 1})
+            self.assertEqual(reopened.list_conversation_events(namespace), [])
 
 
 if __name__ == "__main__":

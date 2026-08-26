@@ -62,7 +62,7 @@ user request
 
 ### 阶段 E：上下文、合成与记忆边界
 
-Prompt 被拆成 task、research、thread context、evidence cards；ContextManifest 记录模型真正看到的证据；模型只能引用 manifest 内且包含逐字 quote 的 evidence。线程记忆只保存最小指代信息并带 TTL，不保存 evidence、prompt 或用户画像。
+Prompt 被拆成 task、research、thread context、evidence cards；ContextManifest 记录模型真正看到的证据；模型只能引用 manifest 内且包含逐字 quote 的 evidence。当前 conversation memory 进一步改为完整事件账本与有界 prompt 投影分离：历史保留到显式删除，旧事件结构化压缩，且始终不具备 evidence 权限。
 
 ### 阶段 F：企业故障注入与代码收敛
 
@@ -237,23 +237,27 @@ NIST 的生成式 AI 风险框架指出，模型可能生成错误内容以及�
 | MEM-03 | NetworkX/Neo4j 图被称为 knowledge memory，但没有检索闭环 | 增加依赖却不提升回答 | 删除假知识图谱，领域知识改成版本化 evidence tool | knowledge scenario | 已解决 |
 | MEM-04 | Neo4j 初始化异常静默回退内存 | 运维以为持久化，实际丢数据 | 删除该未完成能力；provider 失败必须可见 | 代码边界审计 | 已解决 |
 | MEM-05 | 线程记忆没有 tenant/user/thread 精确 namespace | 跨用户泄漏 | namespace 哈希并精确查找，不提供跨 namespace 搜索 | isolation tests | 已解决 |
-| MEM-06 | 线程记忆没有 TTL/删除 | 数据无限留存 | 默认 7 天 TTL，过期/畸形删除，提供 delete endpoint | expiry/delete tests | 已解决 |
-| MEM-07 | 记忆内容类型可被字符串强转 | 损坏记录可能伪装合法 | `ThreadContextMemory.from_dict` 严格类型 | coercion test | 已解决 |
+| MEM-06 | 会话历史的保留语义不符合长对话需求 | 7 天 TTL 会在用户未删除时丢失历史 | 完整事件账本保留到显式删除，并同时清理摘要与关联 checkpoint | restart/delete tests | 已解决 |
+| MEM-07 | 事件或关系内容可被错误重放/强转 | 损坏记录可能伪装合法，同 ID 不同内容可能静默覆盖语义 | 严格 JSON/类型/时区校验；幂等 ID 内容冲突快速失败 | coercion/idempotency tests | 已解决 |
 | MEM-08 | Apple 后改问 Microsoft 仍沿用 Apple | 旧实体优先级错误 | 显式实体 → 当前检测实体 → 真正指代时 remembered entity | entity switch black-box | 已解决 |
 | MEM-09 | 设想了长期 memory promotion，但无真实产品治理 | 隐私数据无法查看、撤回、导出 | 删除 policy/API；长期用户画像明确未实现 | API/docs audit | 刻意不实现 |
 | MEM-10 | 一次性 PDF 无法跨同线程追问 | 要么重复上传，要么误把临时文档永久入库 | 显式 session opt-in；只保留解析页文本、短 TTL、namespace 隔离和删除接口 | service/API follow-up tests | 已解决 |
 | MEM-11 | 临时上传与永久知识库语义混在一起 | 用户同意、ACL、删除传播无法成立 | 三层生命周期；临时绝不自动 promotion，永久文档仅走受控 RAG | lifecycle contract review | 已解决 |
+| MEM-12 | 只保存上一轮最小快照 | 多轮长对话和工具过程无法进入上下文 | user/tool/assistant append-only ledger；旧摘要 + 最近原始事件投影 | persistence/tool-event tests | 已解决 |
+| MEM-13 | 单实体字符串替换无法解析实体顺序和歧义 | “前者/后者/它们”错误，多个候选下的“它”会误猜 | 时间化 entity state、`has_symbol/co_mentioned` 关系和有序 focus；歧义单数不继承 | reference-resolution tests | 已解决 |
+| MEM-14 | 长对话完整注入 prompt | 上下文无界、成本和模型注意力恶化 | 预算达到 85% 滚动压缩；摘要游标 + 最近事件；原账本不删除 | compaction/ledger-retention tests | 已解决 |
+| MEM-15 | 测试命令导入虚拟环境旧安装包 | 修改后的源码可能“假通过” | 质量门显式设置 `PYTHONPATH=src` | full-suite current-source run | 已解决 |
 
 当前四种“记忆”语义必须分开：
 
 1. Run checkpoint：为了崩溃恢复，不是用户知识；
-2. Thread context：为了短期指代，只保存上一问题、实体、symbol、状态和 gap code；
+2. Conversation memory：完整对话/工具事件持久账本，以及预算内旧摘要 + 最近事件 prompt 投影；
 3. Request corpus：本次授权上传，不默认跨请求保存；
 4. Session documents：显式 opt-in 的解析页文本，进程内短 TTL，不是永久知识；
 5. Persistent domain corpus：独立 ingestion/ACL/索引控制面，通过 `RetrievalSource` 只读接入；
 6. Versioned finance knowledge：代码管理的领域定义，不是用户记忆。
 
-任何 evidence、PDF 原文、prompt、隐藏推理、API key 都不得进入 thread memory。
+任何 EvidenceBundle、PDF 原文、system/model prompt、隐藏推理、API key 都不得进入 conversation memory。用户问题、最终报告和脱敏 Harness 工具状态属于用户可见对话历史，可以进入事件账本，但不能支持事实 claim。
 
 ### 4.10 API、上传作业与输出
 
@@ -414,7 +418,7 @@ Gateway 负责 provider API、版权许可、索引 ACL 和 lexical/vector/hybri
 3. 故障注入：畸形输入、无界响应、网络拒绝、崩溃恢复、citation laundering、冲突；
 4. 交付物：静态检查、覆盖率、PEP 517 wheel、隔离安装、CLI 和已安装包评测。
 
-当前 2.2 基线：11/11 企业黑盒场景、140 项 pytest 测试、83.95% 总源码覆盖率（80% 阻断门），Ruff、mypy、
+当前 2.2 基线：11/11 企业黑盒场景、142 项 pytest 测试、84.18% 总源码覆盖率（80% 阻断门），Ruff、mypy、
 compileall、Compose YAML、PEP 517 构建和全新临时目录 wheel 导入全部通过。阶段性数字保留在各阶段记录中，
 不应替代当前基线。
 

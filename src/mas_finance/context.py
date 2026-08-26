@@ -195,11 +195,8 @@ class FinancialContextAssembler:
 
 
 def _safe_thread_context(value: Mapping[str, Any]) -> dict[str, Any]:
-    allowed = {"previous_query", "entities", "symbols", "last_status", "unresolved_gap_codes"}
-    result = {str(key): item for key, item in value.items() if str(key) in allowed}
-    if "previous_query" in result:
-        result["previous_query"] = str(result["previous_query"])[:500]
-    return result
+    allowed = {"summary", "recent_events", "entity_state", "relations", "focus_entities", "manifest"}
+    return {str(key): item for key, item in value.items() if str(key) in allowed}
 
 
 def _tokens(text: str) -> set[str]:

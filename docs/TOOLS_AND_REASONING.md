@@ -402,28 +402,28 @@ Evidence cards按 `entity × source_type` 分组后轮询选择，避免第一�
 
 例如市场 provider 只返回 current price，但估值 requirement 还要求 market cap 和 trailing P/E，Coverage 仍保持 incomplete，报告显示缺口。
 
-## 7. 短期记忆如何影响工具选择
+## 7. 持久对话记忆如何影响工具选择
 
-同一个 `thread_id` 的下一次调用会读取最小线程上下文：
+同一个 `thread_id` 的下一次调用会读取有界对话投影：
 
 ```json
 {
-  "previous_query": "分析 Apple 的估值",
-  "entities": ["Apple"],
-  "symbols": {"Apple": "AAPL"},
-  "last_status": "degraded",
-  "unresolved_gap_codes": ["network_denied"]
+  "summary": {"user_requests": [], "assistant_outcomes": [], "tool_activity": []},
+  "recent_events": [{"kind": "user_message", "content": "分析 Apple 的估值", "occurred_at": "..."}],
+  "focus_entities": ["Apple"],
+  "relations": [{"subject": "Apple", "predicate": "has_symbol", "object": "AAPL"}],
+  "manifest": {"full_history_persisted": true, "memory_is_evidence": false}
 }
 ```
 
 用途：
 
 - “那它的最大回撤呢？”可以继承 Apple/AAPL；
-- 只有真实指代/追问才继承上一实体；当前问题显式或检测到的新实体优先；
-- 上一轮缺口可进入 Prompt research context；
-- previous query 帮助语言上下文，但不能作为事实 evidence。
+- 只有明确指代才继承历史实体；当前问题显式或检测到的新实体优先；
+- 前者/后者/复数按最近有序实体组解析，歧义单数不猜；
+- 旧请求、结果、工具状态和 gap 可帮助多轮理解，但不能作为事实 evidence。
 
-不会保存到线程记忆：
+不会保存到对话账本：
 
 - 原始 PDF；
 - EvidenceBundle；
@@ -435,10 +435,10 @@ Evidence cards按 `entity × source_type` 分组后轮询选择，避免第一�
 删除接口：
 
 ```http
-DELETE /api/v1/memory/threads/{thread_id}
+DELETE /api/v1/conversations/{thread_id}
 ```
 
-线程记忆是严格类型记录，默认 TTL 7 天。个人长期记忆只通过显式 CRUD 保存 profile/preference/experience/skill，同类同标题采用最新明确写入且最多召回八条；它永远不是 Evidence。个人 PDF 也只有独立持久上传接口才入库，临时上传不会自动 promotion。HTTP 层仍是单部署 API-key 身份边界，多用户上线前必须增加可信 principal、导出、retention 和审计。完整设计见 [个人金融助手：记忆、上下文与扩展边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
+对话记忆是严格类型的持久事件账本，旧事件在 prompt 中按预算滚动压缩，数据库记录保留到显式删除；它永远不是 Evidence。个人长期记忆只通过显式 CRUD 保存 profile/preference/experience/skill，同类同标题采用最新明确写入且最多召回八条。个人 PDF 也只有独立持久上传接口才入库，临时上传不会自动 promotion。HTTP 层仍是单部署 API-key 身份边界，多用户上线前必须增加可信 principal、导出、retention 和审计。完整设计见 [持久对话记忆](CONVERSATION_MEMORY.md) 与 [个人助手边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
 
 ## 8. 网络、权限和失败行为
 

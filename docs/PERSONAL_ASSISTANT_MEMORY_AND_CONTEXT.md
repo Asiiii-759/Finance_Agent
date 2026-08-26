@@ -178,10 +178,16 @@ provider 可用且已获网络授权时优先 hybrid。SQLite 仍只持久化页
 
 ## 6. 记忆模型
 
-### 6.1 短期线程记忆
+### 6.1 持久对话记忆
 
-SQLite 中只保存：上一问题、实体、symbol 映射、上一状态和未解决 gap code。它用于“那它呢？”等承接，
-不保存整段对话、报告或 Evidence，默认 TTL 七天，可按 thread 显式删除。
+SQLite 按 tenant/user/thread 持久保存 user、Harness tool 和 assistant 事件，直到用户显式调用
+`DELETE /api/v1/conversations/{thread_id}`。完整账本不直接进入模型：达到可配置字符预算的 85% 后，旧事件形成
+确定性结构化摘要，最近事件保持原始顺序和时间；压缩不会删除账本记录。
+
+实体状态记录首次/最近出现时间、sequence、次数和 `has_symbol/co_mentioned` 关系。“前者/后者/它们”按最近有序
+实体组解析；多个候选时的单数“它”不会猜。无论是否出现代词，只要线程已有历史，有界投影都会进入 prompt；
+历史实体仅在明确指代时继承。对话内容和工具历史仍是不可信上下文，绝不能替代 Evidence。完整数据模型和删除语义见
+[持久对话记忆与动态上下文](CONVERSATION_MEMORY.md)。
 
 ### 6.2 个人长期记忆
 
@@ -280,7 +286,7 @@ Harness 能证明的是“没有执行任意代码、相同输入可复算、数
 - 模型合成逐字 quote、citation laundering、坏 JSON 确定性回退；
 - SEC/FRED/行情/RAG 契约、网络预算、审计脱敏和报告校验。
 
-当前全量结果：140 tests passed，statement coverage 83.95%，ruff 与 mypy 通过。
+当前全量结果：142 tests passed，statement coverage 84.18%，ruff 与 mypy 通过。
 
 ## 11. 明确限制与下一步条件
 

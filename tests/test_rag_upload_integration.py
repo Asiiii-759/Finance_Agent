@@ -32,7 +32,7 @@ def make_config(root: Path, *, allow_network: bool = False) -> AppConfig:
         api_key=None,
         llm=LLMSettings(None, "https://api.deepseek.com", "deepseek-v4-flash", 10),
         allow_network=allow_network,
-        thread_memory_enabled=False,
+        conversation_memory_enabled=False,
     )
 
 

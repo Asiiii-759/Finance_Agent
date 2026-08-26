@@ -34,7 +34,7 @@ Multi-Agent-project/
 │   ├── research.py        # 中英金融意图、ResearchScope 与 evidence requirements
 │   ├── contracts.py       # Source / Evidence / Claim 稳定契约
 │   ├── harness.py         # 工具权限、预算、重试、审计
-│   ├── memory_store.py    # 严格类型、TTL 与隔离的短期线程记忆
+│   ├── memory_store.py    # 持久对话事件、滚动摘要、实体关系与 namespace 隔离
 │   ├── personal_knowledge.py # 用户隔离的持久 PDF 页文本库
 │   ├── embeddings.py      # embedding provider 协议与受限 HTTP 边界
 │   ├── corpus.py          # BM25、向量、RRF 与文档分散检索后端
@@ -142,15 +142,15 @@ run identity/预算上限绑定 → capability → side effect → network → �
 | 平面 | 命名空间 | 内容 | 实现 |
 |---|---|---|---|
 | Run checkpoint | tenant/thread/run 哈希 thread ID | graph step、plan、observations、证据、audit | LangGraph `InMemorySaver` / `SqliteSaver` |
-| Thread memory | tenant/user/thread/kind | 用户确认的会话状态 | `SQLiteMemoryStore` / `InMemoryStore` |
+| Conversation memory | tenant/user/thread/kind | 完整 user/tool/assistant 事件与有界 prompt 投影 | `SQLiteMemoryStore` |
 | Personal memory | tenant/user/kind | 显式 profile/preference/experience/skill | SQLiteMemoryStore；同槽位显式覆盖 |
 | Personal knowledge | tenant/user/document | 解析页文本与来源元数据 | SQLite 文本 + BM25；配置后可在查询期 embedding/RRF；显式上传/删除 |
 | Domain corpus | tenant/KB/version | 文档 chunk、metadata、索引 | retrieval backend |
 | Audit | tenant/thread/run/call | 脱敏参数、状态、耗时、错误码 | run state + artifact；生产待 append-only store |
 
-短期记忆是严格类型的 `ThreadContextMemory`，只允许 previous query、entity/symbol、上次状态和未解决 gap code。默认 TTL 为 7 天。SQLite 查询使用完整命名空间等值条件，不提供跨 tenant 的隐式搜索，并支持 namespace 删除。
+对话完整事件账本默认保留到用户显式删除；进入模型的是 16K 字符预算内的结构化旧摘要、最近原始事件、时间化实体状态与关系。达到预算 85% 才滚动压缩，原事件不删除。显式/当前检测实体优先；前者、后者和复数指代使用最近有序实体组，多个候选下的单数代词不会猜测。记忆不保存 EvidenceBundle，也不能作为事实来源。详见 [持久对话记忆与动态上下文](CONVERSATION_MEMORY.md)。
 
-主服务用短期上下文处理“那它呢”一类连续提问，但当前问题中的显式/检测实体永远优先，避免 Apple 记忆覆盖 Microsoft 新问题。它不保存 EvidenceBundle，也不能作为事实来源。个人长期记忆只由显式 CRUD 创建，最多召回八条且作为低权限 personal context；个人 PDF 必须走独立持久上传接口，临时上传不会自动入库。完整边界见 [个人金融助手：记忆、上下文与扩展边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
+个人长期记忆只由显式 CRUD 创建，最多召回八条且作为低权限 personal context；个人 PDF 必须走独立持久上传接口，临时上传不会自动入库。完整边界见 [个人金融助手：记忆、上下文与扩展边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
 
 检查点包含恢复所需的证据文本，属于敏感 run 数据。生产部署必须设置加密、保留期与删除任务；不能把它当长期用户记忆。
 
@@ -216,7 +216,7 @@ python -m compileall -q src tests
 pip check
 ```
 
-覆盖范围包括：契约引用完整性和 content-addressed 防篡改、工具输入/输出契约、权限/分账预算/脱敏、provider 故障、无证据失败、SQLite checkpoint 恢复、线程实体切换与 TTL、上下文裁剪、citation laundering、金融指标血缘、PDF 上传安全、API 鉴权/作业/上传和产物路径安全。可运行评测矩阵见 [企业级验证与故障注入报告](ENTERPRISE_EVALUATION.md)。
+覆盖范围包括：契约引用完整性和 content-addressed 防篡改、工具输入/输出契约、权限/分账预算/脱敏、provider 故障、无证据失败、SQLite checkpoint 恢复、持久对话/动态压缩/指代/显式删除、上下文裁剪、citation laundering、金融指标血缘、PDF 上传安全、API 鉴权/作业/上传和产物路径安全。可运行评测矩阵见 [企业级验证与故障注入报告](ENTERPRISE_EVALUATION.md)。
 
 ## 12. 后续优先级
 

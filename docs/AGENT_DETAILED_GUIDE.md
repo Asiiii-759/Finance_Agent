@@ -126,7 +126,7 @@ Multi-Agent-project/
 │   ├── research.py        # 金融 intents、ResearchScope 和字段级 requirements
 │   ├── contracts.py       # SourceRef、Evidence、Claim、EvidenceBundle
 │   ├── harness.py         # 工具注册、权限、预算、重试、超时、脱敏审计
-│   ├── memory_store.py    # 严格类型、TTL 与 namespace 隔离的线程记忆
+│   ├── memory_store.py    # 持久对话事件、动态压缩、实体关系与 namespace 隔离
 │   ├── embeddings.py      # embedding provider 与受限 HTTP API
 │   ├── corpus.py          # request/session/personal BM25、向量与 RRF
 │   ├── retrieval.py       # 检索结果 → EvidenceBundle
@@ -581,7 +581,7 @@ LLM 做规划选择和自然语言合成，不做工具授权、来源登记、�
 
 `FinancialContextAssembler` 使用 `finance-evidence-synthesis-v3`，先按 task、research state、thread/personal context 和 evidence trust zone 组织上下文。Evidence 默认按 `entity × source type × domain/provider origin` 分组，并保持文档全局相关排序；只有模型或明确多文档综合意图设置 `diversify_documents` 时，文档才按 document ID 分散。随后按问题重合度、来源质量、结构化程度、置信度和 retrieval rank 排序。规划默认 24,000、生成默认 48,000 evidence 字符，均可调到 200,000；长文本取问题附近窗口。每张 card 包含 provider、locator、source type、period、as-of 和 published-at；逐阶段 `ContextManifest` 精确记录真正进入 prompt 的 evidence ID、遗漏数量、分组、来源类型和预算。
 
-Thread context 只包含前一问题、entity/symbol、上次状态和 gap code，明确标记为非事实来源；文档内容明确标记为不可信数据。`EvidenceBoundLLMSynthesizer` 随后要求模型返回纯 JSON：
+Thread context 是预算内的结构化旧摘要、最近 user/tool/assistant 事件和实体关系，明确标记为非事实来源；文档内容同样标记为不可信数据。`EvidenceBoundLLMSynthesizer` 随后要求模型返回纯 JSON：
 
 ```json
 {
@@ -641,7 +641,7 @@ Validator 会检查：
 | 平面 | 命名空间 | 典型内容 | 当前实现 |
 |---|---|---|---|
 | Run checkpoint | tenant/thread/run 哈希 | graph step、计划、观察、证据、预算、报告 | LangGraph InMemorySaver / SqliteSaver；主服务 SQLite |
-| Thread memory | tenant/user/thread/kind | 前一问题、entity/symbol、状态、gap code | 严格 `ThreadContextMemory` + SQLite，默认 TTL 7 天 |
+| Conversation memory | tenant/user/thread/kind | 完整 user/tool/assistant 事件与有界上下文投影 | SQLite 事件账本 + 结构化滚动摘要，显式删除前持久 |
 | Session documents | tenant/user/thread | 显式保留的解析页文本与 provenance | 进程内存，默认 TTL 1 小时，可列举/删除 |
 | Personal memory | tenant/user/kind | 显式 profile/preference/experience/skill | SQLite CRUD；同 kind/title 最新写入覆盖 |
 | Personal knowledge | tenant/user/document | 明确持久上传的 PDF 页文本与 provenance | SQLite 页文本 + request-time BM25/可选 hybrid，可列举/删除 |
@@ -652,7 +652,7 @@ Validator 会检查：
 
 检查点为了准确恢复，包含完整 EvidenceBundle 和部分文本证据，因此属于敏感运行数据。它不应该被自动用于未来用户画像，也不应该永久保存。生产环境必须补充：静态加密、KMS/密钥轮换、TTL、删除任务、访问审计与备份策略。
 
-短期 thread memory 与 checkpoint 分离：它只允许 previous query、entity/symbol、上次状态和未解决 gap code，不保存 EvidenceBundle、原始 PDF、prompt 或模型隐藏推理。会话文档是另一平面：只在显式保留时保存解析页文本，原 PDF 仍删除；过期或 `DELETE /api/v1/session-documents/{thread_id}` 后释放。个人 memory/knowledge 也只能通过独立显式接口持久化，临时内容不会自动 promotion。完整语义见 [文档生命周期设计](DOCUMENT_LIFECYCLE.md) 与 [个人助手边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
+Conversation memory 与 checkpoint 分离：前者持久记录 user/tool/assistant 事件，后者恢复单个 run 的图状态。模型只看到预算内的结构化旧摘要和最近原始事件；压缩不删除完整账本。它不保存 EvidenceBundle、原始 PDF 或隐藏推理，也不能作为事实来源。会话文档是另一平面：只在显式保留时保存解析页文本，原 PDF 仍删除；过期或 `DELETE /api/v1/session-documents/{thread_id}` 后释放。个人 memory/knowledge 也只能通过独立显式接口持久化，临时内容不会自动 promotion。完整语义见 [持久对话记忆](CONVERSATION_MEMORY.md)、[文档生命周期设计](DOCUMENT_LIFECYCLE.md) 与 [个人助手边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
 
 ### 14.2 实体继承规则
 
@@ -660,7 +660,7 @@ Validator 会检查：
 
 1. API 显式 entities；
 2. 当前 query/当前文档检测到的 entities；
-3. 只有“它、该公司、what about it”等真实指代时才使用线程 entities。
+3. 只有明确指代时才继承历史 entities；前者/后者/复数按最近有序实体组，多个候选下的单数代词不猜。
 
 因此先问 Apple、再问“Microsoft 的最大回撤呢”只研究 Microsoft；再问“那它呢”才会继承上一实体。记忆永远不能作为事实 evidence。
 
@@ -747,7 +747,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/analyze-upload \
 - `GET /health`
 - `GET /api/v1/config`
 - `GET /api/v1/tools`
-- `DELETE /api/v1/memory/threads/{thread_id}`
+- `DELETE /api/v1/conversations/{thread_id}`
 - `GET /api/v1/session-documents/{thread_id}`
 - `DELETE /api/v1/session-documents/{thread_id}`
 - `POST /api/v1/analyze`
@@ -781,8 +781,9 @@ MAS_EMBEDDING_ENDPOINT=
 MAS_EMBEDDING_MODEL=
 MAS_EMBEDDING_API_KEY=
 MAS_EMBEDDING_TIMEOUT_SECONDS=30
-MAS_THREAD_MEMORY_ENABLED=true
-MAS_THREAD_MEMORY_TTL_SECONDS=604800
+MAS_CONVERSATION_MEMORY_ENABLED=true
+MAS_CONVERSATION_CONTEXT_CHARACTERS=16000
+MAS_CONVERSATION_RECENT_EVENTS=12
 MAS_SESSION_DOCUMENT_TTL_SECONDS=3600
 MAS_MAX_SESSION_DOCUMENT_SESSIONS=100
 
@@ -936,7 +937,7 @@ class RAGClient(Protocol):
 - 主/备 provider 重规划和 gap 恢复；
 - 无证据 fail-closed；
 - SQLite checkpoint 崩溃恢复、预算/序号恢复、严格 JSON 与 schema 拒绝；
-- memory 的 tenant/user/thread 隔离、TTL、实体切换与 defensive copy；
+- conversation memory 的 tenant/user/thread 隔离、重启持久化、动态压缩、实体指代与显式删除；
 - PDF 上传类型、大小、数量、文件名和路径安全；
 - API 鉴权、同步分析、上传、job 与产物路径；
 - LLM context omission、quote 校验、无关 citation 清除与确定性 fallback；

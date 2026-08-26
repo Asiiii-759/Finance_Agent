@@ -306,7 +306,7 @@ class FinanceSystemTestCase(unittest.TestCase):
                 )
                 tools = await client.get("/api/v1/tools")
                 config = await client.get("/api/v1/config")
-                deleted = await client.delete("/api/v1/memory/threads/memory-delete-test")
+                deleted = await client.delete("/api/v1/conversations/memory-delete-test")
                 return analysis, tools, config, deleted
 
         analysis, tools, config, deleted = asyncio.run(scenario())
@@ -335,7 +335,9 @@ class FinanceSystemTestCase(unittest.TestCase):
         self.assertFalse(config_payload["embedding_enabled"])
         self.assertIsNone(config_payload["embedding_model"])
         self.assertEqual(deleted.status_code, 200)
-        self.assertEqual(deleted.json()["deleted_records"], 1)
+        self.assertGreaterEqual(deleted.json()["events"], 2)
+        self.assertEqual(deleted.json()["summaries"], 0)
+        self.assertEqual(deleted.json()["checkpoints"], 1)
 
     def test_embedding_config_requires_endpoint_and_model_together(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

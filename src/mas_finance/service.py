@@ -32,11 +32,13 @@ from .market import (
 )
 from .market_data import DEFAULT_TICKER_MAP, MarketDataClient
 from .memory_store import (
+    ConversationEventKind,
+    EntityRelation,
     MemoryNamespace,
     PersonalMemory,
     PersonalMemoryKind,
     SQLiteMemoryStore,
-    ThreadContextMemory,
+    build_conversation_window,
 )
 from .metrics import describe_metric_operations, financial_calculation_harness_tool
 from .ocr import PaddleOCRClient
@@ -448,10 +450,11 @@ class FinanceAnalysisService:
         if use_session_documents and thread_id is None:
             raise ValueError("thread_id is required when using session documents")
         actual_thread_id = thread_id or f"run-{uuid4().hex[:8]}"
+        actual_run_id = run_id or f"run-{uuid4().hex[:12]}"
         # Network access requires both deployment authorization and explicit
         # per-request consent. None never means implicit consent.
         network_allowed = self.config.allow_network and allow_network is True
-        thread_context = self._load_thread_context(tenant_id, user_id, actual_thread_id)
+        thread_context = self._load_conversation_context(tenant_id, user_id, actual_thread_id)
         personal_context = (
             self._recall_personal_memories(tenant_id, user_id, query)
             if use_personal_memory and self.config.personal_memory_enabled
@@ -667,7 +670,7 @@ class FinanceAnalysisService:
             query=query,
             explicit_entities=entities or [],
             detected_entities=detected_entities,
-            remembered_entities=thread_context.get("entities") or [],
+            conversation_context=thread_context,
         )
         if requested_entities:
             market_client = MarketDataClient(
@@ -687,7 +690,11 @@ class FinanceAnalysisService:
                 )
             )
 
-        remembered_symbols = dict(thread_context.get("symbols") or {})
+        remembered_symbols = {
+            str(item["subject"]): str(item["object"])
+            for item in thread_context.get("relations") or []
+            if item.get("predicate") == "has_symbol"
+        }
         resolved_symbols: dict[str, str] = {}
         for entity in requested_entities:
             candidate = (symbols or {}).get(entity) or remembered_symbols.get(entity) or DEFAULT_TICKER_MAP.get(entity)
@@ -720,6 +727,17 @@ class FinanceAnalysisService:
                 and _requests_document_research(query)
             )
         )
+        relations = tuple(
+            [
+                EntityRelation(entity, "has_symbol", resolved_symbols[entity])
+                for entity in requested_entities
+                if entity in resolved_symbols
+            ]
+            + [
+                EntityRelation(requested_entities[index], "co_mentioned", requested_entities[index + 1])
+                for index in range(len(requested_entities) - 1)
+            ]
+        )
         request = ResearchRequest(
             query=query,
             entities=requested_entities,
@@ -727,7 +745,7 @@ class FinanceAnalysisService:
             tenant_id=tenant_id,
             user_id=user_id,
             thread_id=actual_thread_id,
-            run_id=run_id or f"run-{uuid4().hex[:12]}",
+            run_id=actual_run_id,
             allow_network=network_allowed,
             max_iterations=6,
             max_model_calls=7 if llm_client is not None else 1,
@@ -743,39 +761,91 @@ class FinanceAnalysisService:
             personal_context=personal_context,
             available_document_count=len(document_contexts) + len(personal_documents),
         )
-        outcome = FinancialResearchAgent(
-            harness,
-            planner=(
-                ModelPlanner(
-                    harness,
-                    fallback=AdaptivePlanner(document_tools=tuple(document_tool_names)),
-                    max_evidence_chars=self.config.planning_evidence_characters,
-                )
-                if llm_client is not None
-                else AdaptivePlanner(document_tools=tuple(document_tool_names))
-            ),
-            synthesizer=(
-                EvidenceBoundLLMSynthesizer(
-                    llm_client,
-                    harness=harness,
-                    max_evidence_chars=self.config.synthesis_evidence_characters,
-                    max_output_tokens=self.config.synthesis_output_tokens,
-                )
-                if llm_client is not None
-                else DeterministicSynthesizer()
-            ),
-            checkpointer=self._graph_checkpointer,
-        ).run(request, resume=resume)
+        if self.config.conversation_memory_enabled:
+            self.memory_store.append_conversation_event(
+                self._conversation_namespace(tenant_id, user_id, actual_thread_id),
+                event_id=stable_id("event", {"run_id": actual_run_id, "kind": "user"}),
+                kind=ConversationEventKind.USER_MESSAGE,
+                content=query,
+                run_id=actual_run_id,
+                entities=requested_entities,
+                relations=relations,
+            )
+        try:
+            outcome = FinancialResearchAgent(
+                harness,
+                planner=(
+                    ModelPlanner(
+                        harness,
+                        fallback=AdaptivePlanner(document_tools=tuple(document_tool_names)),
+                        max_evidence_chars=self.config.planning_evidence_characters,
+                    )
+                    if llm_client is not None
+                    else AdaptivePlanner(document_tools=tuple(document_tool_names))
+                ),
+                synthesizer=(
+                    EvidenceBoundLLMSynthesizer(
+                        llm_client,
+                        harness=harness,
+                        max_evidence_chars=self.config.synthesis_evidence_characters,
+                        max_output_tokens=self.config.synthesis_output_tokens,
+                    )
+                    if llm_client is not None
+                    else DeterministicSynthesizer()
+                ),
+                checkpointer=self._graph_checkpointer,
+            ).run(request, resume=resume)
+        finally:
+            if self.config.conversation_memory_enabled:
+                namespace = self._conversation_namespace(tenant_id, user_id, actual_thread_id)
+                for audit in harness.audit_events(actual_run_id):
+                    self.memory_store.append_conversation_event(
+                        namespace,
+                        event_id=stable_id("event", {"run_id": actual_run_id, "call_id": audit["call_id"]}),
+                        kind=ConversationEventKind.TOOL_EVENT,
+                        content=f"{audit['tool_name']}: {audit['result_status']}",
+                        occurred_at=str(audit["timestamp"]),
+                        run_id=actual_run_id,
+                        payload={
+                            key: audit.get(key)
+                            for key in (
+                                "tool_name",
+                                "capability",
+                                "result_status",
+                                "attempts",
+                                "network_attempts",
+                                "error_code",
+                            )
+                        },
+                    )
         result = outcome.to_dict()
-        self._save_thread_context(
-            tenant_id,
-            user_id,
-            actual_thread_id,
-            query=query,
-            entities=requested_entities,
-            symbols=resolved_symbols,
-            result=result,
-        )
+        if self.config.conversation_memory_enabled:
+            namespace = self._conversation_namespace(tenant_id, user_id, actual_thread_id)
+            self.memory_store.append_conversation_event(
+                namespace,
+                event_id=stable_id("event", {"run_id": actual_run_id, "kind": "assistant"}),
+                kind=ConversationEventKind.ASSISTANT_MESSAGE,
+                content=str(result["report"]),
+                run_id=actual_run_id,
+                entities=requested_entities,
+                relations=relations,
+                payload={
+                    "status": result["status"],
+                    "claim_count": len(result.get("claims") or ()),
+                    "source_count": len(result.get("sources") or ()),
+                    "gap_codes": [
+                        str(item.get("code") or "data_gap")
+                        for item in result.get("gaps") or ()
+                        if not item.get("resolved", False)
+                    ][:20],
+                },
+            )
+            build_conversation_window(
+                self.memory_store,
+                namespace,
+                max_characters=self.config.conversation_context_characters,
+                recent_event_count=self.config.conversation_recent_events,
+            )
 
         artifacts: dict[str, str] = {}
         if export_artifacts:
@@ -908,92 +978,42 @@ class FinanceAnalysisService:
         match = re.fullmatch(r"[0-9a-f]{8}_(.+)", path.name)
         return match.group(1) if match else path.name
 
-    def _memory_namespace(self, tenant_id: str, user_id: str, thread_id: str) -> MemoryNamespace:
+    def _conversation_namespace(self, tenant_id: str, user_id: str, thread_id: str) -> MemoryNamespace:
         return MemoryNamespace(
             tenant_id=stable_id("tenant", {"value": tenant_id}),
             user_id=stable_id("user", {"value": user_id}),
-            kind="thread_context",
+            kind="conversation_history",
             thread_id=stable_id("thread", {"value": thread_id}),
         )
 
-    def _load_thread_context(self, tenant_id: str, user_id: str, thread_id: str) -> dict:
-        if not self.config.thread_memory_enabled:
+    def _load_conversation_context(self, tenant_id: str, user_id: str, thread_id: str) -> dict:
+        if not self.config.conversation_memory_enabled:
             return {}
-        namespace = self._memory_namespace(tenant_id, user_id, thread_id)
-        try:
-            record = self.memory_store.get(namespace, "latest")
-        except ValueError:
-            self.memory_store.delete_namespace(namespace)
-            return {}
-        if record is not None:
-            expires_at = record.metadata.get("expires_at")
-            try:
-                parsed_expiry = datetime.fromisoformat(str(expires_at)) if expires_at else None
-                expired = (
-                    record.metadata.get("schema_version") != 1
-                    or parsed_expiry is None
-                    or parsed_expiry.tzinfo is None
-                    or parsed_expiry <= datetime.now(UTC)
-                )
-            except (TypeError, ValueError):
-                expired = True
-            if expired:
-                self.memory_store.delete_namespace(namespace)
-                return {}
-        if record is None:
-            return {}
-        try:
-            return ThreadContextMemory.from_dict(record.value).to_dict()
-        except ValueError:
-            self.memory_store.delete_namespace(namespace)
-            return {}
-
-    def _save_thread_context(
-        self,
-        tenant_id: str,
-        user_id: str,
-        thread_id: str,
-        *,
-        query: str,
-        entities: tuple[str, ...],
-        symbols: dict[str, str],
-        result: dict,
-    ) -> None:
-        if not self.config.thread_memory_enabled:
-            return
-        unresolved = [
-            str(item.get("code") or "data_gap") for item in result.get("gaps") or () if not item.get("resolved", False)
-        ]
-        memory = ThreadContextMemory(
-            previous_query=query[:500],
-            entities=entities,
-            symbols=dict(symbols),
-            last_status=str(result.get("status") or "failed"),
-            unresolved_gap_codes=tuple(dict.fromkeys(unresolved))[:20],
-        )
-        self.memory_store.put(
-            self._memory_namespace(tenant_id, user_id, thread_id),
-            "latest",
-            memory.to_dict(),
-            metadata={
-                "schema_version": 1,
-                "memory_class": "short_term_thread_context",
-                "contains_evidence": False,
-                "expires_at": (
-                    datetime.now(UTC) + timedelta(seconds=self.config.thread_memory_ttl_seconds)
-                ).isoformat(),
-            },
+        return build_conversation_window(
+            self.memory_store,
+            self._conversation_namespace(tenant_id, user_id, thread_id),
+            max_characters=self.config.conversation_context_characters,
+            recent_event_count=self.config.conversation_recent_events,
         )
 
-    def delete_thread_context(
+    def delete_conversation(
         self,
         thread_id: str,
         *,
         tenant_id: str = "default",
         user_id: str = "anonymous",
-    ) -> int:
+    ) -> dict[str, int]:
         _validate_thread_id(thread_id)
-        return self.memory_store.delete_namespace(self._memory_namespace(tenant_id, user_id, thread_id))
+        namespace = self._conversation_namespace(tenant_id, user_id, thread_id)
+        run_ids = self.memory_store.conversation_run_ids(namespace)
+        deleted = self.memory_store.delete_conversation(namespace)
+        for stored_run_id in run_ids:
+            checkpoint_thread_id = stable_id(
+                "run",
+                {"tenant_id": tenant_id, "thread_id": thread_id, "run_id": stored_run_id},
+            )
+            self._graph_checkpointer.delete_thread(checkpoint_thread_id)
+        return {**deleted, "checkpoints": len(run_ids)}
 
     def _personal_memory_namespace(self, tenant_id: str, user_id: str) -> MemoryNamespace:
         tenant_key, user_key = _personal_principal_ids(tenant_id, user_id)
@@ -1274,22 +1294,29 @@ def _resolve_request_entities(
     query: str,
     explicit_entities: list[str],
     detected_entities: list[str],
-    remembered_entities: object,
+    conversation_context: dict,
 ) -> tuple[tuple[str, ...], bool]:
     explicit = _normalized_entities(explicit_entities)
     detected = _normalized_entities(detected_entities)
-    remembered = _normalized_entities(
-        remembered_entities
-        if isinstance(remembered_entities, Sequence) and not isinstance(remembered_entities, (str, bytes))
-        else []
-    )
+    remembered = _normalized_entities(conversation_context.get("focus_entities") or [])
     contextual = _is_contextual_followup(query)
+    has_history = int(conversation_context.get("manifest", {}).get("latest_sequence") or 0) > 0
     if explicit:
-        return explicit, contextual
+        return explicit, has_history
     if detected:
         if _references_previous_entity(query):
             return tuple(dict.fromkeys((*detected, *remembered))), True
-        return detected, contextual
+        return detected, has_history
+    if _references_first_entity(query):
+        return remembered[:1], True
+    if _references_last_entity(query):
+        return remembered[-1:], True
+    if _references_entity_group(query):
+        return remembered, True
+    if _references_previous_entity(query):
+        # A singular pronoun after a multi-entity turn is ambiguous.  Keep the
+        # context visible to the planner but do not guess which entity it means.
+        return (remembered if len(remembered) == 1 else ()), True
     if contextual:
         return remembered, True
     return (), False
@@ -1309,6 +1336,24 @@ def _references_previous_entity(query: str) -> bool:
     return any(
         marker in normalized
         for marker in (" 它", "其", "该公司", "这家公司", "上述公司", " it ", " its ", " that company ")
+    )
+
+
+def _references_first_entity(query: str) -> bool:
+    normalized = f" {query.casefold()} "
+    return any(marker in normalized for marker in ("前者", "第一个", "第一家", " former ", " first one "))
+
+
+def _references_last_entity(query: str) -> bool:
+    normalized = f" {query.casefold()} "
+    return any(marker in normalized for marker in ("后者", "最后一个", "最后一家", " latter ", " last one "))
+
+
+def _references_entity_group(query: str) -> bool:
+    normalized = f" {query.casefold()} "
+    return any(
+        marker in normalized
+        for marker in ("它们", "这些公司", "上述公司们", "两者", " they ", " them ", " those companies ", " both ")
     )
 
 

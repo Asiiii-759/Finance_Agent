@@ -6,7 +6,7 @@
 
 ## 1. 结论
 
-MAS Finance 的核心研究链路已经成为“可验证的参考实现”：模型从运行时工具目录自主选择研究动作，LangGraph 承载四阶段生命周期与恢复，Harness 约束每次执行，证据、计算血缘、报告校验和停止条件由代码契约控制。当前黑盒验收 11/11 通过；140 项自动化测试通过；源码总覆盖率 83.95%，80% 门槛生效；Ruff、mypy 和 `compileall` 通过。2.2 另外验证了 BM25/embedding/RRF、临时与个人 PDF、非法向量、hybrid 网络权限边界，以及 Bocha 域名 allowlist 的 provider 不服从故障。
+MAS Finance 的核心研究链路已经成为“可验证的参考实现”：模型从运行时工具目录自主选择研究动作，LangGraph 承载四阶段生命周期与恢复，Harness 约束每次执行，证据、计算血缘、报告校验和停止条件由代码契约控制。当前黑盒验收 11/11 通过；142 项自动化测试通过；源码总覆盖率 84.18%，80% 门槛生效；Ruff、mypy 和 `compileall` 通过。2.2 另外验证了 BM25/embedding/RRF、临时与个人 PDF、非法向量、hybrid 网络权限边界，以及 Bocha 域名 allowlist 的 provider 不服从故障。
 
 这里的“企业级”特指核心 Agent 的正确性边界可定义、可审计、可故障注入和失败关闭，不等于整个部署已经取得生产认证。单租户 API key、同步 provider、Redis list 作业、SQLite 敏感状态、非 append-only 审计和实验性 Yahoo 适配器仍是明确的上线门槛，见第 10 节。
 
@@ -106,7 +106,7 @@ python -m mas_finance.evaluation
 | Yahoo 是默认 provider | 默认依赖非正式接口 | 默认改为 `offline`；Yahoo 标记 experimental |
 | `/api/v1/config` 回显 database URL | DSN 可能泄漏密码 | 仅返回无凭据的 backend/capability 信息 |
 | LLM 一个 quote 可附带无关 evidence ID | citation laundering | 只保留确实包含该 quote 的证据 ID |
-| 线程记忆无 TTL | 数据无限留存 | 默认 7 天 TTL，过期或畸形记录删除 |
+| 对话历史在用户未删除前丢失 | 长对话无法跨重启持续 | 完整事件账本持久保存；显式删除同时清理摘要与 checkpoints |
 | 文档曾宣称有自动 memory promotion API | 虚假产品能力与隐私污染 | 删除自动 promotion；2.1 只恢复用户显式 CRUD 的个人记忆 |
 | 工具输入只在各 adapter 零散校验 | 多余字段静默忽略、载荷无界 | Harness 增加统一 `ToolArgumentContract` |
 | Bundle/checkpoint 可无限增长或接受 NaN | 内存、磁盘与恢复风险 | 数量、字符、JSON 与作用域硬上限 |
@@ -191,7 +191,7 @@ Evidence 按 `entity × source_type × domain/provider origin` 分组轮询；�
 | 层 | 当前实现 | 可保存 | 不可保存 |
 |---|---|---|---|
 | Run state | LangGraph InMemorySaver/SqliteSaver | phase、计划、观察、账本、报告、审计 | 不作为跨用户知识 |
-| Thread context | SQLite，精确 tenant/user/thread namespace，默认 TTL 7 天 | previous query、entity、symbol、状态、gap code | Evidence、原文、prompt、隐藏推理、凭据 |
+| Conversation context | SQLite 精确 tenant/user/thread namespace；完整账本 + 有界滚动摘要 | user/tool/assistant 事件、实体时间与关系 | EvidenceBundle、PDF 原文、system/model prompt、隐藏推理、凭据 |
 | Personal memory | SQLite，精确 tenant/user namespace，显式 CRUD | profile、preference、experience、skill | 自动提取、事实 Evidence、可执行指令、凭据 |
 | Domain corpus | 上传 PDF 的 request/session BM25 | 当前请求或显式会话授权的文档 chunk | 默认不跨请求；opt-in session 默认 1 小时 |
 | Personal corpus | SQLite 页文本 + request-time BM25 | 用户明确持久上传的 PDF 页与 provenance | 原始 PDF、其他用户文档、自动入库 |

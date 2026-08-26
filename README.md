@@ -30,12 +30,12 @@ intent → planning ↔ validation → final_generation → validation → END
 - 工具输入/输出契约、run identity、capability、网络、副作用、分账预算、重试、超时和审计控制
 - 主/备数据源重规划、模型 `finish` 证据校验与明确停止原因
 - LangGraph SQLite checkpointer、状态历史和跨 Agent 实例恢复，以及 tenant/user/thread 隔离记忆
-- 最小跨轮线程上下文、显式写入的个人 profile/preference/experience/skill、用户隔离的持久个人 PDF 知识库及逐项删除
+- 持久对话事件账本、预算驱动的“旧摘要 + 最近原始事件”、带时间/关系的实体指代，以及显式写入的个人记忆和持久 PDF 知识库
 - 按 entity/source/domain 平衡、按研究意图可选 document 分散、保留 provenance 的 Prompt ContextAssembler；规划 24K、生成 48K evidence 字符预算可调，并输出逐阶段 manifest
 - 只读 canonical-evidence 工具注入边界，可接企业 RAG、MCP gateway 或 licensed feed；未注入时不启用
 - 带逐字 evidence quote 验证的 LLM 合成与确定性降级
 - FastAPI、后台作业、CLI、报告与审计产物
-- 11 个可独立运行的黑盒验收场景和 140 项自动化测试
+- 11 个可独立运行的黑盒验收场景和 142 项自动化测试
 
 完整的运行机制、状态契约、数据源、记忆、安全边界和扩展方法见
 [Agent 详细说明](docs/AGENT_DETAILED_GUIDE.md)；架构决策摘要见
@@ -49,6 +49,7 @@ intent → planning ↔ validation → final_generation → validation → END
 [Bocha 搜索与当前模型配置实测](docs/LIVE_PROVIDER_EVALUATION.md)记录了线上契约、调用结果和保留边界。
 个人记忆、个人知识库、上下文预算、联网来源质量、MCP/企业扩展与模型自拟公式的当前边界见
 [个人金融助手：记忆、上下文与扩展边界](docs/PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
+[持久对话记忆与动态上下文](docs/CONVERSATION_MEMORY.md)详述事件账本、压缩、指代和删除语义。
 双路召回的算法、真实工具边界、部署接口、生命周期、测试与未完成项见
 [BM25 + Embedding 双路检索设计](docs/HYBRID_RETRIEVAL.md)。
 
@@ -163,7 +164,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/knowledge/documents \
 - `GET /health`
 - `GET /api/v1/config`
 - `GET /api/v1/tools`
-- `DELETE /api/v1/memory/threads/{thread_id}`
+- `DELETE /api/v1/conversations/{thread_id}`
 - `POST /api/v1/memories`
 - `GET /api/v1/memories`
 - `DELETE /api/v1/memories/{memory_id}`
@@ -199,8 +200,9 @@ MAS_EMBEDDING_ENDPOINT=
 MAS_EMBEDDING_MODEL=
 MAS_EMBEDDING_API_KEY=
 MAS_EMBEDDING_TIMEOUT_SECONDS=30
-MAS_THREAD_MEMORY_ENABLED=true
-MAS_THREAD_MEMORY_TTL_SECONDS=604800
+MAS_CONVERSATION_MEMORY_ENABLED=true
+MAS_CONVERSATION_CONTEXT_CHARACTERS=16000
+MAS_CONVERSATION_RECENT_EVENTS=12
 MAS_PERSONAL_MEMORY_ENABLED=true
 MAS_PERSONAL_KNOWLEDGE_ENABLED=true
 MAS_MAX_PERSONAL_KNOWLEDGE_DOCUMENTS=100

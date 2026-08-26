@@ -442,7 +442,11 @@ class ContextAndMemoryTests(unittest.TestCase):
             query="Compare Alpha and Beta",
             entities=("Alpha", "Beta"),
             require_documents=False,
-            thread_context={"previous_query": "private prior", "forbidden": "drop me"},
+            thread_context={
+                "focus_entities": ["Alpha"],
+                "manifest": {"memory_is_evidence": False},
+                "forbidden": "drop me",
+            },
         )
         payload, manifest = FinancialContextAssembler(
             max_evidence_chars=1_600,
@@ -471,7 +475,7 @@ class ContextAndMemoryTests(unittest.TestCase):
                 api_key=None,
                 llm=LLMSettings(None, "https://api.deepseek.com", "deepseek-v4-flash", 10),
                 allow_network=False,
-                thread_memory_enabled=True,
+                conversation_memory_enabled=True,
             )
             service = FinanceAnalysisService(config)
             service.analyze(
@@ -487,8 +491,9 @@ class ContextAndMemoryTests(unittest.TestCase):
             )
             request = second["result"]["request"]
             self.assertEqual(request["entities"], ["Apple"])
-            self.assertEqual(request["thread_context"]["previous_query"], "解释 Apple 的市盈率")
-            self.assertNotIn("evidence", request["thread_context"])
+            self.assertEqual(request["thread_context"]["focus_entities"], ["Apple"])
+            self.assertEqual(request["thread_context"]["recent_events"][0]["content"], "解释 Apple 的市盈率")
+            self.assertFalse(request["thread_context"]["manifest"]["memory_is_evidence"])
 
 
 if __name__ == "__main__":

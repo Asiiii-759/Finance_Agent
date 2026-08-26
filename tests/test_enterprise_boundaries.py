@@ -26,8 +26,9 @@ from mas_finance.harness import (
     function_tool,
 )
 from mas_finance.llm import BaseLLMClient, LLMSettings
+from mas_finance.memory_store import ConversationEventKind
 from mas_finance.metrics import MetricOperation, financial_calculation_harness_tool
-from mas_finance.service import FinanceAnalysisService
+from mas_finance.service import FinanceAnalysisService, _resolve_request_entities
 from mas_finance.synthesis import EvidenceBoundLLMSynthesizer
 
 
@@ -602,65 +603,81 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 export_artifacts=False,
             )["result"]
             self.assertEqual(inherited["request"]["entities"], ["Apple"])
-            self.assertEqual(inherited["request"]["thread_context"]["previous_query"], "解释 Apple 的市盈率")
+            self.assertEqual(inherited["request"]["thread_context"]["focus_entities"], ["Apple"])
 
-    def test_expired_thread_memory_is_deleted_not_reused(self) -> None:
+    def test_conversation_history_persists_until_explicit_deletion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            service = FinanceAnalysisService(make_test_config(Path(directory)))
+            root = Path(directory)
+            service = FinanceAnalysisService(make_test_config(root))
             service.analyze(
                 "解释 Apple 的市盈率",
                 thread_id="expired",
                 entities=["Apple"],
                 export_artifacts=False,
             )
-            namespace = service._memory_namespace("default", "anonymous", "expired")
-            record = service.memory_store.get(namespace, "latest")
-            self.assertIsNotNone(record)
-            service.memory_store.put(
-                namespace,
-                "latest",
-                record.value,
-                {
-                    "schema_version": 1,
-                    "memory_class": "short_term_thread_context",
-                    "contains_evidence": False,
-                    "expires_at": "2000-01-01T00:00:00+00:00",
-                },
+            events = service.memory_store.list_conversation_events(
+                service._conversation_namespace("default", "anonymous", "expired")
             )
+            self.assertEqual(events[0].kind, ConversationEventKind.USER_MESSAGE)
+            self.assertIn(ConversationEventKind.TOOL_EVENT, {event.kind for event in events})
+            self.assertEqual(events[-1].kind, ConversationEventKind.ASSISTANT_MESSAGE)
+            service.close()
+            service = FinanceAnalysisService(make_test_config(root))
             follow_up = service.analyze(
                 "那它的最大回撤呢？",
                 thread_id="expired",
                 export_artifacts=False,
             )["result"]
-            self.assertEqual(follow_up["request"]["entities"], [])
-            self.assertEqual(follow_up["request"]["thread_context"], {})
+            self.assertEqual(follow_up["request"]["entities"], ["Apple"])
+            deleted = service.delete_conversation("expired")
+            self.assertGreater(deleted["events"], 0)
+            self.assertGreater(deleted["checkpoints"], 0)
+            self.assertEqual(
+                service._load_conversation_context("default", "anonymous", "expired")["recent_events"],
+                [],
+            )
 
-            service.analyze(
-                "解释 Apple 的市盈率",
-                thread_id="naive-expiry",
-                entities=["Apple"],
-                export_artifacts=False,
-            )
-            naive_namespace = service._memory_namespace("default", "anonymous", "naive-expiry")
-            naive_record = service.memory_store.get(naive_namespace, "latest")
-            self.assertIsNotNone(naive_record)
-            service.memory_store.put(
-                naive_namespace,
-                "latest",
-                naive_record.value,
-                {
-                    "schema_version": 1,
-                    "memory_class": "short_term_thread_context",
-                    "contains_evidence": False,
-                    "expires_at": "2099-01-01T00:00:00",
-                },
-            )
-            naive_follow_up = service.analyze(
-                "那它的最大回撤呢？",
-                thread_id="naive-expiry",
-                export_artifacts=False,
-            )["result"]
-            self.assertEqual(naive_follow_up["request"]["entities"], [])
+    def test_reference_resolution_uses_order_and_refuses_ambiguous_singular_pronouns(self) -> None:
+        context = {
+            "focus_entities": ["Apple", "Microsoft"],
+            "manifest": {"latest_sequence": 3},
+        }
+        self.assertEqual(
+            _resolve_request_entities(
+                query="前者的估值呢？",
+                explicit_entities=[],
+                detected_entities=[],
+                conversation_context=context,
+            ),
+            (("Apple",), True),
+        )
+        self.assertEqual(
+            _resolve_request_entities(
+                query="后者的估值呢？",
+                explicit_entities=[],
+                detected_entities=[],
+                conversation_context=context,
+            )[0],
+            ("Microsoft",),
+        )
+        self.assertEqual(
+            _resolve_request_entities(
+                query="它们的估值呢？",
+                explicit_entities=[],
+                detected_entities=[],
+                conversation_context=context,
+            )[0],
+            ("Apple", "Microsoft"),
+        )
+        self.assertEqual(
+            _resolve_request_entities(
+                query="它的估值呢？",
+                explicit_entities=[],
+                detected_entities=[],
+                conversation_context=context,
+            ),
+            ((), True),
+        )
 
     def test_unknown_scope_and_markdown_injection_fail_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "entities exceed"):

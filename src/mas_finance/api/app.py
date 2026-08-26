@@ -129,10 +129,11 @@ def create_app(
             "network_allowed": app_config.allow_network,
             "sec_enabled": bool(app_config.sec_user_agent),
             "fred_enabled": bool(app_config.fred_api_key),
-            "thread_memory_enabled": app_config.thread_memory_enabled,
+            "conversation_memory_enabled": app_config.conversation_memory_enabled,
             "personal_memory_enabled": app_config.personal_memory_enabled,
             "personal_knowledge_enabled": app_config.personal_knowledge_enabled,
-            "thread_memory_ttl_seconds": app_config.thread_memory_ttl_seconds,
+            "conversation_context_characters": app_config.conversation_context_characters,
+            "conversation_recent_events": app_config.conversation_recent_events,
             "session_document_ttl_seconds": app_config.session_document_ttl_seconds,
             "max_session_document_sessions": app_config.max_session_document_sessions,
             "max_pdf_pages": app_config.max_pdf_pages,
@@ -151,13 +152,13 @@ def create_app(
     async def get_tools(_: None = Depends(auth_dependency)) -> list[dict]:
         return service.describe_tools()
 
-    @app.delete("/api/v1/memory/threads/{thread_id}")
-    async def delete_thread_memory(thread_id: str, _: None = Depends(auth_dependency)) -> dict[str, int | str]:
+    @app.delete("/api/v1/conversations/{thread_id}")
+    async def delete_conversation(thread_id: str, _: None = Depends(auth_dependency)) -> dict[str, int | str]:
         try:
-            deleted = service.delete_thread_context(thread_id)
+            deleted = service.delete_conversation(thread_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"thread_id": thread_id, "deleted_records": deleted}
+        return {"thread_id": thread_id, **deleted}
 
     @app.post("/api/v1/memories", response_model=PersonalMemoryResponse, status_code=201)
     async def save_personal_memory(

@@ -176,7 +176,7 @@ rank/score 被保留用于审计与排序，但不会被伪装成概率 confiden
 ## 6. 记忆模型
 
 进入模型的上下文按权限分层，而不是拼成一段可互相覆盖的“大 system prompt”：不可变中文系统规则位于最高层；
-用户维护的 Markdown 和召回长期记忆作为带来源标记的低权限数据；随后是对话摘要、最近原始 run、实体回放；
+用户维护的 Markdown 和召回长期记忆作为带来源标记的低权限数据；随后是全历史原子事实、对话摘要和最近原始 run；
 当前请求、工具 schema、工具结果和 Evidence 最后按规划/生成阶段组装。摘要器只接收旧摘要与事件账本，永远不接收系统规则。
 
 ### 6.1 持久对话记忆
@@ -185,36 +185,34 @@ SQLite 按 tenant/user/thread 持久保存 user、Harness tool 和 assistant 事
 `DELETE /api/v1/conversations/{thread_id}`。完整账本不直接进入模型：默认 300K token 投影预算达到 85% 后，专用 LLM
 将 20K token 近期完整 run 之前的事件滚动总结为对话概要、用户目标/需求、已完成工作、工具成败状态、未完成工作和未决问题；压缩不会删除账本记录。
 
-实体身份不由 LLM 摘要决定。系统从事件确定性构建 `entity_state`、有序 `focus_history`、当前焦点和
-`entity_events` 原子事件回放。原子事件记录时间、sequence、实体、动作、状态及来源 event/run；账本最多保留最近 100 条，
-每轮只把与当前 query/实体最相关或最近的 20 条作为 `entity_replay` 交给模型，不把完整历史实体表塞进 prompt。
-“前者/后者/它们/刚刚那个公司”仍按确定性焦点历史解析；多个候选时的单数“它”不会猜。
-历史实体仅在明确指代时继承。对话内容和工具历史仍是不可信上下文，绝不能替代 Evidence。完整数据模型和删除语义见
+每个完成 run 由专用 LLM 抽取带时间、状态、实体和来源事件 ID 的最小语义短句。`atomic_fact` 不进入摘要输入，
+下一轮从完整账本读取全部事实，不按相关性或最近 N 条裁剪；TaskFrame 在 prompt 开头直接看到这些事实并负责指代消解。
+代码只校验返回结构和来源 ID，不用规则重新判断事实语义。多个候选无法可靠消解时模型返回澄清问题。
+对话内容和工具历史仍是不可信上下文，绝不能替代 Evidence。完整数据模型和删除语义见
 [持久对话记忆与动态上下文](CONVERSATION_MEMORY.md)。
 
 ### 6.2 个人长期记忆
 
-个人记忆有四类：
+个人记忆有三类：
 
 - `profile`：稳定背景，例如常用市场或分析期限；
 - `preference`：语言、格式、风险展示偏好；
 - `experience`：用户显式要求保留的使用经验；
-- `skill`：用户显式要求保留的分析步骤或方法。
 
 长期信息有两个不同来源。`MAS_USER_PROFILE_PATH` 可指向用户主动维护的 UTF-8 Markdown；它在每轮作为独立的
 `user_instructions` 数据层注入，低于系统规则、高于系统推断记忆，绝不拼接或改写不可变 system prompt。
 `POST /api/v1/memories` 仍支持用户显式写入。
 
-若启用 `MAS_AUTOMATIC_MEMORY_CONSOLIDATION_ENABLED`、配置 LLM 且本次请求获得网络授权，一个完成的 run 会作为静默窗口：
+若启用 `MAS_AUTOMATIC_MEMORY_CONSOLIDATION_ENABLED` 并配置 LLM，一个完成的 run 会作为静默窗口：
 专用中文 LLM prompt 只读取该 run 的用户消息和已有记忆，最多生成 0～2 个候选。它看不到 system/developer prompt、工具结果和
 助手回答，因此不能总结系统指令，也不能把助手建议或金融事实沉淀成用户偏好。自动候选只允许 profile/preference/experience，
 禁止自动生成可执行 skill；置信度低于 0.75 的候选直接忽略。
 
-LLM 必须声明 `add/reinforce/update/conflict/ignore`。显式且高置信的长期陈述可在一次 run 后晋升；仅推断出的倾向必须在两个
-不同 run 中以同一记忆槽位重复出现。候选按 kind/title 和词项相似度与现有记忆去重。用户显式写入的记忆不会被自动内容覆盖；
-冲突候选单独保存并带来源 run，不会静默替换。晋升记忆保存来源、scope、置信度和 evidence_run_ids，便于审计。
+LLM 必须声明 `add/reinforce/update/ignore`。显式且高置信的长期陈述可在一次 run 后晋升；仅推断出的倾向必须在两个
+不同 run 中以同一记忆槽位重复出现。“本轮/今天”类临时要求必须 ignore；用户明确表示“从今以后”改变长期偏好时，
+`update` 会覆盖同槽位旧值，包括先前显式写入的值。晋升记忆保存来源、scope、置信度和 evidence_run_ids，便于审计。
 
-召回规则是确定性的：`profile/preference` 始终进入候选；`experience/skill` 必须与本轮 query 在 title/content/tags 上有词项重叠。英文按长度至少 2 的字母数字词项，中文按连续文本二元组匹配。排序使用“重叠数 + profile/preference 候选加分”，同分按更新时间倒序。最多八条、12,000 字符；单条注入内容最多 2,000 字符。召回结果同时进入规划和最终生成 prompt，但只是低权限偏好/背景数据，不能作为 Evidence。
+召回规则是确定性的：`profile/preference` 始终进入候选；`experience` 必须与本轮 query 在 title/content/tags 上有词项重叠。英文按长度至少 2 的字母数字词项，中文按连续文本二元组匹配。排序使用“重叠数 + profile/preference 候选加分”，同分按更新时间倒序。最多八条、12,000 字符；单条注入内容最多 2,000 字符。召回结果同时进入规划和最终生成 prompt，但只是低权限偏好/背景数据，不能作为 Evidence。
 
 同一 kind + 规范化 title 是同一槽位，后一次明确写入覆盖内容但保留创建时间。这是当前冲突策略：显式最新值
 胜出，而不是把相反偏好同时交给 LLM 猜。不同标题的语义冲突不会被模型偷偷合并；用户可以列表查看并删除。
@@ -248,7 +246,8 @@ retryable 和 suggested_action 到 ToolResult；规划模型可在后续迭代�
 
 `FinanceAnalysisService(..., evidence_tools=(...))` 仍是手工注入入口，约束与 MCP 工具相同。原始 MCP annotation 不能提升权限。HTTP MCP 的 URL 必须是启动时固定的凭据无关 HTTPS；stdio command 由部署配置，不接受模型提供的路径。配置 AllTick 或必盈许可时会自动挂载本地 `extmarket` server。FRED/Bocha/行情/MCP call 有每分钟限流。
 
-个人 skill 记忆也不是可执行插件。它只是低权限文本上下文。真正可执行 MCP 必须走 Host allowlist。
+Learned Skill 与个人记忆分库：成功且至少完成两个工具动作的 run 才可能沉淀工作路径。TaskFrame 只看 Skill 短索引，
+选中后 Planner 才看到完整步骤；Skill 始终是低权限建议，不是可执行插件。真正可执行 MCP 必须走 Host allowlist。
 
 成功的 MCP 调用参数不会写入 personal memory，而是按 `server + tool + input-schema fingerprint + arguments` 写入当前用户隔离的
 `tool_usage_memory`。记录只来自 Harness 验证成功的调用，包含成功次数和最后验证时间；召回时要求当前工具 schema 指纹一致，

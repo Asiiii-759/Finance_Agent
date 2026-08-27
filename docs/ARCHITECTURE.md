@@ -177,16 +177,17 @@ Host 会转发 server 给出的 `field` / `candidates`；内置 `extmarket` 当�
 | 平面 | 命名空间 | 内容 | 实现 |
 |---|---|---|---|
 | Run checkpoint | tenant/thread/run 哈希 thread ID | graph step、plan、observations、证据、audit | LangGraph `InMemorySaver` / `SqliteSaver` |
-| Conversation memory | tenant/user/thread/kind | 完整 user/tool/assistant 事件与有界 prompt 投影 | `SQLiteMemoryStore` |
-| Personal memory | tenant/user/kind | 显式 profile/preference/experience/skill | SQLiteMemoryStore；同槽位显式覆盖 |
+| Conversation memory | tenant/user/thread/kind | 完整 user/tool/assistant/atomic_fact 事件与有界 prompt 投影 | `SQLiteMemoryStore` |
+| Personal memory | tenant/user/kind | profile/preference/experience；明确长期 update 可覆盖，临时要求忽略 | SQLiteMemoryStore |
+| Learned Skill | tenant/user/learned_skills | 成功工作路径；索引选择后才披露完整步骤 | SQLiteMemoryStore |
 | Personal knowledge | tenant/user/document | 解析页文本与来源元数据 | SQLite 文本 + BM25；配置后可在查询期 embedding/RRF；显式上传/删除 |
 | Tool usage memory | tenant/user/`tool_usage_memory` | 曾成功的 MCP 参数示例与 schema fingerprint | 仅 Harness `success`；schema 变化后停用；最多五条进入规划上下文 |
 | Domain corpus | tenant/KB/version | 文档 chunk、metadata、索引 | retrieval backend |
-| Audit | tenant/thread/run/call | 脱敏参数、状态、耗时、错误码 | run state + artifact；生产待 append-only store |
+| Run log | tenant/user/thread/run | 脱敏参数、工具返回摘要、状态、耗时、失败阶段 | SQLite `run_logs` |
 
-对话完整事件账本默认保留到用户显式删除；进入模型的投影默认上限为 300K token。达到预算 85% 时，专用 LLM 滚动生成结构化语义摘要，最近原始事件继续保留，原账本不删除。实体事件是带时间和顺序的原子回放索引；TaskFrame 模型结合摘要、最近事件和回放理解指代，无法可靠消解时返回澄清问题，不调用工具。LLM 是研究链路的必需依赖，未配置则快速失败。记忆不保存 EvidenceBundle，也不能作为事实来源。详见 [持久对话记忆与动态上下文](CONVERSATION_MEMORY.md) 与 [LLM TaskFrame](TASK_FRAME.md)。
+对话完整事件账本默认保留到用户显式删除；进入模型的投影默认上限为 300K token。达到预算 85% 时，专用 LLM 滚动生成结构化语义摘要，最近原始事件继续保留，原账本不删除。独立的原子事实由 LLM 提取最小语义短句、带来源和时间持久化，不参加摘要且全历史进入 TaskFrame；无法可靠消解时返回澄清问题。LLM 是研究链路的必需依赖，未配置则快速失败。记忆不保存 EvidenceBundle，也不能作为事实来源。详见 [记忆与日志](CONVERSATION_MEMORY.md) 与 [LLM TaskFrame](TASK_FRAME.md)。
 
-个人长期记忆只由显式 CRUD 创建，最多召回八条且作为低权限 personal context；个人 PDF 必须走独立持久上传接口，临时上传不会自动入库。完整边界见 [个人金融助手：记忆、上下文与扩展边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
+个人长期记忆支持显式 CRUD 和受限 LLM 沉淀，最多召回八条且作为低权限 personal context；Skill 使用独立成功路径存储和渐进披露。个人 PDF 必须走独立持久上传接口，临时上传不会自动入库。完整边界见 [个人金融助手：记忆、上下文与扩展边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
 
 检查点包含恢复所需的证据文本，属于敏感 run 数据。生产部署必须设置加密、保留期与删除任务；不能把它当长期用户记忆。
 

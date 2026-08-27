@@ -31,7 +31,7 @@ LLM 是研究链路的必需依赖：未配置模型或模型计划违反契约�
 - 工具输入/输出契约、run identity、capability、网络、副作用、分账预算、重试、超时和审计控制
 - 主/备数据源重规划、模型 `finish` 证据校验与明确停止原因
 - LangGraph SQLite checkpointer、状态历史和跨 Agent 实例恢复，以及 tenant/user/thread 隔离记忆
-- 持久对话事件账本、“LLM 旧摘要 + 最近 20K token 完整 run”、模型经 entity_replay 消解指代，以及显式写入的个人记忆和持久 PDF 知识库
+- 持久对话事件账本、“LLM 旧摘要 + 最近 20K token 完整 run”、不可被摘要吞并的全历史原子事实、可更新的个人长期记忆、渐进披露 Skill 和持久 PDF 知识库
 - 按 entity/source/domain 平衡、按研究意图可选 document 分散、保留 provenance 的 Prompt ContextAssembler；规划 24K、生成 48K evidence 字符预算可调，并输出逐阶段 manifest
 - 只读 canonical-evidence 工具注入边界，可接企业 RAG、MCP gateway 或 licensed feed；未注入时不启用
 - 带逐字 evidence quote 验证的 LLM 合成；非法输出快速失败
@@ -149,9 +149,11 @@ curl -X POST http://127.0.0.1:8000/api/v1/memories \
   -d '{"kind":"preference","title":"回答风格","content":"使用中文，先给结论再解释风险。","tags":["中文"]}'
 ```
 
-配置 DeepSeek、允许本次 LLM 网络调用且启用 `MAS_AUTOMATIC_MEMORY_CONSOLIDATION_ENABLED` 时，完成的对话 run
+配置 LLM 且启用 `MAS_AUTOMATIC_MEMORY_CONSOLIDATION_ENABLED` 时，完成的对话 run
 会由专用中文 Prompt 提取最多两条长期记忆候选。明确偏好可晋升；行为推断必须在两个不同 run 中重复出现，
-临时要求、助手内容、工具结果和金融事实不会作为个人偏好。也可通过 `MAS_USER_PROFILE_PATH` 加载用户主动维护的 Markdown 长期指令。
+明确的长期改变可覆盖旧偏好；临时要求、助手内容、工具结果和金融事实不会作为个人偏好。成功的多步骤 run 可在
+`MAS_AUTOMATIC_SKILL_LEARNING_ENABLED=true` 时沉淀独立 Skill，TaskFrame 选中后才向 Planner 披露完整步骤。
+也可通过 `MAS_USER_PROFILE_PATH` 加载用户主动维护的 Markdown 长期指令。
 
 明确持久上传个人知识文档：
 
@@ -209,6 +211,7 @@ MAS_CONVERSATION_MEMORY_ENABLED=true
 MAS_CONVERSATION_CONTEXT_TOKENS=300000
 MAS_CONVERSATION_RECENT_TOKENS=20000
 MAS_AUTOMATIC_MEMORY_CONSOLIDATION_ENABLED=true
+MAS_AUTOMATIC_SKILL_LEARNING_ENABLED=true
 MAS_USER_PROFILE_PATH=
 MAS_PERSONAL_MEMORY_ENABLED=true
 MAS_PERSONAL_KNOWLEDGE_ENABLED=true

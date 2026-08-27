@@ -413,6 +413,7 @@ Evidence cards按 `entity × source_type` 分组后轮询选择，避免第一�
 {
   "summary": {"conversation_summary": "", "user_goals": [], "requirements": [], "decisions": [], "completed_work": [], "successful_tools": [], "failed_tools": [], "unfinished_work": [], "open_questions": []},
   "recent_events": [{"kind": "user_message", "content": "分析 Apple 的估值", "occurred_at": "..."}],
+  "atomic_facts": [{"event_id": "fact-1", "kind": "atomic_fact", "content": "用户要求分析 Apple 的估值。", "occurred_at": "...", "entities": ["Apple"], "payload": {"status": "requested", "source_event_ids": ["event-1"]}}],
   "entity_state": {"Apple": {"mention_count": 1, "symbol": "AAPL", "last_sequence": 1}},
   "focus_history": [{"sequence": 1, "entities": ["Apple"]}],
   "focus_entities": ["Apple"],
@@ -424,7 +425,7 @@ Evidence cards按 `entity × source_type` 分组后轮询选择，避免第一�
 用途：
 
 - “那它的最大回撤呢？”可以继承 Apple/AAPL；
-- TaskFrame 依据摘要、最近事件和原子实体回放解析历史实体；歧义时返回澄清问题；
+- TaskFrame 依据全历史原子事实、摘要和最近事件解析历史实体；歧义时返回澄清问题；
 - 旧请求、结果、工具状态和 gap 可帮助多轮理解，但不能作为事实 evidence。
 
 不会保存到对话账本：
@@ -442,7 +443,7 @@ Evidence cards按 `entity × source_type` 分组后轮询选择，避免第一�
 DELETE /api/v1/conversations/{thread_id}
 ```
 
-对话记忆是严格类型的持久事件账本，旧事件在 prompt 中按预算滚动压缩，数据库记录保留到显式删除；它永远不是 Evidence。个人长期记忆只通过显式 CRUD 保存 profile/preference/experience/skill，同类同标题采用最新明确写入且最多召回八条。个人 PDF 也只有独立持久上传接口才入库，临时上传不会自动 promotion。HTTP 层仍是单部署 API-key 身份边界，多用户上线前必须增加可信 principal、导出、retention 和审计。完整设计见 [持久对话记忆](CONVERSATION_MEMORY.md) 与 [个人助手边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
+对话记忆是严格类型的持久事件账本，旧事件在 prompt 中按预算滚动压缩，原子事实不参与摘要并全历史回放，数据库记录保留到显式删除；它永远不是 Evidence。个人长期记忆保存 profile/preference/experience，明确长期更新可覆盖旧值，临时要求不得沉淀。成功工作路径进入独立 Learned Skill，并在 TaskFrame 选择后才向 Planner 披露完整步骤。个人 PDF 只有独立持久上传接口才入库，临时上传不会自动 promotion。HTTP 层仍是单部署 API-key 身份边界，多用户上线前必须增加可信 principal、导出和 retention。完整设计见 [记忆与日志](CONVERSATION_MEMORY.md) 与 [个人助手边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
 
 ## 8. 网络、权限和失败行为
 

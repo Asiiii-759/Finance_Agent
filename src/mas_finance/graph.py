@@ -38,7 +38,6 @@ from .agent import (
 from .calculator import derive_standard_ratios
 from .contracts import EvidenceBundle, stable_id
 from .harness import ExecutionPolicy, SideEffect, ToolContext, ToolHarness, ToolSpec
-from .research import FinancialQueryAnalyzer
 from .task_frame import LLMTaskInterpreter
 from .validators import Severity, validate_research_output
 
@@ -77,10 +76,9 @@ class FinancialResearchAgent:
         harness: ToolHarness,
         *,
         planner: Planner,
+        task_interpreter: LLMTaskInterpreter,
         synthesizer: Synthesizer | None = None,
         assessor: CoverageAssessor | None = None,
-        scope_analyzer: FinancialQueryAnalyzer | None = None,
-        task_interpreter: LLMTaskInterpreter | None = None,
         checkpointer: BaseCheckpointSaver[Any] | None = None,
         allowed_capabilities: frozenset[str] = frozenset(
             {
@@ -99,10 +97,9 @@ class FinancialResearchAgent:
     ) -> None:
         self.harness = harness
         self.planner = planner
+        self.task_interpreter = task_interpreter
         self.synthesizer = synthesizer or DeterministicSynthesizer()
         self.assessor = assessor or CoverageAssessor()
-        self.scope_analyzer = scope_analyzer or FinancialQueryAnalyzer()
-        self.task_interpreter = task_interpreter
         self.allowed_capabilities = allowed_capabilities
         self.planner_hidden_tool_names = planner_hidden_tool_names
         self.checkpointer = checkpointer or InMemorySaver()
@@ -166,23 +163,16 @@ class FinancialResearchAgent:
     def _intent_node(self, graph_state: FinancialGraphState) -> dict[str, Any]:
         request = ResearchRequest.from_dict(graph_state["request"])
         self.harness.clear_run(request.run_id)
-        if self.task_interpreter is not None:
-            frame = self.task_interpreter.interpret(request, self._planner_catalog())
-            state = ResearchState(
-                request=request,
-                scope=frame.scope,
-                task_frame=frame.to_dict(),
-                phase=AgentPhase.INTENT,
-            )
-            if frame.requires_clarification:
-                state.stop_reason = StopReason.CLARIFICATION_REQUIRED
-                state.report = f"需要澄清后才能继续：{frame.clarification_question}"
-            return {"research": state.to_dict()}
+        frame = self.task_interpreter.interpret(request, self._planner_catalog())
         state = ResearchState(
             request=request,
-            scope=self.scope_analyzer.analyze(request),
+            scope=frame.scope,
+            task_frame=frame.to_dict(),
             phase=AgentPhase.INTENT,
         )
+        if frame.requires_clarification:
+            state.stop_reason = StopReason.CLARIFICATION_REQUIRED
+            state.report = f"需要澄清后才能继续：{frame.clarification_question}"
         return {"research": state.to_dict()}
 
     def _planning_node(self, graph_state: FinancialGraphState) -> dict[str, Any]:

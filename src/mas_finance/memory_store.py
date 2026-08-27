@@ -26,13 +26,13 @@ class PersonalMemoryKind(StrEnum):
     PROFILE = "profile"
     PREFERENCE = "preference"
     EXPERIENCE = "experience"
-    SKILL = "skill"
 
 
 class ConversationEventKind(StrEnum):
     USER_MESSAGE = "user_message"
     ASSISTANT_MESSAGE = "assistant_message"
     TOOL_EVENT = "tool_event"
+    ATOMIC_FACT = "atomic_fact"
 
 
 @dataclass(frozen=True)
@@ -184,6 +184,28 @@ class ConversationSummaryRecord:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class RunLogEvent:
+    sequence: int
+    run_id: str
+    event_type: str
+    level: str
+    message: str
+    details: dict[str, Any]
+    occurred_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sequence": self.sequence,
+            "run_id": self.run_id,
+            "event_type": self.event_type,
+            "level": self.level,
+            "message": self.message,
+            "details": dict(self.details),
+            "occurred_at": self.occurred_at,
+        }
+
+
 class ConversationSummarizer(Protocol):
     def summarize(
         self,
@@ -233,13 +255,18 @@ def build_conversation_window(
     summary = deepcopy(stored.summary) if stored is not None else {
         "semantic_summary": _empty_semantic_summary(),
         "entity_state": {},
-        "entity_events": [],
         "focus_history": [],
         "run_state": {},
     }
-    pending = store.list_conversation_events(namespace, after_sequence=covered)
+    all_events = store.list_conversation_events(namespace, limit=None)
+    atomic_facts = [event for event in all_events if event.kind is ConversationEventKind.ATOMIC_FACT]
+    pending = [
+        event
+        for event in all_events
+        if event.sequence > covered and event.kind is not ConversationEventKind.ATOMIC_FACT
+    ]
 
-    projection = _conversation_projection(summary, pending, covered)
+    projection = _conversation_projection(summary, pending, covered, atomic_facts)
     projection_tokens = _projection_tokens(projection, counter)
     compacted, recent = _split_recent_runs(pending, counter, recent_tokens)
     if projection_tokens >= int(max_tokens * 0.85) and compacted:
@@ -248,7 +275,7 @@ def build_conversation_window(
         summary = _merge_conversation_summary(summary, compacted, summarizer)
         covered = compacted[-1].sequence
         pending = recent
-        projection = _conversation_projection(summary, pending, covered)
+        projection = _conversation_projection(summary, pending, covered, atomic_facts)
         projection_tokens = _projection_tokens(projection, counter)
         store.put_conversation_summary(
             namespace,
@@ -355,6 +382,23 @@ class SQLiteMemoryStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (tenant_id, user_id, kind, thread_id, record_key)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS run_logs (
+                    tenant_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    level TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, user_id, thread_id, run_id, sequence)
                 )
                 """
             )
@@ -584,22 +628,33 @@ class SQLiteMemoryStore:
         namespace: MemoryNamespace,
         *,
         after_sequence: int = 0,
-        limit: int = 10_000,
+        limit: int | None = 10_000,
     ) -> builtins.list[ConversationEvent]:
         if namespace.kind != "conversation_history" or namespace.thread_id is None:
             raise ValueError("conversation events require a thread-scoped conversation_history namespace")
         if isinstance(after_sequence, bool) or not isinstance(after_sequence, int) or after_sequence < 0:
             raise ValueError("conversation event cursor is invalid")
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000
+        ):
             raise ValueError("conversation event limit must be between 1 and 10000")
         with self._lock, self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT * FROM conversation_events WHERE tenant_id = ? AND user_id = ?
-                AND kind = ? AND thread_id = ? AND sequence > ? ORDER BY sequence ASC LIMIT ?
-                """,
-                (*_namespace_values(namespace), after_sequence, limit),
-            ).fetchall()
+            if limit is None:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM conversation_events WHERE tenant_id = ? AND user_id = ?
+                    AND kind = ? AND thread_id = ? AND sequence > ? ORDER BY sequence ASC
+                    """,
+                    (*_namespace_values(namespace), after_sequence),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM conversation_events WHERE tenant_id = ? AND user_id = ?
+                    AND kind = ? AND thread_id = ? AND sequence > ? ORDER BY sequence ASC LIMIT ?
+                    """,
+                    (*_namespace_values(namespace), after_sequence, limit),
+                ).fetchall()
         return [_row_to_conversation_event(row) for row in rows]
 
     def get_conversation_summary(self, namespace: MemoryNamespace) -> ConversationSummaryRecord | None:
@@ -695,7 +750,103 @@ class SQLiteMemoryStore:
                 """,
                 _namespace_values(namespace),
             ).rowcount
-        return {"events": events, "summaries": summaries}
+            logs = connection.execute(
+                """
+                DELETE FROM run_logs WHERE tenant_id = ? AND user_id = ? AND thread_id = ?
+                """,
+                (namespace.tenant_id, namespace.user_id, namespace.thread_id),
+            ).rowcount
+        return {"events": events, "summaries": summaries, "run_logs": logs}
+
+    def append_run_log(
+        self,
+        namespace: MemoryNamespace,
+        *,
+        run_id: str,
+        event_type: str,
+        level: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+        occurred_at: str | None = None,
+    ) -> RunLogEvent:
+        _validate_conversation_namespace(namespace)
+        if not run_id.strip() or len(run_id) > 200:
+            raise ValueError("run log run_id is invalid")
+        if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,99}", event_type):
+            raise ValueError("run log event_type is invalid")
+        if level not in {"info", "warning", "error"}:
+            raise ValueError("run log level is invalid")
+        if not message.strip() or len(message) > 2_000:
+            raise ValueError("run log message is invalid")
+        detail_value = dict(details or {})
+        _validate_json_payload(detail_value, "run log details", 30_000)
+        timestamp = occurred_at or _utc_now()
+        _aware_datetime(timestamp, "run log occurred_at")
+        with self._lock, self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM run_logs
+                WHERE tenant_id = ? AND user_id = ? AND thread_id = ? AND run_id = ?
+                """,
+                (namespace.tenant_id, namespace.user_id, namespace.thread_id, run_id),
+            ).fetchone()
+            sequence = int(row["next_sequence"])
+            connection.execute(
+                """
+                INSERT INTO run_logs (
+                    tenant_id, user_id, thread_id, run_id, sequence, event_type,
+                    level, message, details_json, occurred_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    namespace.tenant_id,
+                    namespace.user_id,
+                    namespace.thread_id,
+                    run_id,
+                    sequence,
+                    event_type,
+                    level,
+                    message.strip(),
+                    json.dumps(detail_value, ensure_ascii=False, sort_keys=True),
+                    timestamp,
+                ),
+            )
+        return RunLogEvent(sequence, run_id, event_type, level, message.strip(), detail_value, timestamp)
+
+    def list_run_logs(
+        self,
+        namespace: MemoryNamespace,
+        run_id: str,
+        *,
+        limit: int = 1_000,
+    ) -> builtins.list[RunLogEvent]:
+        _validate_conversation_namespace(namespace)
+        if not run_id.strip() or len(run_id) > 200:
+            raise ValueError("run log run_id is invalid")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
+            raise ValueError("run log limit must be between 1 and 10000")
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT sequence, run_id, event_type, level, message, details_json, occurred_at
+                FROM run_logs WHERE tenant_id = ? AND user_id = ? AND thread_id = ? AND run_id = ?
+                ORDER BY sequence ASC LIMIT ?
+                """,
+                (namespace.tenant_id, namespace.user_id, namespace.thread_id, run_id, limit),
+            ).fetchall()
+        return [
+            RunLogEvent(
+                sequence=int(row["sequence"]),
+                run_id=str(row["run_id"]),
+                event_type=str(row["event_type"]),
+                level=str(row["level"]),
+                message=str(row["message"]),
+                details=json.loads(row["details_json"]),
+                occurred_at=str(row["occurred_at"]),
+            )
+            for row in rows
+        ]
 
 
 def _namespace_values(namespace: MemoryNamespace) -> tuple[str, str, str, str]:
@@ -747,15 +898,12 @@ def _conversation_projection(
     summary: dict[str, Any],
     events: list[ConversationEvent],
     covered_through_sequence: int,
+    atomic_facts: list[ConversationEvent] | None = None,
 ) -> dict[str, Any]:
     entity_state = deepcopy(summary.get("entity_state") or {})
-    entity_events = [dict(item) for item in summary.get("entity_events") or []]
     focus_history = [dict(item) for item in summary.get("focus_history") or []]
     run_state = deepcopy(summary.get("run_state") or {})
     for event in events:
-        atom = _entity_event_atom(event)
-        if atom is not None:
-            entity_events.append(atom)
         run = run_state.setdefault(
             event.run_id,
             {
@@ -809,7 +957,6 @@ def _conversation_projection(
             run["status"] = "completed"
             run["outcome_status"] = event.payload.get("status")
     focus_history = focus_history[-50:]
-    entity_events = entity_events[-100:]
     if focus_history:
         focus_entities = list(focus_history[-1]["entities"])
     else:
@@ -825,7 +972,7 @@ def _conversation_projection(
         "summary": dict(summary.get("semantic_summary") or _empty_semantic_summary()),
         "recent_events": [_prompt_event(event) for event in events],
         "entity_state": entity_state,
-        "entity_events": entity_events,
+        "atomic_facts": [_prompt_event(event) for event in (atomic_facts or [])],
         "focus_history": focus_history,
         "focus_entities": focus_entities,
         "run_state": ordered_runs,
@@ -864,44 +1011,8 @@ def _merge_conversation_summary(
     return {
         "semantic_summary": semantic_summary,
         "entity_state": dict(list(projection["entity_state"].items())[-50:]),
-        "entity_events": projection["entity_events"][-100:],
         "focus_history": projection["focus_history"][-50:],
         "run_state": {item["run_id"]: item for item in projection["run_state"][-20:]},
-    }
-
-
-def _entity_event_atom(event: ConversationEvent) -> dict[str, Any] | None:
-    if not event.entities:
-        return None
-    if event.kind is ConversationEventKind.USER_MESSAGE:
-        if len(event.entities) > 1 and re.search(r"比较|对比|区别|孰优|versus|\bvs\.?\b|compare", event.content, re.I):
-            action = "comparison_requested"
-            fact = f"用户请求比较：{'、'.join(event.entities)}"
-        elif re.search(r"计算|测算|回撤|收益率|cagr|指标|估值", event.content, re.I):
-            action = "calculation_requested"
-            fact = f"用户请求计算或分析：{'、'.join(event.entities)}"
-        else:
-            action = "mentioned"
-            fact = f"用户提到：{'、'.join(event.entities)}"
-        status = "requested"
-    elif event.kind is ConversationEventKind.TOOL_EVENT:
-        action = f"tool:{event.payload.get('tool_name') or 'unknown'}"
-        status = str(event.payload.get("result_status") or "unknown")
-        fact = f"{action} {status}"
-    else:
-        action = "response_completed"
-        status = str(event.payload.get("status") or "completed")
-        fact = "已生成本轮回答"
-    return {
-        "event_id": event.event_id,
-        "sequence": event.sequence,
-        "occurred_at": event.occurred_at,
-        "run_id": event.run_id,
-        "action": action,
-        "entities": list(event.entities),
-        "status": status,
-        "fact": fact,
-        "confidence": "explicit" if event.kind is ConversationEventKind.USER_MESSAGE else "observed",
     }
 
 
@@ -917,6 +1028,7 @@ def _prompt_event(event: ConversationEvent) -> dict[str, Any]:
         "source_count",
         "status",
         "tool_name",
+        "source_event_ids",
     }
     value = event.to_dict()
     value.pop("relations", None)

@@ -240,6 +240,8 @@ class ToolAuditEvent:
     duration_ms: float
     timestamp: str
     error_code: str | None = None
+    error_message: str | None = None
+    result_summary: Mapping[str, Any] | None = None
 
 
 @dataclass
@@ -689,6 +691,8 @@ class ToolHarness:
             duration_ms=duration_ms,
             timestamp=started_at,
             error_code=error_code,
+            error_message=result.error_message,
+            result_summary=_result_summary(data) if status is ToolStatus.SUCCESS else None,
         )
         with self._lock:
             self._events.append(event)
@@ -762,6 +766,28 @@ def _redact_error(message: str | None) -> str | None:
         cleaned,
     )
     return cleaned
+
+
+def _result_summary(value: Any) -> dict[str, Any]:
+    """Describe a tool return for operations logs without persisting its content."""
+    if value is None:
+        return {"type": "null"}
+    if hasattr(value, "to_dict"):
+        value = value.to_dict()
+    if isinstance(value, Mapping):
+        summary: dict[str, Any] = {"type": "object", "keys": sorted(str(key) for key in value)[:50]}
+        for key in ("status", "ok", "source_count", "evidence_count", "claim_count"):
+            item = value.get(key)
+            if isinstance(item, (str, int, float, bool)) or item is None:
+                summary[key] = item
+        for key in ("sources", "evidence", "claims", "items", "results", "gaps"):
+            item = value.get(key)
+            if isinstance(item, (list, tuple)):
+                summary[f"{key}_count"] = len(item)
+        return summary
+    if isinstance(value, (list, tuple)):
+        return {"type": "array", "item_count": len(value)}
+    return {"type": type(value).__name__}
 
 
 def _is_secret_key(value: str) -> bool:

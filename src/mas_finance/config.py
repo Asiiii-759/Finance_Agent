@@ -72,6 +72,7 @@ class AppConfig:
     embedding_timeout_seconds: float = 30.0
     personal_memory_enabled: bool = True
     automatic_memory_consolidation_enabled: bool = True
+    automatic_skill_learning_enabled: bool = True
     user_profile_path: Path | None = None
     personal_knowledge_enabled: bool = True
     max_personal_knowledge_documents: int = 100
@@ -188,6 +189,10 @@ class AppConfig:
             in {"1", "true", "yes"},
             automatic_memory_consolidation_enabled=os.getenv(
                 "MAS_AUTOMATIC_MEMORY_CONSOLIDATION_ENABLED", "true"
+            ).strip().lower()
+            in {"1", "true", "yes"},
+            automatic_skill_learning_enabled=os.getenv(
+                "MAS_AUTOMATIC_SKILL_LEARNING_ENABLED", "true"
             ).strip().lower()
             in {"1", "true", "yes"},
             user_profile_path=(Path(value) if (value := os.getenv("MAS_USER_PROFILE_PATH")) else None),

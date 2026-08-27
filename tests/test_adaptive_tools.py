@@ -19,7 +19,7 @@ from mas_finance.metrics import (
     calculate_metric,
     financial_calculation_harness_tool,
 )
-from mas_finance.research import FinancialIntent, FinancialQueryAnalyzer
+from mas_finance.research import FinancialIntent, ResearchRequirement, ResearchScope
 from mas_finance.sec import SECRecentFilingsAdapter
 
 
@@ -175,98 +175,6 @@ class MetricToolTests(unittest.TestCase):
 
 
 class AdaptiveScopeTests(unittest.TestCase):
-    def test_document_fundamentals_do_not_implicitly_require_sec(self) -> None:
-        analyzer = FinancialQueryAnalyzer()
-        document_scope = analyzer.analyze(
-            ResearchRequest(
-                query="根据内部文档概括 ACME 收入。",
-                entities=("ACME",),
-                require_documents=True,
-            )
-        )
-        self.assertEqual(
-            {item.key for item in document_scope.requirements},
-            {"document:ACME"},
-        )
-
-        cross_check_scope = analyzer.analyze(
-            ResearchRequest(
-                query="根据内部文档概括 ACME 收入，并与监管数据交叉核验。",
-                entities=("ACME",),
-                require_documents=True,
-                require_regulatory_data=True,
-            )
-        )
-        self.assertEqual(
-            {item.key for item in cross_check_scope.requirements},
-            {"document:ACME", "regulatory:ACME"},
-        )
-
-    def test_specific_valuation_and_unsupported_metric_requirements_are_explicit(self) -> None:
-        analyzer = FinancialQueryAnalyzer()
-        pb_scope = analyzer.analyze(
-            ResearchRequest(
-                query="Apple 当前市净率是多少？",
-                entities=("Apple",),
-                symbols={"Apple": "AAPL"},
-                require_documents=False,
-            )
-        )
-        market = next(item for item in pb_scope.requirements if item.category == "market")
-        self.assertIn("price_to_book", market.fields)
-        self.assertNotIn("trailing_pe", market.fields)
-
-        roe_scope = analyzer.analyze(
-            ResearchRequest(
-                query="Apple 的 ROE 是多少？",
-                entities=("Apple",),
-                symbols={"Apple": "AAPL"},
-                require_documents=False,
-            )
-        )
-        self.assertIn(
-            "metric_requires_average_balance",
-            {str(item.parameters.get("gap_code")) for item in roe_scope.requirements if item.category == "unsupported"},
-        )
-
-        dcf_scope = analyzer.analyze(
-            ResearchRequest(
-                query="用 DCF 给 Apple 估值",
-                entities=("Apple",),
-                symbols={"Apple": "AAPL"},
-                require_documents=False,
-            )
-        )
-        self.assertIn(
-            "valuation_model_inputs_required",
-            {str(item.parameters.get("gap_code")) for item in dcf_scope.requirements if item.category == "unsupported"},
-        )
-
-    def test_scope_routes_performance_fundamentals_and_comparison(self) -> None:
-        request = ResearchRequest(
-            query="比较 Apple 和 Microsoft 过去五年的盈利能力、波动率与最大回撤",
-            entities=("Apple", "Microsoft"),
-            require_documents=False,
-        )
-        scope = FinancialQueryAnalyzer().analyze(request)
-        self.assertIn(FinancialIntent.COMPARISON, scope.intents)
-        self.assertIn(FinancialIntent.MARKET_PERFORMANCE, scope.intents)
-        self.assertIn(FinancialIntent.PROFITABILITY, scope.intents)
-        keys = {item.key for item in scope.requirements}
-        self.assertEqual(
-            {
-                "market_history:Apple",
-                "market_history:Microsoft",
-                "regulatory:Apple",
-                "regulatory:Microsoft",
-                "metric:Apple:net_margin",
-                "metric:Microsoft:net_margin",
-            },
-            keys,
-        )
-        history = next(item for item in scope.requirements if item.key == "market_history:Apple")
-        self.assertEqual(history.parameters["range"], "5y")
-
     def test_finance_definition_answers_without_curated_knowledge_tool(self) -> None:
         outcome = llm_backed_agent(ToolHarness()).run(
             llm_research_request(
@@ -373,12 +281,15 @@ class ContextAndMemoryTests(unittest.TestCase):
             metadata={"document_id": "first"},
         )
         bundle.add_evidence(Evidence.create(source=first_source, content="ACME covenant headroom is 20%."))
-        analyzer = FinancialQueryAnalyzer()
         focused = ResearchRequest(query="根据文档回答 covenant headroom 是多少？")
-        self.assertTrue(CoverageAssessor().assess(focused, bundle, analyzer.analyze(focused)).complete)
+        scope = ResearchScope(
+            intents=(FinancialIntent.DOCUMENT_RESEARCH,),
+            requirements=(ResearchRequirement("document:query:1", "document", "Search supplied documents."),),
+        )
+        self.assertTrue(CoverageAssessor().assess(focused, bundle, scope).complete)
 
         comparison = ResearchRequest(query="对比这些 PDF 的 covenant 风险。", available_document_count=2)
-        self.assertFalse(CoverageAssessor().assess(comparison, bundle, analyzer.analyze(comparison)).complete)
+        self.assertFalse(CoverageAssessor().assess(comparison, bundle, scope).complete)
         second_source = SourceRef.create(
             source_type=SourceType.DOCUMENT,
             title="second.pdf",
@@ -387,7 +298,7 @@ class ContextAndMemoryTests(unittest.TestCase):
             metadata={"document_id": "second"},
         )
         bundle.add_evidence(Evidence.create(source=second_source, content="ACME covenant risk increased."))
-        self.assertTrue(CoverageAssessor().assess(comparison, bundle, analyzer.analyze(comparison)).complete)
+        self.assertTrue(CoverageAssessor().assess(comparison, bundle, scope).complete)
 
     def test_context_balances_documents_not_only_entities(self) -> None:
         bundle = EvidenceBundle()

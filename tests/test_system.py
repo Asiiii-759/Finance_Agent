@@ -58,7 +58,7 @@ class FinanceSystemTestCase(unittest.TestCase):
                 user_id="alice",
             )
             service.save_personal_memory(
-                kind=PersonalMemoryKind.SKILL,
+                kind=PersonalMemoryKind.EXPERIENCE,
                 title="债券分析步骤",
                 content="分析久期、凸性与信用利差。",
                 tags=["债券"],

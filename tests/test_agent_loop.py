@@ -9,7 +9,6 @@ from llm_fixtures import NullPlanner, llm_backed_agent, llm_research_request
 
 from mas_finance.agent import ResearchRequest
 from mas_finance.corpus import CorpusDocument, InMemoryCorpus
-from mas_finance.graph import FinancialResearchAgent
 from mas_finance.harness import ToolHarness
 from mas_finance.market import MarketEvidenceAdapter, market_data_harness_tool
 from mas_finance.retrieval import RetrievalEvidenceAdapter, retrieval_harness_tool
@@ -135,7 +134,7 @@ class AgentLoopTests(unittest.TestCase):
             self.assertEqual(first.state.to_dict(), second.state.to_dict())
             other_tenant = ResearchRequest.from_dict({**request.to_dict(), "tenant_id": "other-tenant"})
             self.assertIsNone(
-                FinancialResearchAgent(ToolHarness(), planner=NullPlanner(), checkpointer=checkpointer).get_state(
+                llm_backed_agent(ToolHarness(), planner=NullPlanner(), checkpointer=checkpointer).get_state(
                     other_tenant
                 )
             )

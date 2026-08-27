@@ -691,7 +691,8 @@ Validator 会检查：
 | Run checkpoint | tenant/thread/run 哈希 | graph step、计划、观察、证据、预算、报告 | LangGraph InMemorySaver / SqliteSaver；主服务 SQLite |
 | Conversation memory | tenant/user/thread/kind | 完整 user/tool/assistant 事件与有界上下文投影 | SQLite 事件账本 + 结构化滚动摘要，显式删除前持久 |
 | Session documents | tenant/user/thread | 显式保留的解析页文本与 provenance | 进程内存，默认 TTL 1 小时，可列举/删除 |
-| Personal memory | tenant/user/kind | 显式 profile/preference/experience/skill | SQLite CRUD；同 kind/title 最新写入覆盖 |
+| Personal memory | tenant/user/kind | profile/preference/experience | SQLite CRUD + 受限 LLM 沉淀；明确长期 update 覆盖 |
+| Learned Skill | tenant/user/learned_skills | 成功工作路径 | TaskFrame 短索引选择，Planner 渐进披露完整步骤 |
 | Personal knowledge | tenant/user/document | 明确持久上传的 PDF 页文本与 provenance | SQLite 页文本 + request-time BM25/可选 hybrid，可列举/删除 |
 | Domain corpus | tenant/KB/version | 企业文档 chunks、metadata、index manifest | 永久来源通过注入式 RAG/evidence tool |
 | Audit | tenant/thread/run/call | 脱敏调用记录 | checkpoint/artifact；生产 append-only 待实现 |
@@ -700,15 +701,15 @@ Validator 会检查：
 
 检查点为了准确恢复，包含完整 EvidenceBundle 和部分文本证据，因此属于敏感运行数据。它不应该被自动用于未来用户画像，也不应该永久保存。生产环境必须补充：静态加密、KMS/密钥轮换、TTL、删除任务、访问审计与备份策略。
 
-Conversation memory 与 checkpoint 分离：前者持久记录 user/tool/assistant 事件，后者恢复单个 run 的图状态。模型只看到 300K token 预算内的 LLM 语义摘要和最近原始事件；实体身份与焦点历史由代码独立保真，压缩不删除完整账本。它不保存 EvidenceBundle、原始 PDF 或隐藏推理，也不能作为事实来源。会话文档是另一平面：只在显式保留时保存解析页文本，原 PDF 仍删除；过期或 `DELETE /api/v1/session-documents/{thread_id}` 后释放。个人 memory/knowledge 也只能通过独立显式接口持久化，临时内容不会自动 promotion。完整语义见 [持久对话记忆](CONVERSATION_MEMORY.md)、[文档生命周期设计](DOCUMENT_LIFECYCLE.md) 与 [个人助手边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
+Conversation memory 与 checkpoint 分离：前者持久记录 user/tool/assistant/atomic_fact 事件，后者恢复单个 run 的图状态。模型看到 300K token 预算内的 LLM 语义摘要和最近原始事件，同时看到不参加摘要的全历史原子事实；压缩不删除完整账本。它不保存 EvidenceBundle、原始 PDF 或隐藏推理，也不能作为事实来源。会话文档是另一平面：只在显式保留时保存解析页文本，原 PDF 仍删除；过期或 `DELETE /api/v1/session-documents/{thread_id}` 后释放。个人 memory/knowledge/Skill 有独立生命周期，临时内容不会自动 promotion。完整语义见 [持久对话记忆](CONVERSATION_MEMORY.md)、[文档生命周期设计](DOCUMENT_LIFECYCLE.md) 与 [个人助手边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
 
-### 14.2 实体回放与指代
+### 14.2 原子事实与指代
 
-系统不以 marker 规则决定“它 / 前者 / 后者”是谁。`llm.task_frame` 读取当前请求、摘要、最近事件和带时间顺序的实体回放，声明它采用的实体及来源，再生成本轮 requirements。多个候选都合理时，TaskFrame 返回中文澄清问题，Agent 不调工具也不静默猜测。实体记忆永远不能作为事实 evidence。详见 [LLM TaskFrame](TASK_FRAME.md)。
+系统不以 marker 规则决定“它 / 前者 / 后者”是谁。`llm.task_frame` 先读取带时间、状态和来源 event ID 的全历史最小语义事实，再结合当前请求、摘要与最近事件，声明它采用的实体及来源并生成 requirements。多个候选都合理时，TaskFrame 返回中文澄清问题，Agent 不调工具也不静默猜测。原子事实永远不能作为金融 evidence。详见 [LLM TaskFrame](TASK_FRAME.md)。
 
-### 14.3 为什么长期记忆必须显式
+### 14.3 长期记忆与 Skill 为什么分离
 
-系统不从普通对话自动提取长期画像，避免错误回答和提示注入形成自我强化。用户只能通过 personal memory CRUD 明确保存、查看、覆盖和删除 profile/preference/experience/skill；个人 PDF 也必须走独立持久上传接口。个人上下文属于不可信低权限数据，不能支持事实 claim 或成为可执行 skill。多用户生产仍需要 OIDC、导出、retention、加密与访问审计。
+系统仅用受限 LLM 从用户消息提取可撤回的稳定 profile/preference/experience；临时要求、工具结果和金融事实必须忽略，明确长期改变可更新旧偏好。成功多步骤工作路径进入独立 Learned Skill，并在选择后渐进披露。个人 PDF 必须走独立持久上传接口。所有个人上下文都属于不可信低权限数据，不能支持事实 claim 或成为可执行插件。多用户生产仍需要 OIDC、导出、retention、加密与访问审计。
 
 ### 14.4 租户隔离
 

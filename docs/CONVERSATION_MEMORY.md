@@ -1,90 +1,111 @@
-# 持久对话记忆与动态上下文
+# 对话记忆、原子事实、长期记忆与运行日志
 
-本文描述当前已实现的对话记忆，不把 roadmap 写成现状。其目标是同时满足：线程对话在重启后仍存在；长对话不会撑爆模型窗口；工具执行可被后续轮次理解；指代解析不靠猜；用户删除线程时相关状态一并删除。
+本文描述当前代码已经实现的四个独立数据平面。它们不能互相冒充：对话历史用于延续会话，原子事实用于精确回放，个人长期记忆用于跨会话偏好，Skill 用于复用成功工作路径；运行日志用于后端排障和审计。任何一层都不是金融 Evidence。
 
-## 1. 两层模型
+## 1. 总体数据流
 
 ```text
-SQLite 完整事件账本（事实记录，不自动过期）
-  user_message / tool_event / assistant_message
-                    │
-                    ▼ 预算达到 85% 时滚动压缩
-Prompt 投影（最多 MAS_CONVERSATION_CONTEXT_TOKENS）
-  LLM 语义摘要 + 最近 20K token 完整 run + 实体相关回放 + run state + manifest
+当前用户请求
+  ├─ 完整 conversation_events ──┬─ LLM 滚动摘要 + 最近完整 run
+  │                             └─ 全历史 atomic_fact（不参加摘要）
+  ├─ personal_memory：profile / preference / experience
+  ├─ learned_skills：短索引 ── TaskFrame 选中 ── 完整步骤交给 Planner
+  └─ run_logs：启动、上下文、工具终态、运行终态/失败
 ```
 
-完整账本与 prompt 投影必须分开：压缩只改变模型下一轮看到的表示，不删除原事件。默认保留到用户调用 `DELETE /api/v1/conversations/{thread_id}`。这与 request/session PDF 生命周期和个人长期记忆是不同的数据平面。
+所有 namespace 都包含 tenant/user；会话事件、摘要和日志额外包含 thread，日志再包含 run。当前 HTTP 层仍使用部署级 API key 和默认 principal，多用户生产部署必须由可信网关/OIDC 注入 tenant/user，不能相信请求体自报身份。
 
-## 2. 持久事件账本
+## 2. 持久对话事件与动态压缩
 
-`conversation_events` 以 `tenant_id + user_id + conversation_history + thread_id` 精确隔离，线程内 sequence 单调递增。事件包括：
+`conversation_events` 持久保存四种事件：
 
-| 类型 | 内容 | 附加状态 |
+| 类型 | 保存内容 | 不保存 |
 |---|---|---|
-| `user_message` | 用户原始问题 | 时间、run、当前解析实体及 symbol |
-| `tool_event` | 工具名与结果状态 | capability、尝试次数、网络次数、错误码；不复制 prompt/密钥 |
-| `assistant_message` | 最终报告 | 状态、claim/source 数量、未解决 gap code |
+| `user_message` | 用户原文、时间、run、显式实体 | system prompt、密钥 |
+| `tool_event` | 工具名、终态、尝试次数、错误码 | 原始 prompt、大段返回、凭据 |
+| `assistant_message` | 用户可见报告、终态与数量统计 | 隐藏推理 |
+| `atomic_fact` | 最小语义短句、时间、状态、来源事件 ID、实体 | 金融数据副本、推断结论 |
 
-`event_id` 支持恢复重放幂等；同 ID 内容不同会快速失败。SQLite 用立即写事务分配 sequence，避免并发写入得到相同序号。数据库损坏或未知事件类型不会被静默清空，而是显式报错。
+事件 sequence 在线程内单调递增；`event_id` 幂等，同 ID 不同内容立即报错。完整账本不会因上下文压缩被删除，默认保留到用户显式删除线程。
 
-工具审计来自 Harness 已脱敏字段。对话账本不保存隐藏推理，也不把记忆提升为 `Evidence`；后续回答中的金融事实仍必须由本轮可引用数据源支撑。
+Prompt 投影默认最大 300,000 token。达到 85% 时，专用 LLM 把旧摘要与近期窗口之前的完整 run 合并成结构化摘要；近期窗口默认约 20,000 token，并以 run 为边界避免截断半次工具流程。摘要保留目标、限制、纠正、已完成事项、工具成败、未完成事项和开放问题。没有可用摘要器时快速失败，不做规则摘要或静默截断。
 
-## 3. 动态压缩
+摘要模型是应用内部模型调用，不等于访问外部金融数据，因此不受请求的 `allow_network` 数据授权开关控制。`manifest` 公开摘要游标、估算 token、近期事件数及 `memory_is_evidence=false`。
 
-默认投影预算为 300,000 token，压缩后保留最近约 20,000 token 的原始上下文。近期窗口按完整 `run_id` 分组，不会因为一轮工具较多而只保留半轮；因此为了保持最近一个 run 完整，实际值可能略高于 20K。
+## 3. 全历史原子事实
 
-```dotenv
-MAS_CONVERSATION_CONTEXT_TOKENS=300000
-MAS_CONVERSATION_RECENT_TOKENS=20000
+原子事实不是结构化知识图谱，也不是规则生成的实体标签。每个已结束 run 后，专用 LLM 从该 run 的用户、工具和助手终态事件中抽取最多 12 条可独立理解的最小中文短句，例如：
+
+```text
+用户要求比较苹果公司与微软公司的五年最大回撤。
+market.history 对苹果公司的调用因 provider_timeout 失败。
+本轮尚未完成两家公司回撤比较。
 ```
 
-每次分析前从最近摘要游标继续读取事件。投影达到预算的 85% 时，专用 LLM 把上一份摘要与 20K 近期窗口之前的事件压缩成严格 JSON。摘要必须保留对话概要、用户目标、需求/限制/成功标准、决策/纠正、已完成工作、成功工具、失败工具/错误码/重试结果、未完成工作和未决问题。摘要 prompt 使用中文，将所有历史文本视为不可信数据。
+模型只能记录用户明确请求/纠正、系统确实完成的动作、工具明确成败和未完成事项；不能保存助手观点、金融结论、隐藏推理或推断意图。代码只在 LLM 边界校验 JSON 结构、长度、状态枚举和 `source_event_ids` 确实属于输入事件，不用关键词或相似度重新判断语义“是否相关”。
 
-`run_state` 由事件账本确定性生成：有 `user_message` 但没有 `assistant_message` 的 run 标记为 `unfinished`；工具记录保留终态、错误码和尝试次数。当前 Harness 仅在工具返回后写入审计事件，所以没有启动事件时不会把某个工具猜成“正在执行”；崩溃恢复的精确图状态仍以 LangGraph checkpoint 为准。
+原子事实有三个关键不变量：
 
-压缩是显式的 LLM 网络调用：达到阈值时如果没有配置 LLM，或请求/部署未授权网络，系统快速失败，不会悄悄改用截断或规则摘要。SQLite 完整账本始终不受压缩影响。
+1. 摘要器的输入会排除 `atomic_fact`，所以事实不会被摘要改写或吞并。
+2. 构造下一轮上下文时会从完整事件账本读取所有原子事实，不按最近 N 条或检索 top-k 裁剪。
+3. TaskFrame prompt 首段是“该对话已经完成的最小事实经历”，每条包含 event ID、时间、状态、实体和短句；模型用它消解指代，并为来自历史的实体返回来源 event ID。
 
-默认 token counter 是针对 DeepSeek V4 的保守预估，因为 OpenAI-compatible API 只在请求完成后返回实际 `usage`。`manifest.token_count_method` 公开计数方法和估算值；部署方可注入官方 tokenizer 实现精确 `TokenCounter`。300K 是本系统的投影上限，不是声称会用满模型的 1M 窗口。
+如果所有原子事实加其他必要上下文超过硬预算，系统显式失败，而不是悄悄丢弃早期事实。这个取舍保证“对话开头提到的实体”仍可回放；代价是极端超长线程最终需要用户新建线程或未来引入可审计的事实归档策略。
 
-`manifest` 明确给出摘要覆盖序号、近期事件数量、最新序号、`full_history_persisted=true` 和 `memory_is_evidence=false`。因此测试和审计可以区分“数据库里存在”与“模型本轮实际看见”。
+`entity_state` 和 `focus_history` 仍是从用户事件确定性投影出的辅助状态，用于 symbol 与焦点展示；它们不再生成规则式事实，也不决定 TaskFrame 意图。TaskFrame 模型无法可靠消解多个候选时必须请求澄清。
 
-## 4. 实体与指代
+## 4. 个人长期记忆
 
-实体不再作为一张通用“关系表”交给模型。当前只保存指代解析真正需要的确定性状态：
+长期记忆只允许三类：
 
-- `entity_state`：实体的首次/最近提及时间、sequence、用户提及次数和可选 symbol；
-- `focus_history`：每个含实体的用户轮次及其有序实体组；
-- `focus_entities`：最近一个焦点组。
-- `entity_events`：按时间保存的原子对象/动作记录，最多 100 条；
-- `entity_replay`：本轮真正进入模型的相关或最近事件，最多 20 条；
+- `profile`：稳定背景；
+- `preference`：长期语言、格式或分析偏好；
+- `experience`：跨会话仍有用的用户经验。
 
-这些状态由事件账本确定性构建，不让 LLM 提取或改写。原子事件只记录“提到、比较请求、计算请求、工具成功/失败、回答完成”
-等可观察动作，不把结果当作 Evidence。因此即使旧原文已被语义摘要覆盖，“刚刚聊到的那个公司”仍可查到上一个焦点组，
-模型也能通过有时间顺序的 `entity_replay` 知道此前对这些对象做过什么。
+用户可通过 `POST/GET/DELETE /api/v1/memories` 显式管理；同 kind/title 的明确写入覆盖旧值。`MAS_USER_PROFILE_PATH` 指向用户自己维护的 Markdown，它作为独立低权限 `user_instructions` 注入，不拼进 system prompt。
 
-解析优先级是：API 显式实体 → 当前问题检测实体 → 明确的历史指代。最近一个含实体的用户事件形成有序 `focus_entities`：
+启用自动沉淀时，专用 LLM 每个完成窗口只读取用户消息和现有记忆，最多产生两条候选：
 
-- “前者/第一个/former”选择首个；
-- “后者/最后一个/latter”选择末个；
-- “它们/两者/both”选择整组；
-- 单数“它/该公司/it”只有在候选唯一时继承；多候选时返回空实体并保留上下文，让规划/回答暴露歧义，而不是猜一个；
-- “刚刚那个公司/之前那个公司”选择上一个唯一焦点，并可与当前明确实体组合成比较；
-- “继续/呢/what about”可承接当前焦点组。
+- “这次、今天、本轮、当前报告”等临时要求必须 `ignore`，不会覆盖长期记忆；
+- 行为推断需在两个不同成功 run 中重复后才晋升；
+- 用户明确说“从今以后”并改变长期偏好时用 `update`，可覆盖同槽位旧记忆，包括先前由用户显式写入的值；
+- `reinforce` 只追加来源 run，不改变原内容。
 
-处理顺序是：读取线程摘要、最近事件、`entity_state` 与实体回放 → 交给 LLM TaskFrame 解析本轮目标和指代 → 将 TaskFrame 和有界线程上下文交给规划与生成模型。模型必须为历史实体声明事件来源；多个候选无法可靠区分时返回澄清问题，不调用工具。当前问题的显式或检测实体会进入 `ResearchRequest.entities`，完成后写入事件账本。
+工具结果、当前关注股票、金融事实、敏感信息和 Skill 都禁止进入个人长期记忆。记忆召回最多八条，profile/preference 全局可见，experience 需与当前问题有词项重叠；它们始终是低权限上下文而非 Evidence。
 
-## 5. 删除与 LangGraph checkpoint
+## 5. Learned Skill 与渐进披露
 
-`DELETE /api/v1/conversations/{thread_id}` 删除当前 principal 下：
+Skill 是成功工作路径，不是用户偏好。只有 run 为 `succeeded` 且至少有两个成功工具 observation 时，Skill 提取器才会看到目标、成功标准、计划、工具类别和 gap；普通问答、单工具任务和失败 run 不触发学习。
 
-1. 全部对话事件；
-2. 滚动摘要；
-3. 账本中每个 run 对应的 LangGraph SQLite checkpoint thread。
+Skill 只允许保存名称、用途、适用条件、2～12 个步骤和所需 capability。禁止公司名、symbol、日期、数值、URL、凭据、代码和金融结论。相同名称使用稳定 skill ID；再次成功会更新内容并累计来源 run。
 
-返回删除的 event、summary 和 checkpoint-thread 数量。Session documents 与 personal memory/knowledge 有独立接口，不会因删除对话被隐式联动；这是为了避免一个按钮越权删除不同同意范围的数据。
+渐进披露分两步：
 
-## 6. 已验证边界
+1. TaskFrame 只看到最多 100 个 Skill 的 `id/name/description/applicability` 短索引，并最多选 3 个；不存在的 ID 会被拒绝。
+2. Planner 只收到被选中 Skill 的完整 steps/capabilities，未选中的步骤不会进入规划上下文。
 
-自动测试覆盖：SQLite 重启持久化、sequence 与幂等冲突、LLM 摘要的严格结构、动态压缩后原始事件不丢失、实体状态/焦点投影、Harness 工具事件入账、tenant/user/thread 隔离、前者/后者/复数/歧义单数及“刚刚那个公司”指代、服务重启继续对话，以及显式删除事件/摘要/checkpoint。
+Skill 是不可信建议，不能越过当前工具 schema、权限、证据验收或用户请求。接口为 `GET /api/v1/skills` 与 `DELETE /api/v1/skills/{skill_id}`。
 
-当前生产缺口仍包括数据库静态加密、可信 OIDC principal、对话导出、可配置合规保留策略与 append-only 访问审计。它们不应由代码中的静默 TTL 或默认用户假装解决。
+## 6. 持久运行日志
+
+`run_logs` 是独立 SQLite 表，不依赖 API 响应是否成功。当前记录：
+
+- `run.started`：run、恢复标志和请求是否授权网络；
+- `context.loaded`：原子事实和近期事件数量；
+- `tool.completed`：call ID、工具/capability、成功或失败、尝试/网络次数、耗时、错误码/脱敏错误消息、返回结构摘要；
+- `run.completed`：Agent 终态、stop reason、claim/source 数、未解决 gap 和预算；
+- `run.failed`：失败阶段和异常类型。
+
+成功返回摘要只保存类型、顶层 keys 和证据/来源/条目数量，不复制网页、PDF、模型 prompt 或原始返回。Harness 在写审计前对参数和异常消息脱敏。日志通过 `GET /api/v1/conversations/{thread_id}/runs/{run_id}/logs` 查询；删除对话会同时删除该线程日志。
+
+LangGraph checkpoint 与日志含义不同：checkpoint 用于状态恢复，日志用于人和运维系统理解发生了什么；日志不能恢复执行，checkpoint 也不应被当作长期记忆。
+
+## 7. 删除、授权与当前边界
+
+`DELETE /api/v1/conversations/{thread_id}` 删除当前 principal 下的完整事件、滚动摘要、运行日志和该线程各 run 的 LangGraph checkpoint。Session PDF、个人知识库、个人长期记忆和 Skill 各自有独立生命周期，不随线程删除。
+
+当前工具全部是只读取证或纯计算，没有交易、转账、发送消息、删除外部数据等危险 side effect，因此运行时没有伪造一个无消费者的审批状态机。未来加入危险工具时，正确接入点是 Harness 在执行前根据 `side_effect` 产生 approval request，LangGraph checkpoint 保存中断状态，前端展示精确工具/参数/影响范围，用户批准后以同一 run 恢复；未批准不得调用 provider。API key 鉴权不能代替逐操作授权。
+
+## 8. 已验证边界
+
+测试覆盖 SQLite 重启持久化、事件幂等冲突、跨 tenant/user/thread 隔离、动态摘要不删除原文、早期原子事实跨压缩保留、来源 ID 校验、模型指代消解、长期偏好显式替换与临时 ignore、Skill 选中后才披露完整步骤、失败 run 日志持久化、工具审计脱敏，以及对话删除联动日志/checkpoint。生产仍需补可信多用户 principal、静态加密、合规 retention/export 和外部日志汇聚。

@@ -139,6 +139,7 @@ def create_app(
             "conversation_memory_enabled": app_config.conversation_memory_enabled,
             "personal_memory_enabled": app_config.personal_memory_enabled,
             "automatic_memory_consolidation_enabled": app_config.automatic_memory_consolidation_enabled,
+            "automatic_skill_learning_enabled": app_config.automatic_skill_learning_enabled,
             "user_profile_configured": app_config.user_profile_path is not None,
             "personal_knowledge_enabled": app_config.personal_knowledge_enabled,
             "conversation_context_tokens": app_config.conversation_context_tokens,
@@ -160,6 +161,33 @@ def create_app(
     @app.get("/api/v1/tools")
     async def get_tools(_: None = Depends(auth_dependency)) -> list[dict]:
         return service.describe_tools()
+
+    @app.get("/api/v1/conversations/{thread_id}/runs/{run_id}/logs")
+    async def get_run_logs(
+        thread_id: str,
+        run_id: str,
+        _: None = Depends(auth_dependency),
+    ) -> dict:
+        try:
+            events = service.list_run_logs(thread_id, run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"thread_id": thread_id, "run_id": run_id, "events": events}
+
+    @app.get("/api/v1/skills")
+    async def get_learned_skills(_: None = Depends(auth_dependency)) -> dict:
+        return {"skills": service.list_learned_skills()}
+
+    @app.delete("/api/v1/skills/{skill_id}")
+    async def delete_learned_skill(
+        skill_id: str,
+        _: None = Depends(auth_dependency),
+    ) -> dict[str, str | bool]:
+        try:
+            deleted = service.delete_learned_skill(skill_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"skill_id": skill_id, "deleted": deleted}
 
     @app.delete("/api/v1/conversations/{thread_id}")
     async def delete_conversation(thread_id: str, _: None = Depends(auth_dependency)) -> dict[str, int | str]:

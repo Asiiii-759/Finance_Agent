@@ -33,7 +33,7 @@
 - 报告 Markdown 注入转义、citation/footnote/gap/calculation lineage/risk notice 硬校验。
 - 持久 conversation event ledger：user/tool/assistant 全历史、tenant/user/thread namespace、300K token 默认 prompt 预算、85% 阈值 LLM 滚动摘要、最近原始事件、确定性实体/焦点历史、歧义代词拒绝猜测和显式删除关联 checkpoints。
 - 显式会话文档：原 PDF 请求后删除，仅在 opt-in 时将解析页文本按 tenant/user/thread 保留于进程内存；默认 1 小时 TTL，支持列举、召回和删除。
-- 显式个人长期记忆：profile/preference/experience/skill 仅通过 CRUD 写入；同类同标题覆盖，相关性召回且绝不充当 Evidence。
+- 个人长期记忆：profile/preference/experience 支持 CRUD 与受限 LLM 沉淀；明确长期更新覆盖、临时要求忽略，绝不充当 Evidence。成功工作路径进入独立 Learned Skill 并渐进披露。
 - 持久个人 PDF 知识库：只保存解析页文本和元数据，tenant/user 精确隔离，支持上传、列表、检索和删除；临时文档不自动入库。
 - 部署级 `evidence_tools` 注入边界：只接受 read-only canonical `EvidenceBundle` 工具。
 - MCP Host/Client：`MAS_MCP_SERVERS` allowlist 连接 stdio 或固定 HTTPS JSON-RPC；只读+Evidence 过滤后进入 Harness；规划侧用 `mcp.search_tools` / `mcp.describe_tool` / `mcp.call_tool` 渐进发现。AllTick/必盈可自动挂载 `extmarket` server。FRED/Bocha/行情/MCP call 有每分钟滑动窗口限流。计算与内部 RAG 仍为内置工具。

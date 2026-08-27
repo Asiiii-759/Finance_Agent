@@ -29,7 +29,7 @@
 
 ```text
 user request
-  → deterministic scope and requirements
+  → mandatory LLM TaskFrame and requirements
   → bounded adaptive planner
   → policy-controlled tools
   → SourceRef / Evidence ledger
@@ -111,7 +111,7 @@ provider-neutral `web.search`，使模型能自主产生检索式和时效范围
 
 | ID | 发现的问题 | 根因与风险 | 采用的方案 | 验证 | 状态 |
 |---|---|---|---|---|---|
-| PLN-01 | 所有查询采用同一固定 workflow | 没有需求分类和字段级目标 | 中英 deterministic scope，生成 intents 与 requirements | CAGR、知识、市场、SEC、宏观场景 | 已解决 |
+| PLN-01 | 所有查询采用同一固定 workflow | 没有需求分类和字段级目标 | 后续先引入规则 scope，最终由强制 LLM TaskFrame 完全替代，生成 intents 与 requirements | TaskFrame、CAGR、知识、市场、SEC、宏观场景 | 已解决 |
 | PLN-02 | 模型可能选择不存在或越权工具 | 提示词不是安全边界 | Planner 输出仍需经过工具注册表和 capability allowlist | `planner_tool_denied` 注入 | 已解决 |
 | PLN-03 | Planner 可重复同一 task | 浪费预算甚至循环 | task ID 由工具名和参数稳定哈希，重复 task 不执行 | duplicate task test | 已解决 |
 | PLN-04 | 主数据源失败后没有真正 fallback | 固定节点无法表达同一 requirement 的多个候选工具 | 每类 requirement 配置有序候选，下一轮选择未尝试工具 | RAG primary/fallback、市场 fallback tests | 已解决 |
@@ -240,7 +240,7 @@ NIST 的生成式 AI 风险框架指出，模型可能生成错误内容以及�
 | MEM-06 | 会话历史的保留语义不符合长对话需求 | 7 天 TTL 会在用户未删除时丢失历史 | 完整事件账本保留到显式删除，并同时清理摘要与关联 checkpoint | restart/delete tests | 已解决 |
 | MEM-07 | 事件或关系内容可被错误重放/强转 | 损坏记录可能伪装合法，同 ID 不同内容可能静默覆盖语义 | 严格 JSON/类型/时区校验；幂等 ID 内容冲突快速失败 | coercion/idempotency tests | 已解决 |
 | MEM-08 | Apple 后改问 Microsoft 仍沿用 Apple | 旧实体优先级错误 | 显式实体 → 当前检测实体 → 真正指代时 remembered entity | entity switch black-box | 已解决 |
-| MEM-09 | 设想了长期 memory promotion，但无真实产品治理 | 隐私数据无法查看、撤回、导出 | 删除 policy/API；长期用户画像明确未实现 | API/docs audit | 刻意不实现 |
+| MEM-09 | 自动长期记忆若不区分临时要求与长期变更，会污染跨会话偏好 | 本轮格式覆盖长期习惯，或旧偏好永远无法更新 | LLM 候选限定 profile/preference/experience；临时要求 ignore，明确长期 update 覆盖；显式 CRUD 可查看删除 | promotion/update/ignore tests | 已解决 |
 | MEM-10 | 一次性 PDF 无法跨同线程追问 | 要么重复上传，要么误把临时文档永久入库 | 显式 session opt-in；只保留解析页文本、短 TTL、namespace 隔离和删除接口 | service/API follow-up tests | 已解决 |
 | MEM-11 | 临时上传与永久知识库语义混在一起 | 用户同意、ACL、删除传播无法成立 | 三层生命周期；临时绝不自动 promotion，永久文档仅走受控 RAG | lifecycle contract review | 已解决 |
 | MEM-12 | 只保存上一轮最小快照 | 多轮长对话和工具过程无法进入上下文 | user/tool/assistant append-only ledger；旧摘要 + 最近原始事件投影 | persistence/tool-event tests | 已解决 |
@@ -399,7 +399,7 @@ validation 不要求为了“多 Agent 感”追加市场、SEC 或 RAG。当前
 - 不执行任意代码；模型自拟计算只允许受限声明式 AST，并公开语义待核验；
 - 不提供任意 URL 抓取；
 - 不提供 broker/交易工具；
-- 不自动从对话生成用户画像；单用户个人记忆只接受显式 CRUD，多用户能力继续等待可信 identity/retention；
+- 自动长期记忆只提取受限、可撤回的稳定偏好/背景；临时需求、工具结果、金融事实与 Skill 不得进入，多用户能力继续等待可信 identity/retention；
 - 不自动用 source priority 隐藏冲突；
 - 不把模型 fallback 写成预设 Apple/Microsoft 结论。
 
@@ -459,6 +459,28 @@ compileall、Compose YAML、PEP 517 构建和全新临时目录 wheel 导入全�
   留在 provenance/observation，语义 tags 固定，跨检索路径幂等去重，真实 DeepSeek 复测成功。
 
 最终打包与安装后验证结果同时记录在 `IMPLEMENTATION_STATUS.md`。
+
+### 7.1 记忆基础重审：问题、取舍与落地
+
+本轮不是继续叠加一种“记忆”，而是把原先混在一起的语义拆成四个最小平面：
+
+| 发现的问题 | 根因 | 最终方案 | 为什么这样收敛 |
+|---|---|---|---|
+| 长期偏好冲突一律不覆盖 | 把金融证据冲突策略错误套到用户偏好 | 用户明确长期改变时 `update` 同槽位旧值；“本轮/今天”必须 `ignore` | 偏好存在时间上的最新真实值，和多源金融口径冲突不是同一问题 |
+| Skill 被塞进 personal memory | 把“用户是谁/喜欢什么”和“系统怎样成功做事”混为一谈 | Skill 独立 namespace，只从成功且多步骤的 run 提取 | 防止一次任务路径污染用户画像，也便于单独查看和删除 |
+| 所有 Skill 完整注入 prompt | 缺少渐进披露入口 | TaskFrame 只看短索引并选择最多 3 个，Planner 只看选中 Skill 的完整步骤 | 控制上下文并降低历史路径的指令注入面 |
+| 原子事件由关键词规则生成 | “提到/计算/比较”标签不是用户所说的最小事实 | LLM 输出独立中文短句，代码仅校验结构和来源事件 ID | 语义由模型理解，确定性代码只守系统边界 |
+| 原子事件只保留 100 条、每轮召回 20 条 | 先截断再相关性排序使对话开头的实体永远不可见 | `atomic_fact` 不参加摘要，构造窗口时从完整账本全量回放 | 满足长对话早期指代；超硬预算时显式失败，不静默遗漏 |
+| 会话事件兼作运维日志 | 用户可见历史缺少失败阶段、返回摘要和独立查询 | 新增 `run_logs`，记录 run/context/tool/terminal，成功返回只存结构摘要 | 对话语义和后端可观测性生命周期不同 |
+| Harness audit 没有错误消息和成功返回信息 | 只记录状态/错误码无法排障 | 审计增加脱敏错误消息与不含内容的 result summary | 可诊断，同时不把 PDF、网页、prompt 或密钥复制进日志 |
+| 摘要器错误依赖请求的金融数据联网授权 | 把内部模型调用和外部数据出网混成一个开关 | 已配置模型即可摘要；外部工具仍需部署 + 请求双重授权 | 内部上下文维护不应因用户拒绝网页/行情访问而失效 |
+
+同时明确没有提前实现的能力：当前没有交易、转账、发信或外部删除工具，因此只记录未来危险工具的审批接入点，
+没有制造一个无前端消费者、无法真正中断/恢复的“伪审批框架”。真正接入时必须由 Harness 产生 approval request，
+LangGraph checkpoint 保存中断，前端明确展示工具、参数和影响范围后再恢复同一 run。
+
+本轮回归增加了：明确长期更新与临时 ignore、原子事实来源边界、早期事实跨摘要保留、Skill 选中后才披露完整步骤、
+Agent 失败后日志仍可查询、工具审计返回摘要和线程删除联动日志。完整现状见 `CONVERSATION_MEMORY.md`。
 
 ## 8. 仍然存在的边界
 

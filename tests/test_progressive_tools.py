@@ -4,9 +4,10 @@ import json
 import sys
 import unittest
 
+from llm_fixtures import llm_backed_agent
+
 from mas_finance.agent import ResearchRequest
 from mas_finance.contracts import Evidence, EvidenceBundle, SourceRef, SourceType
-from mas_finance.graph import FinancialResearchAgent
 from mas_finance.harness import ToolHarness
 from mas_finance.llm import BaseLLMClient
 from mas_finance.mcp import (
@@ -147,7 +148,7 @@ class ProgressiveDiscoveryTests(unittest.TestCase):
                 ]
             )
             harness.register(llm_planning_harness_tool(llm, network_access=False))
-            outcome = FinancialResearchAgent(
+            outcome = llm_backed_agent(
                 harness,
                 planner=ModelPlanner(
                     harness,
@@ -169,7 +170,7 @@ class ProgressiveDiscoveryTests(unittest.TestCase):
                     require_market_data=False,
                     require_regulatory_data=False,
                     run_id="progressive-discovery",
-                    max_model_calls=3,
+                    max_model_calls=5,
                     max_iterations=4,
                 )
             )

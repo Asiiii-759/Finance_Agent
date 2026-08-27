@@ -22,9 +22,11 @@ MEMORY_CONSOLIDATION_SYSTEM_PROMPT = """你负责从一个已经结束的对话�
 3. “这次、今天、当前报告”等临时要求一律忽略；敏感信息一律忽略；
 4. 每个窗口最多返回两条，宁缺毋滥，普通对话应返回空数组；
 5. 标题应稳定、简短，便于与已有记忆去重；内容必须是原子性的单一陈述；
-6. 只允许 profile、preference、experience；不得自动生成可执行 skill。
+6. 只允许 profile、preference、experience。Skill 属于独立的成功工作路径记忆，不在这里提取；
+7. 若新陈述只是“这次、今天、本轮”采用的临时偏好，必须 ignore，绝不能覆盖长期偏好；
+8. 若用户明确表示从今以后采用新的长期偏好，即使与旧记忆冲突，也应 operation=update。
 
-operation 必须根据已有记忆选择 add、reinforce、update、conflict 或 ignore；只有用户明确改变旧偏好时才可 update。
+operation 必须根据已有记忆选择 add、reinforce、update 或 ignore；只有用户明确改变长期偏好时才可 update。
 
 只返回 JSON：
 {"candidates":[{"kind":"preference","title":"回答语言","content":"用户长期偏好使用中文交流。",
@@ -51,8 +53,6 @@ class LongTermMemoryCandidate:
         if set(value).difference(allowed):
             raise ValueError("长期记忆候选包含未知字段")
         kind = PersonalMemoryKind(str(value.get("kind") or ""))
-        if kind == PersonalMemoryKind.SKILL:
-            raise ValueError("自动提取不能创建 skill 记忆")
         title = str(value.get("title") or "").strip()
         content = str(value.get("content") or "").strip()
         scope = str(value.get("scope") or "").strip()
@@ -68,7 +68,7 @@ class LongTermMemoryCandidate:
             raise ValueError("长期记忆候选 explicitness 无效")
         if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
             raise ValueError("长期记忆候选 confidence 无效")
-        if operation not in {"add", "reinforce", "update", "conflict", "ignore"}:
+        if operation not in {"add", "reinforce", "update", "ignore"}:
             raise ValueError("长期记忆候选 operation 无效")
         if not isinstance(tags, list) or len(tags) > 10 or any(not isinstance(item, str) for item in tags):
             raise ValueError("长期记忆候选 tags 无效")

@@ -302,6 +302,16 @@ class MemoryTests(unittest.TestCase):
                     "attempts": 2,
                 },
             )
+            store.append_conversation_event(
+                namespace,
+                event_id="fact-early",
+                kind=ConversationEventKind.ATOMIC_FACT,
+                content="用户要求比较 Apple 与 Microsoft。",
+                occurred_at="2026-08-26T12:18:00+08:00",
+                run_id="run-pending",
+                entities=("Apple", "Microsoft"),
+                payload={"source_event_ids": ["event-16"], "status": "requested"},
+            )
 
             with self.assertRaisesRegex(RuntimeError, "requires an LLM summarizer"):
                 build_conversation_window(
@@ -327,18 +337,17 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(context["focus_history"][-1]["entities"], ["Apple"])
             self.assertEqual(context["entity_state"]["Apple"]["mention_count"], 9)
             self.assertEqual(context["entity_state"]["Apple"]["symbol"], "AAPL")
-            self.assertEqual(context["entity_events"][-1]["entities"], ["Apple"])
-            self.assertEqual(context["entity_events"][-1]["action"], "mentioned")
+            self.assertEqual(context["atomic_facts"][0]["content"], "用户要求比较 Apple 与 Microsoft。")
             self.assertLessEqual(context["manifest"]["recent_context_tokens"], 4_000)
             self.assertEqual(context["manifest"]["max_recent_context_tokens"], 4_000)
             self.assertEqual({event["run_id"] for event in context["recent_events"]}, {"run-pending"})
             self.assertEqual(context["run_state"][-1]["status"], "unfinished")
             self.assertEqual(context["run_state"][-1]["tools"][0]["error_code"], "provider_timeout")
             self.assertGreater(context["manifest"]["covered_through_sequence"], 0)
-            self.assertEqual(len(store.list_conversation_events(namespace)), 18)
+            self.assertEqual(len(store.list_conversation_events(namespace)), 19)
 
             reopened = SQLiteMemoryStore(path)
-            self.assertEqual(len(reopened.list_conversation_events(namespace)), 18)
+            self.assertEqual(len(reopened.list_conversation_events(namespace)), 19)
             self.assertIsNotNone(reopened.get_conversation_summary(namespace))
             self.assertEqual(
                 reopened.list_conversation_events(namespace)[0],
@@ -361,7 +370,10 @@ class MemoryTests(unittest.TestCase):
                     content="different content",
                     run_id="run-0",
                 )
-            self.assertEqual(reopened.delete_conversation(namespace), {"events": 18, "summaries": 1})
+            self.assertEqual(
+                reopened.delete_conversation(namespace),
+                {"events": 19, "summaries": 1, "run_logs": 0},
+            )
             self.assertEqual(reopened.list_conversation_events(namespace), [])
 
 

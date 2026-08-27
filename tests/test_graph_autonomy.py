@@ -4,15 +4,14 @@ import json
 import unittest
 
 import httpx
-from llm_fixtures import NullPlanner, ScriptedLLM
+from llm_fixtures import NullPlanner, ScriptedLLM, llm_backed_agent
 
 from mas_finance.agent import CoverageAssessor, ResearchRequest
 from mas_finance.contracts import EvidenceBundle
-from mas_finance.graph import FinancialResearchAgent
 from mas_finance.harness import ExecutionPolicy, ToolContext, ToolHarness
 from mas_finance.metrics import financial_calculation_harness_tool
 from mas_finance.planning import ModelPlanner, llm_planning_harness_tool
-from mas_finance.research import FinancialQueryAnalyzer
+from mas_finance.research import FinancialIntent, ResearchRequirement, ResearchScope
 from mas_finance.task_frame import LLMTaskInterpreter, llm_task_frame_harness_tool
 from mas_finance.web_search import (
     BochaWebSearchClient,
@@ -50,7 +49,7 @@ class FixtureWebSearch:
 
 class GraphAutonomyTests(unittest.TestCase):
     def test_graph_contains_only_business_nodes(self) -> None:
-        graph = FinancialResearchAgent(ToolHarness(), planner=NullPlanner()).graph.get_graph()
+        graph = llm_backed_agent(ToolHarness(), planner=NullPlanner()).graph.get_graph()
         business_nodes = {name for name in graph.nodes if not name.startswith("__")}
         self.assertEqual(business_nodes, {"intent", "planning", "validation", "final_generation"})
 
@@ -82,21 +81,21 @@ class GraphAutonomyTests(unittest.TestCase):
                 network_access=False,
             )
         )
-        outcome = FinancialResearchAgent(harness, planner=ModelPlanner(harness)).run(
+        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness)).run(
             ResearchRequest(
                 query="一项投资从100增长到121，用了2年，CAGR是多少？",
                 require_documents=False,
                 require_market_data=False,
                 require_regulatory_data=False,
                 run_id="model-tool-choice",
-                max_model_calls=2,
+                max_model_calls=4,
             )
         )
         self.assertEqual(outcome.status, "succeeded")
         self.assertEqual([item.task.tool_name for item in outcome.state.observations], ["finance.calculate"])
         self.assertEqual(
             [item["tool_name"] for item in outcome.audit_events],
-            ["llm.plan", "finance.calculate", "llm.plan"],
+            ["llm.task_frame", "llm.plan", "finance.calculate", "llm.plan", "llm.synthesize"],
         )
         self.assertEqual(outcome.state.context_manifests[0]["phase"], "planning")
         self.assertIn("金融研究 Agent", llm.system_prompts[0])
@@ -122,7 +121,7 @@ class GraphAutonomyTests(unittest.TestCase):
         )
         harness.register(llm_task_frame_harness_tool(llm, network_access=False))
         harness.register(llm_planning_harness_tool(llm, network_access=False))
-        outcome = FinancialResearchAgent(
+        outcome = llm_backed_agent(
             harness,
             planner=ModelPlanner(harness),
             task_interpreter=LLMTaskInterpreter(harness),
@@ -131,7 +130,7 @@ class GraphAutonomyTests(unittest.TestCase):
                 query="解释市盈率",
                 require_documents=False,
                 run_id="task-frame-scope",
-                max_model_calls=3,
+                max_model_calls=4,
             )
         )
         self.assertEqual(outcome.status, "succeeded")
@@ -139,7 +138,7 @@ class GraphAutonomyTests(unittest.TestCase):
         self.assertEqual(outcome.state.task_frame["goal"], "解释市盈率的含义")
         self.assertEqual(
             [item["tool_name"] for item in outcome.audit_events],
-            ["llm.task_frame", "llm.plan"],
+            ["llm.task_frame", "llm.plan", "llm.synthesize"],
         )
 
     def test_task_frame_stops_for_ambiguous_history_reference(self) -> None:
@@ -160,7 +159,7 @@ class GraphAutonomyTests(unittest.TestCase):
                 network_access=False,
             )
         )
-        outcome = FinancialResearchAgent(
+        outcome = llm_backed_agent(
             harness,
             planner=NullPlanner(),
             task_interpreter=LLMTaskInterpreter(harness),
@@ -169,7 +168,7 @@ class GraphAutonomyTests(unittest.TestCase):
                 query="它的回撤呢？",
                 require_documents=False,
                 run_id="task-frame-clarification",
-                thread_context={"entity_replay": [{"entities": ["Apple", "Microsoft"]}]},
+                thread_context={"atomic_facts": [{"entities": ["Apple", "Microsoft"]}]},
             )
         )
         self.assertEqual(outcome.status, "needs_clarification")
@@ -203,13 +202,13 @@ class GraphAutonomyTests(unittest.TestCase):
                 network_access=False,
             )
         )
-        outcome = FinancialResearchAgent(harness, planner=ModelPlanner(harness)).run(
+        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness)).run(
             ResearchRequest(
                 query="一项投资从100增长到121，用了2年，CAGR是多少？",
                 require_documents=False,
                 run_id="premature-finish",
                 max_iterations=3,
-                max_model_calls=3,
+                max_model_calls=5,
             )
         )
         self.assertEqual(outcome.status, "succeeded")
@@ -241,13 +240,13 @@ class GraphAutonomyTests(unittest.TestCase):
                 network_access=False,
             )
         )
-        outcome = FinancialResearchAgent(harness, planner=ModelPlanner(harness)).run(
+        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness)).run(
             ResearchRequest(
                 query="What changed in ACME's covenant outlook this week?",
                 require_documents=False,
                 allow_network=True,
                 run_id="model-web-search",
-                max_model_calls=2,
+                max_model_calls=4,
             )
         )
         self.assertEqual(outcome.status, "degraded")
@@ -291,7 +290,16 @@ class GraphAutonomyTests(unittest.TestCase):
         decision = CoverageAssessor().assess(
             request,
             EvidenceBundle.from_dict(bundle),
-            FinancialQueryAnalyzer().analyze(request),
+            ResearchScope(
+                intents=(FinancialIntent.GENERAL_RESEARCH,),
+                requirements=(
+                    ResearchRequirement(
+                        key="web:query:1",
+                        category="web",
+                        reason="The request requires diverse current web evidence.",
+                    ),
+                ),
+            ),
         )
         self.assertFalse(decision.complete)
 
@@ -342,7 +350,7 @@ class GraphAutonomyTests(unittest.TestCase):
             )
         )
         with self.assertRaisesRegex(RuntimeError, "model planning response is unusable"):
-            FinancialResearchAgent(harness, planner=ModelPlanner(harness)).run(
+            llm_backed_agent(harness, planner=ModelPlanner(harness)).run(
                 ResearchRequest(
                     query="解释市盈率",
                     require_documents=False,
@@ -524,14 +532,14 @@ class GraphAutonomyTests(unittest.TestCase):
         )
         harness.register(financial_calculation_harness_tool())
         harness.register(llm_planning_harness_tool(llm, network_access=False))
-        outcome = FinancialResearchAgent(harness, planner=ModelPlanner(harness)).run(
+        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness)).run(
             ResearchRequest(
                 query="一项投资从100增长到121，用了2年，CAGR和百分比变化是多少？",
                 require_documents=False,
                 require_market_data=False,
                 require_regulatory_data=False,
                 run_id="multi-tool-plan",
-                max_model_calls=2,
+                max_model_calls=4,
                 max_parallel_tool_calls=2,
             )
         )
@@ -540,7 +548,14 @@ class GraphAutonomyTests(unittest.TestCase):
         self.assertEqual({item.task.tool_name for item in outcome.state.observations}, {"finance.calculate"})
         self.assertEqual(
             [item["tool_name"] for item in outcome.audit_events],
-            ["llm.plan", "finance.calculate", "finance.calculate", "llm.plan"],
+            [
+                "llm.task_frame",
+                "llm.plan",
+                "finance.calculate",
+                "finance.calculate",
+                "llm.plan",
+                "llm.synthesize",
+            ],
         )
 
 

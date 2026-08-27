@@ -11,7 +11,7 @@ from typing import Any, Protocol
 
 from .contracts import Claim, ClaimStatus, EvidenceBundle, SourceType, stable_id
 from .harness import ToolSpec
-from .research import FinancialQueryAnalyzer, ResearchRequirement, ResearchScope, validate_macro_series
+from .research import ResearchRequirement, ResearchScope, validate_macro_series
 
 
 class AgentPhase(StrEnum):
@@ -47,7 +47,7 @@ class ResearchRequest:
     max_iterations: int = 3
     max_tool_calls: int = 12
     max_network_calls: int = 8
-    max_model_calls: int = 1
+    max_model_calls: int = 8
     max_parallel_tool_calls: int = 4
     require_documents: bool = True
     require_market_data: bool | None = None
@@ -59,6 +59,7 @@ class ResearchRequest:
     calculations: tuple[Mapping[str, Any], ...] = ()
     thread_context: Mapping[str, Any] = field(default_factory=dict)
     personal_context: tuple[Mapping[str, Any], ...] = ()
+    skill_index: tuple[Mapping[str, Any], ...] = ()
     available_document_count: int = 0
 
     def __post_init__(self) -> None:
@@ -133,6 +134,11 @@ class ResearchRequest:
             raise ValueError("personal_context must be JSON serializable") from exc
         if len(personal_payload) > 20_000:
             raise ValueError("personal_context exceeds length limit")
+        if len(self.skill_index) > 100 or any(not isinstance(item, Mapping) for item in self.skill_index):
+            raise ValueError("skill_index must contain at most 100 objects")
+        skill_payload = json.dumps([dict(item) for item in self.skill_index], ensure_ascii=False, allow_nan=False)
+        if len(skill_payload) > 20_000:
+            raise ValueError("skill_index exceeds length limit")
         if (
             isinstance(self.available_document_count, bool)
             or not isinstance(self.available_document_count, int)
@@ -152,6 +158,7 @@ class ResearchRequest:
         value["calculations"] = [dict(item) for item in self.calculations]
         value["thread_context"] = dict(self.thread_context)
         value["personal_context"] = [dict(item) for item in self.personal_context]
+        value["skill_index"] = [dict(item) for item in self.skill_index]
         return value
 
     @classmethod
@@ -169,7 +176,7 @@ class ResearchRequest:
             max_iterations=int(value.get("max_iterations", 3)),
             max_tool_calls=int(value.get("max_tool_calls", 12)),
             max_network_calls=int(value.get("max_network_calls", 8)),
-            max_model_calls=int(value.get("max_model_calls", 1)),
+            max_model_calls=int(value.get("max_model_calls", 8)),
             max_parallel_tool_calls=int(value.get("max_parallel_tool_calls", 4)),
             require_documents=bool(value.get("require_documents", True)),
             require_market_data=value.get("require_market_data"),
@@ -181,6 +188,7 @@ class ResearchRequest:
             calculations=tuple(dict(item) for item in value.get("calculations") or ()),
             thread_context=dict(value.get("thread_context") or {}),
             personal_context=tuple(dict(item) for item in value.get("personal_context") or ()),
+            skill_index=tuple(dict(item) for item in value.get("skill_index") or ()),
             available_document_count=int(value.get("available_document_count", 0)),
         )
 
@@ -513,9 +521,10 @@ class CoverageAssessor:
         bundle: EvidenceBundle,
         scope: ResearchScope | None = None,
     ) -> CoverageDecision:
-        actual_scope = scope or FinancialQueryAnalyzer().analyze(request)
+        if scope is None:
+            raise ValueError("coverage assessment requires a model-created research scope")
         missing: list[str] = []
-        for requirement in actual_scope.requirements:
+        for requirement in scope.requirements:
             if requirement.category == "knowledge":
                 # 概念定义由模型自身判断，不强制检索词条。
                 continue

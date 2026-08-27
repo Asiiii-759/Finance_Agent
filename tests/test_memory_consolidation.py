@@ -25,6 +25,58 @@ class StaticMemoryExtractor:
 
 
 class MemoryConsolidationTests(unittest.TestCase):
+    def test_explicit_long_term_update_replaces_prior_preference_but_temporary_ignore_does_not(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            service = research_service(build_test_config(Path(directory)))
+            original = service.save_personal_memory(
+                kind=PersonalMemoryKind.PREFERENCE,
+                title="回答语言",
+                content="用户长期偏好使用中文。",
+            )
+            service._merge_long_term_memory_candidate(
+                "default",
+                "anonymous",
+                "memory-update-thread",
+                "memory-update-run",
+                LongTermMemoryCandidate(
+                    PersonalMemoryKind.PREFERENCE,
+                    "回答语言",
+                    "用户今后长期偏好使用英文。",
+                    "全局",
+                    "explicit",
+                    0.99,
+                    "update",
+                    ("英文",),
+                ),
+                service.list_personal_memories(),
+            )
+            updated = service.list_personal_memories()[0]
+            self.assertEqual(updated["memory_id"], original["memory_id"])
+            self.assertEqual(updated["content"], "用户今后长期偏好使用英文。")
+            self.assertTrue(updated["metadata"]["replaces_prior_memory"])
+
+            service._consolidate_long_term_memory(
+                "default",
+                "anonymous",
+                "temporary-thread",
+                "temporary-run",
+                (),
+                StaticMemoryExtractor(
+                    LongTermMemoryCandidate(
+                        PersonalMemoryKind.PREFERENCE,
+                        "回答语言",
+                        "用户本轮临时要求使用日文。",
+                        "本轮",
+                        "explicit",
+                        1.0,
+                        "ignore",
+                        ("日文",),
+                    )
+                ),
+            )
+            self.assertEqual(service.list_personal_memories()[0]["content"], "用户今后长期偏好使用英文。")
+            service.close()
+
     def test_inferred_memory_requires_two_distinct_completed_runs(self) -> None:
         candidate = LongTermMemoryCandidate(
             PersonalMemoryKind.PREFERENCE,

@@ -13,6 +13,7 @@ from uuid import uuid4
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from .agent import ResearchRequest
+from .atomic_facts import AtomicFactExtractor, LLMAtomicFactExtractor
 from .config import AppConfig
 from .contracts import stable_id
 from .conversation import LLMConversationSummarizer
@@ -63,6 +64,7 @@ from .sec import (
     sec_recent_filings_harness_tool,
 )
 from .security import safe_child, safe_upload_name
+from .skill_learning import LearnedSkill, LLMSkillExtractor, SkillExtractor, skill_run_context
 from .synthesis import EvidenceBoundLLMSynthesizer, llm_synthesis_harness_tool
 from .task_frame import LLMTaskInterpreter, llm_task_frame_harness_tool
 from .web_search import BochaWebSearchClient, BraveWebSearchClient, WebSearchEvidenceAdapter, web_search_harness_tool
@@ -84,6 +86,8 @@ class FinanceAnalysisService:
         conversation_summarizer: ConversationSummarizer | None = None,
         conversation_token_counter: TokenCounter | None = None,
         long_term_memory_extractor: LongTermMemoryExtractor | None = None,
+        skill_extractor: SkillExtractor | None = None,
+        atomic_fact_extractor: AtomicFactExtractor | None = None,
         mcp_host: MCPHost | None = None,
         llm_client: BaseLLMClient | None = None,
     ) -> None:
@@ -106,6 +110,8 @@ class FinanceAnalysisService:
         self.conversation_summarizer = conversation_summarizer
         self.conversation_token_counter = conversation_token_counter
         self.long_term_memory_extractor = long_term_memory_extractor
+        self.skill_extractor = skill_extractor
+        self.atomic_fact_extractor = atomic_fact_extractor
         if embedding_provider is not None and config.embedding_endpoint:
             raise ValueError("inject either an embedding provider or configured embedding endpoint, not both")
         self.embedding_provider = embedding_provider or (
@@ -564,23 +570,45 @@ class FinanceAnalysisService:
             raise ValueError("thread_id is required when using session documents")
         actual_thread_id = thread_id or f"run-{uuid4().hex[:8]}"
         actual_run_id = run_id or f"run-{uuid4().hex[:12]}"
+        conversation_namespace = self._conversation_namespace(tenant_id, user_id, actual_thread_id)
+        self.memory_store.append_run_log(
+            conversation_namespace,
+            run_id=actual_run_id,
+            event_type="run.started",
+            level="info",
+            message="研究运行已启动。",
+            details={"resume": resume, "requested_network": allow_network is True},
+        )
         # Network access requires both deployment authorization and explicit
         # per-request consent. None never means implicit consent.
         network_allowed = self.config.allow_network and allow_network is True
         llm_client = self._require_llm_client()
-        conversation_summarizer = self.conversation_summarizer or (
-            LLMConversationSummarizer(llm_client) if network_allowed else None
-        )
+        conversation_summarizer = self.conversation_summarizer or LLMConversationSummarizer(llm_client)
         memory_extractor = self.long_term_memory_extractor or (
             LLMLongTermMemoryExtractor(llm_client)
-            if network_allowed and self.config.automatic_memory_consolidation_enabled
+            if self.config.automatic_memory_consolidation_enabled
             else None
         )
+        skill_extractor = self.skill_extractor or (
+            LLMSkillExtractor(llm_client) if self.config.automatic_skill_learning_enabled else None
+        )
+        atomic_fact_extractor = self.atomic_fact_extractor or LLMAtomicFactExtractor(llm_client)
         thread_context = self._load_conversation_context(
             tenant_id,
             user_id,
             actual_thread_id,
             summarizer=conversation_summarizer,
+        )
+        self.memory_store.append_run_log(
+            conversation_namespace,
+            run_id=actual_run_id,
+            event_type="context.loaded",
+            level="info",
+            message="会话、个人记忆与 Skill 索引已装载。",
+            details={
+                "atomic_fact_count": len(thread_context.get("atomic_facts") or ()),
+                "recent_event_count": len(thread_context.get("recent_events") or ()),
+            },
         )
         personal_context = (
             (*self._user_profile_context(), *self._recall_personal_memories(tenant_id, user_id, query))
@@ -588,6 +616,16 @@ class FinanceAnalysisService:
             else ()
         )
         tool_usage_context = self._recall_tool_usage_memory(tenant_id, user_id, query)
+        learned_skills = self.list_learned_skills(tenant_id=tenant_id, user_id=user_id)
+        skill_index = tuple(
+            {
+                "skill_id": item["skill_id"],
+                "name": item["name"],
+                "description": item["description"],
+                "applicability": item["applicability"],
+            }
+            for item in learned_skills
+        )
         harness = ToolHarness()
         harness.register(financial_calculation_harness_tool())
         harness.register(formula_harness_tool())
@@ -794,17 +832,9 @@ class FinanceAnalysisService:
                 company for document in document_contexts for company in document.get("detected_companies") or []
             )
         )
-        # The task-frame model, not a marker list, resolves references from the
-        # visible summary and atomic entity replay.
+        # The task-frame model resolves references from durable atomic facts.
         requested_entities = _normalized_entities([*(entities or []), *detected_entities])
         request_thread_context = dict(thread_context)
-        if request_thread_context:
-            current_entities = _normalized_entities([*(entities or []), *detected_entities])
-            request_thread_context["entity_replay"] = self._select_entity_replay(
-                thread_context.get("entity_events") or [],
-                query=query,
-                entities=requested_entities or current_entities,
-            )
         market_client = MarketDataClient(
             provider=self.config.market_data_provider,
             alphavantage_api_key=self.config.alphavantage_api_key,
@@ -881,6 +911,7 @@ class FinanceAnalysisService:
             calculations=tuple(dict(item) for item in (calculations or ())),
             thread_context=request_thread_context,
             personal_context=personal_context,
+            skill_index=skill_index,
             available_document_count=len(document_contexts) + len(personal_documents),
         )
         if self.config.conversation_memory_enabled:
@@ -893,6 +924,7 @@ class FinanceAnalysisService:
                 entities=requested_entities,
                 payload={"entity_symbols": resolved_symbols},
             )
+        agent_failure: Exception | None = None
         try:
             outcome = FinancialResearchAgent(
                 harness,
@@ -901,6 +933,7 @@ class FinanceAnalysisService:
                     max_evidence_chars=self.config.planning_evidence_characters,
                     mcp_tool_index=self._mcp_tool_index(),
                     tool_usage_context=tool_usage_context,
+                    learned_skills=learned_skills,
                 ),
                 synthesizer=EvidenceBoundLLMSynthesizer(
                     llm_client,
@@ -912,13 +945,15 @@ class FinanceAnalysisService:
                 task_interpreter=LLMTaskInterpreter(harness),
                 planner_hidden_tool_names=frozenset(tool.spec.name for tool in self.mcp_tools),
             ).run(request, resume=resume)
+        except Exception as exc:
+            agent_failure = exc
+            raise
         finally:
             self._close_graph_checkpointer()
-            if self.config.conversation_memory_enabled:
-                namespace = self._conversation_namespace(tenant_id, user_id, actual_thread_id)
-                for audit in harness.audit_events(actual_run_id):
+            for audit in harness.audit_events(actual_run_id):
+                if self.config.conversation_memory_enabled:
                     self.memory_store.append_conversation_event(
-                        namespace,
+                        conversation_namespace,
                         event_id=stable_id("event", {"run_id": actual_run_id, "call_id": audit["call_id"]}),
                         kind=ConversationEventKind.TOOL_EVENT,
                         content=f"{audit['tool_name']}: {audit['result_status']}",
@@ -937,7 +972,58 @@ class FinanceAnalysisService:
                             )
                         },
                     )
+                self.memory_store.append_run_log(
+                    conversation_namespace,
+                    run_id=actual_run_id,
+                    event_type="tool.completed",
+                    level="info" if audit["result_status"] == "success" else "warning",
+                    message=f"工具 {audit['tool_name']} 调用结束。",
+                    occurred_at=str(audit["timestamp"]),
+                    details={
+                        key: audit.get(key)
+                        for key in (
+                            "call_id",
+                            "tool_name",
+                            "capability",
+                            "result_status",
+                            "attempts",
+                            "network_attempts",
+                            "duration_ms",
+                            "error_code",
+                            "error_message",
+                            "result_summary",
+                        )
+                    },
+                )
+            if agent_failure is not None:
+                self.memory_store.append_run_log(
+                    conversation_namespace,
+                    run_id=actual_run_id,
+                    event_type="run.failed",
+                    level="error",
+                    message="研究运行在 Agent 执行阶段失败。",
+                    details={"phase": "agent_execution", "error_type": type(agent_failure).__name__},
+                )
         result = outcome.to_dict()
+        self.memory_store.append_run_log(
+            conversation_namespace,
+            run_id=actual_run_id,
+            event_type="run.completed",
+            level="info" if result["status"] == "succeeded" else "warning",
+            message="Agent 已生成研究终态。",
+            details={
+                "status": result["status"],
+                "stop_reason": result.get("stop_reason"),
+                "claim_count": len(result.get("claims") or ()),
+                "source_count": len(result.get("sources") or ()),
+                "unresolved_gap_codes": [
+                    str(item.get("code") or "data_gap")
+                    for item in result.get("gaps") or ()
+                    if not item.get("resolved", False)
+                ][:20],
+                "budget": result.get("budget"),
+            },
+        )
         if self.config.conversation_memory_enabled:
             namespace = self._conversation_namespace(tenant_id, user_id, actual_thread_id)
             self.memory_store.append_conversation_event(
@@ -958,33 +1044,126 @@ class FinanceAnalysisService:
                     ][:20],
                 },
             )
-            build_conversation_window(
-                self.memory_store,
-                namespace,
-                max_tokens=self.config.conversation_context_tokens,
-                recent_tokens=self.config.conversation_recent_tokens,
-                summarizer=conversation_summarizer,
-                token_counter=self.conversation_token_counter,
+            run_events = tuple(
+                event
+                for event in self.memory_store.list_conversation_events(namespace)
+                if event.run_id == actual_run_id and event.kind is not ConversationEventKind.ATOMIC_FACT
             )
+            try:
+                atomic_facts = atomic_fact_extractor.extract(run_events)
+            except Exception as exc:
+                self.memory_store.append_run_log(
+                    conversation_namespace,
+                    run_id=actual_run_id,
+                    event_type="memory.atomic_facts_failed",
+                    level="error",
+                    message="原子事实提取失败。",
+                    details={"phase": "atomic_fact_extraction", "error_type": type(exc).__name__},
+                )
+                raise
+            for fact in atomic_facts:
+                self.memory_store.append_conversation_event(
+                    namespace,
+                    event_id=stable_id(
+                        "fact",
+                        {"run_id": actual_run_id, "text": fact.text, "sources": fact.source_event_ids},
+                    ),
+                    kind=ConversationEventKind.ATOMIC_FACT,
+                    content=fact.text,
+                    run_id=actual_run_id,
+                    entities=fact.entities,
+                    payload={"source_event_ids": list(fact.source_event_ids), "status": fact.status},
+                )
+            self.memory_store.append_run_log(
+                conversation_namespace,
+                run_id=actual_run_id,
+                event_type="memory.atomic_facts_completed",
+                level="info",
+                message="原子事实已写入独立账本。",
+                details={"fact_count": len(atomic_facts)},
+            )
+            try:
+                build_conversation_window(
+                    self.memory_store,
+                    namespace,
+                    max_tokens=self.config.conversation_context_tokens,
+                    recent_tokens=self.config.conversation_recent_tokens,
+                    summarizer=conversation_summarizer,
+                    token_counter=self.conversation_token_counter,
+                )
+            except Exception as exc:
+                self.memory_store.append_run_log(
+                    conversation_namespace,
+                    run_id=actual_run_id,
+                    event_type="memory.compaction_failed",
+                    level="error",
+                    message="对话上下文投影或压缩失败。",
+                    details={"phase": "conversation_compaction", "error_type": type(exc).__name__},
+                )
+                raise
             if memory_extractor is not None and use_personal_memory and self.config.personal_memory_enabled:
                 run_events = tuple(
                     event
                     for event in self.memory_store.list_conversation_events(namespace)
                     if event.run_id == actual_run_id and event.kind is ConversationEventKind.USER_MESSAGE
                 )
-                self._consolidate_long_term_memory(
-                    tenant_id,
-                    user_id,
-                    actual_thread_id,
-                    actual_run_id,
-                    run_events,
-                    memory_extractor,
+                try:
+                    self._consolidate_long_term_memory(
+                        tenant_id,
+                        user_id,
+                        actual_thread_id,
+                        actual_run_id,
+                        run_events,
+                        memory_extractor,
+                    )
+                except Exception as exc:
+                    self.memory_store.append_run_log(
+                        conversation_namespace,
+                        run_id=actual_run_id,
+                        event_type="memory.long_term_failed",
+                        level="error",
+                        message="长期记忆候选处理失败。",
+                        details={"phase": "long_term_memory", "error_type": type(exc).__name__},
+                    )
+                    raise
+                self.memory_store.append_run_log(
+                    conversation_namespace,
+                    run_id=actual_run_id,
+                    event_type="memory.long_term_completed",
+                    level="info",
+                    message="长期记忆候选已处理。",
+                    details={},
                 )
-            self._record_tool_usage_memory(
-                tenant_id,
-                user_id,
-                harness.audit_events(actual_run_id),
-            )
+        self._record_tool_usage_memory(
+            tenant_id,
+            user_id,
+            harness.audit_events(actual_run_id),
+        )
+        if skill_extractor is not None:
+            context = skill_run_context(result)
+            if context is not None:
+                try:
+                    skill = skill_extractor.extract(context)
+                except Exception as exc:
+                    self.memory_store.append_run_log(
+                        conversation_namespace,
+                        run_id=actual_run_id,
+                        event_type="skill.learning_failed",
+                        level="error",
+                        message="成功工作路径学习失败。",
+                        details={"phase": "skill_learning", "error_type": type(exc).__name__},
+                    )
+                    raise
+                if skill is not None:
+                    self._save_learned_skill(tenant_id, user_id, actual_run_id, skill)
+                self.memory_store.append_run_log(
+                    conversation_namespace,
+                    run_id=actual_run_id,
+                    event_type="skill.learning_completed",
+                    level="info",
+                    message="成功工作路径学习已处理。",
+                    details={"skill_created": skill is not None},
+                )
 
         artifacts: dict[str, str] = {}
         if export_artifacts:
@@ -1186,6 +1365,23 @@ class FinanceAnalysisService:
             self._close_graph_checkpointer()
         return {**deleted, "checkpoints": len(run_ids)}
 
+    def list_run_logs(
+        self,
+        thread_id: str,
+        run_id: str,
+        *,
+        tenant_id: str = "default",
+        user_id: str = "anonymous",
+    ) -> list[dict]:
+        _validate_thread_id(thread_id)
+        return [
+            event.to_dict()
+            for event in self.memory_store.list_run_logs(
+                self._conversation_namespace(tenant_id, user_id, thread_id),
+                run_id,
+            )
+        ]
+
     def _personal_memory_namespace(self, tenant_id: str, user_id: str) -> MemoryNamespace:
         tenant_key, user_key = _personal_principal_ids(tenant_id, user_id)
         return MemoryNamespace(
@@ -1201,6 +1397,59 @@ class FinanceAnalysisService:
     def _tool_usage_memory_namespace(self, tenant_id: str, user_id: str) -> MemoryNamespace:
         tenant_key, user_key = _personal_principal_ids(tenant_id, user_id)
         return MemoryNamespace(tenant_id=tenant_key, user_id=user_key, kind="tool_usage_memory")
+
+    def _learned_skill_namespace(self, tenant_id: str, user_id: str) -> MemoryNamespace:
+        tenant_key, user_key = _personal_principal_ids(tenant_id, user_id)
+        return MemoryNamespace(tenant_id=tenant_key, user_id=user_key, kind="learned_skills")
+
+    def list_learned_skills(
+        self,
+        *,
+        tenant_id: str = "default",
+        user_id: str = "anonymous",
+    ) -> list[dict]:
+        return [
+            {
+                "skill_id": record.key,
+                **LearnedSkill.from_dict(record.value).to_dict(),
+                "success_count": int(record.metadata["success_count"]),
+                "updated_at": record.updated_at,
+            }
+            for record in self.memory_store.list(self._learned_skill_namespace(tenant_id, user_id), limit=100)
+        ]
+
+    def delete_learned_skill(
+        self,
+        skill_id: str,
+        *,
+        tenant_id: str = "default",
+        user_id: str = "anonymous",
+    ) -> bool:
+        return self.memory_store.delete(self._learned_skill_namespace(tenant_id, user_id), skill_id)
+
+    def _save_learned_skill(
+        self,
+        tenant_id: str,
+        user_id: str,
+        run_id: str,
+        skill: LearnedSkill,
+    ) -> None:
+        namespace = self._learned_skill_namespace(tenant_id, user_id)
+        skill_id = stable_id("skill", {"name": skill.name.casefold()})
+        stored = self.memory_store.get(namespace, skill_id)
+        run_ids = list(dict.fromkeys([*((stored.metadata.get("run_ids") or []) if stored else []), run_id]))
+        self.memory_store.put(
+            namespace,
+            skill_id,
+            skill.to_dict(),
+            metadata={
+                "schema_version": 1,
+                "source": "successful_run",
+                "success_count": len(run_ids),
+                "run_ids": run_ids,
+                "untrusted_guidance": True,
+            },
+        )
 
     def save_personal_memory(
         self,
@@ -1374,26 +1623,8 @@ class FinanceAnalysisService:
             value = PersonalMemory.from_dict(
                 {key: matched[key] for key in ("kind", "title", "content", "tags")}
             ).to_dict()
-            if candidate.operation == "conflict":
-                self.memory_store.put(
-                    self._personal_memory_candidate_namespace(tenant_id, user_id),
-                    stable_id("conflict", {"memory_id": matched["memory_id"], "run_id": run_id}),
-                    {
-                        "kind": candidate.kind.value,
-                        "title": candidate.title,
-                        "content": candidate.content,
-                        "scope": candidate.scope,
-                        "explicitness": candidate.explicitness,
-                        "confidence": candidate.confidence,
-                        "operation": candidate.operation,
-                        "tags": list(candidate.tags),
-                    },
-                    metadata={"schema_version": 1, "status": "conflict", "evidence_run_ids": [run_id]},
-                )
-                return
             if (
-                metadata.get("write_policy") != "explicit_user_action"
-                and candidate.explicitness == "explicit"
+                candidate.explicitness == "explicit"
                 and candidate.operation == "update"
             ):
                 value = PersonalMemory(
@@ -1404,6 +1635,7 @@ class FinanceAnalysisService:
                 ).to_dict()
                 metadata["write_policy"] = "automatic_llm_consolidation"
                 metadata["scope"] = candidate.scope
+                metadata["replaces_prior_memory"] = True
             self.memory_store.put(
                 self._personal_memory_namespace(tenant_id, user_id),
                 matched["memory_id"],
@@ -1461,20 +1693,6 @@ class FinanceAnalysisService:
         )
         self.memory_store.delete(namespace, candidate_key)
         existing.append({"memory_id": memory_id, **memory.to_dict()})
-
-    @staticmethod
-    def _select_entity_replay(events: Sequence[dict], *, query: str, entities: Sequence[str]) -> list[dict]:
-        query_terms = _memory_terms(query)
-        entity_names = set(entities)
-        ranked = []
-        for position, event in enumerate(events):
-            event_entities = {str(item) for item in event.get("entities") or []}
-            overlap = len(query_terms.intersection(_memory_terms(" ".join(event_entities))))
-            direct = len(entity_names.intersection(event_entities))
-            ranked.append((direct, overlap, position, event))
-        ranked.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-        selected = sorted(ranked[:20], key=lambda item: item[2])
-        return [dict(item[3]) for item in selected]
 
     def _record_tool_usage_memory(
         self,

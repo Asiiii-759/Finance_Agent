@@ -18,7 +18,6 @@ from mas_finance.config import AppConfig
 from mas_finance.context import FinancialContextAssembler
 from mas_finance.contracts import Claim, ClaimStatus, Evidence, EvidenceBundle, SourceRef, SourceType
 from mas_finance.conversation import SUMMARY_SYSTEM_PROMPT, LLMConversationSummarizer
-from mas_finance.graph import FinancialResearchAgent
 from mas_finance.harness import (
     ExecutionPolicy,
     ToolContext,
@@ -234,7 +233,7 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 invoke,
             )
         )
-        outcome = FinancialResearchAgent(harness, planner=DuplicatePlanner()).run(
+        outcome = llm_backed_agent(harness, planner=DuplicatePlanner()).run(
             ResearchRequest(
                 query="Alpha 当前股价",
                 entities=("Alpha",),
@@ -428,18 +427,18 @@ class EnterpriseBoundaryTests(unittest.TestCase):
             run_id="resume-denied-budget",
         )
         with self.assertRaisesRegex(RuntimeError, "simulated synthesis crash"):
-            FinancialResearchAgent(
+            llm_backed_agent(
                 harness,
                 planner=DuplicatePlanner(),
                 synthesizer=CrashingSynthesizer(),
                 checkpointer=checkpointer,
             ).run(request)
-        event = harness.audit_events(request.run_id)[0]
+        event = next(item for item in harness.audit_events(request.run_id) if item["tool_name"] == "market.snapshot")
         self.assertFalse(event["budget_consumed"])
         self.assertEqual(event["network_attempts"], 0)
 
         resumed_harness = ToolHarness()
-        resumed = FinancialResearchAgent(
+        resumed = llm_backed_agent(
             resumed_harness,
             planner=NullPlanner(),
             checkpointer=checkpointer,
@@ -469,13 +468,13 @@ class EnterpriseBoundaryTests(unittest.TestCase):
             run_id="resume-after-synthesis-crash",
         )
         with self.assertRaisesRegex(RuntimeError, "simulated synthesis crash"):
-            FinancialResearchAgent(
+            llm_backed_agent(
                 harness,
                 planner=DuplicatePlanner(),
                 synthesizer=CrashingSynthesizer(),
                 checkpointer=checkpointer,
             ).run(request)
-        persisted = FinancialResearchAgent(
+        persisted = llm_backed_agent(
             ToolHarness(),
             planner=NullPlanner(),
             checkpointer=checkpointer,
@@ -483,17 +482,20 @@ class EnterpriseBoundaryTests(unittest.TestCase):
         self.assertIsNotNone(persisted)
         self.assertEqual(persisted.stop_reason, StopReason.COVERAGE_SATISFIED)
 
-        resumed = FinancialResearchAgent(
+        resumed = llm_backed_agent(
             ToolHarness(),
             planner=NullPlanner(),
             checkpointer=checkpointer,
         ).run(request, resume=True)
         self.assertEqual(resumed.status, "succeeded")
         self.assertEqual(resumed.state.stop_reason, StopReason.COVERAGE_SATISFIED)
-        self.assertEqual(len(resumed.audit_events), 1)
+        self.assertEqual(
+            [item["tool_name"] for item in resumed.audit_events],
+            ["llm.task_frame", "market.snapshot", "llm.synthesize"],
+        )
         self.assertEqual(
             resumed.budget_usage,
-            {"tool_calls": 1, "network_attempts": 0, "model_calls": 0},
+            {"tool_calls": 1, "network_attempts": 0, "model_calls": 2},
         )
 
     def test_graph_checkpoint_history_contains_business_steps(self) -> None:
@@ -669,7 +671,8 @@ class EnterpriseBoundaryTests(unittest.TestCase):
             )
             self.assertEqual(events[0].kind, ConversationEventKind.USER_MESSAGE)
             self.assertIn(ConversationEventKind.TOOL_EVENT, {event.kind for event in events})
-            self.assertEqual(events[-1].kind, ConversationEventKind.ASSISTANT_MESSAGE)
+            self.assertEqual(events[-1].kind, ConversationEventKind.ATOMIC_FACT)
+            self.assertIn(ConversationEventKind.ASSISTANT_MESSAGE, {event.kind for event in events})
             service.close()
             service = research_service(make_test_config(root))
             follow_up = service.analyze(

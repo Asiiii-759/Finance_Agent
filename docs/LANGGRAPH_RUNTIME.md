@@ -45,7 +45,8 @@ Harness 是每次工具调用配套的执行 middleware；工具 adapter 是能�
 
 ### 3.1 `intent`
 
-输入是经过边界校验的 `ResearchRequest`。节点生成可持久化 `ResearchScope`：
+输入是经过边界校验的 `ResearchRequest`。节点必须通过 `LLMTaskInterpreter` 生成可持久化 `TaskFrame` 和
+`ResearchScope`：
 
 - 中英文金融意图提示；
 - entity/symbol；
@@ -53,8 +54,9 @@ Harness 是每次工具调用配套的执行 middleware；工具 adapter 是能�
 - 显式 calculation requests；
 - 文档、行情、监管、宏观、知识或开放检索 requirements。
 
-当前意图提示以确定性规则生成。它不是工具路由结果，模型可以根据原始问题和动态工具目录选择不同研究路线。
-规则的作用是给 validation 一个最低证据标准，并降低模型遗漏显式需求的概率。
+系统不存在规则式意图分析器或无模型 fallback。模型依据当前请求、线程上下文、实体事件回放和动态能力目录生成
+最低 evidence requirements；历史实体必须声明来源，歧义无法可靠消解时直接提出澄清问题。Validation 只对模型已经
+声明的 requirements 做确定性验收，不反向猜测用户意图。没有可用 LLM/`llm.task_frame` 时请求快速失败。
 
 ### 3.2 `planning`
 

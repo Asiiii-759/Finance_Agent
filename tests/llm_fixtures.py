@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -78,6 +79,28 @@ class FixtureResearchLLM(BaseLLMClient):
     def chat(self, system_prompt, user_prompt, temperature=0.2, max_tokens=600):
         del temperature, max_tokens
         payload = json.loads(user_prompt)
+        if "最小语义事实" in system_prompt:
+            events = list(payload.get("events") or ())
+            user_event = next((item for item in events if item.get("kind") == "user_message"), None)
+            if user_event is None:
+                return '{"facts":[]}'
+            return json.dumps(
+                {
+                    "facts": [
+                        {
+                            "text": f"用户提出请求：{str(user_event.get('content') or '')[:300]}",
+                            "source_event_ids": [user_event["event_id"]],
+                            "entities": list(user_event.get("entities") or ()),
+                            "status": "requested",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        if "长期记忆候选" in system_prompt:
+            return '{"candidates":[]}'
+        if "可复用工作路径" in system_prompt:
+            return '{"skill":null}'
         if "任务理解" in system_prompt:
             return json.dumps(self._task_frame(payload), ensure_ascii=False)
         if "规划组件" in system_prompt:
@@ -89,7 +112,7 @@ class FixtureResearchLLM(BaseLLMClient):
         query = str(current.get("query") or "")
         current_entities = [str(item) for item in current.get("explicit_or_detected_entities") or ()]
         symbols = dict(current.get("symbols") or {})
-        replay = list((payload.get("thread_context") or {}).get("entity_replay") or ())
+        replay = _atomic_fact_replay(str(payload.get("atomic_fact_history") or ""))
         unique_history = _unique_replay_entities(replay)
         if _needs_clarification(query, current_entities, unique_history):
             return {
@@ -120,6 +143,7 @@ class FixtureResearchLLM(BaseLLMClient):
             "intents": ["general_research"],
             "requirements": requirements,
             "success_criteria": ["在有检索需求时引用证据，概念题可直接作答"],
+            "selected_skill_ids": [],
             "clarification_question": None,
         }
 
@@ -260,6 +284,16 @@ def _unique_replay_entities(replay: Sequence[Mapping[str, Any]]) -> list[str]:
             if text and text not in names:
                 names.append(text)
     return names
+
+
+def _atomic_fact_replay(value: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "event_id": match.group(1),
+            "entities": [item for item in match.group(2).split(",") if item],
+        }
+        for match in re.finditer(r"event_id=([^;\]]+);[^\]]*entities=([^\]]*)\]", value)
+    ]
 
 
 def _needs_clarification(query: str, current_entities: Sequence[str], history: Sequence[str]) -> bool:

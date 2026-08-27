@@ -27,14 +27,14 @@ intent ── 解析实体、意图与证据需求
   ▼
 planning ── ModelPlanner 选择一个动作 ── Harness ── 只读 Tool
   ▲                 │                        │
-  │                 └─ 非法/不可用 ─────────┘ 可见错误或规则规划降级
+  │                 └─ 非法/不可用 ─────────┘ 可见错误并快速失败
   │
 validation ── 覆盖、冲突、引用、预算和停止条件
   │  不足且仍可解决
   └──────────────────────────────────────────────┐
   │ 足够/预算终止                                │
   ▼                                               │
-final_generation ── evidence-bound LLM / 确定性复述│
+final_generation ── evidence-bound LLM 合成
   │                                               │
   └────────── validation ───────── END            │
 ```
@@ -43,11 +43,9 @@ LangGraph 是唯一状态机，只有 `intent / planning / validation / final_ge
 `ToolHarness` 是每次工具执行的配套 middleware，不是一个业务节点。这样既保留 checkpoint、状态历史和恢复，
 又不把工具执行误建模为固定 workflow。
 
-模型每轮最多提出四个 `call_tool`（或一次 `call_tools`）或 `finish`。配置了 LLM 时由模型自主选择工具；
-没有密钥时才用 AdaptivePlanner 规则降级。MCP 工具走渐进发现，不把完整 schema 一次性塞进规划 prompt。
-反过来也一样：coverage 达到最低要求后，只要仍有迭代预算，模型会再看到新 Evidence，并明确选择继续检索或
-`finish`；Validation 不会因为“已经有一条文档证据”替模型抢先结束。无模型的规则规划器则在最低 requirement
-满足后直接结束，避免为了模拟自主性增加空调用。
+模型每轮最多提出四个 `call_tool`（或一次 `call_tools`）或 `finish`。LLM 是研究链路的必需依赖；MCP 工具走渐进发现，不把完整 schema 一次性塞进规划 prompt。
+coverage 达到最低要求后，只要仍有迭代预算，模型会再看到新 Evidence，并明确选择继续检索或
+`finish`；Validation 不会因为“已经有一条文档证据”替模型抢先结束。
 
 ## 3. 上下文不是 3,000 token
 
@@ -147,7 +145,7 @@ Adapter 做以下边界处理：
 ### 5.3 检索契约
 
 本地 personal/session corpus 默认严格按全局 BM25 相关性取 top-k，不为了“覆盖更多 PDF”牺牲当前问题的相关性。
-只有模型明确传入 `diversify_documents=true`，或无模型降级规则识别到“综合/对比/分别分析多份材料”时，
+只有模型明确传入 `diversify_documents=true`，或 TaskFrame/规划把问题理解为多文档综合时，
 才先给各相关文档一个结果再补同文档 chunk；此时规则基线把 top-k 提高到可用文档数（最高 20）。
 `diversify_documents` 是研究意图，不是检索器的固定偏好：问单个 covenant 数值时，即使上传八份 PDF，也仍可只召回最相关的一份。
 Validation 对明确的多文档意图只设置“至少两份不同文档”的硬下限，不粗暴要求遍历所有上传文件；超过这个
@@ -172,8 +170,7 @@ rank/score 被保留用于审计与排序，但不会被伪装成概率 confiden
 因此当前 canonical gateway 必须自己执行阈值和 rerank；核心层不会套一个错误的通用阈值。
 
 当前个人库默认使用 `personal.search` 词法检索；配置 `EmbeddingProvider` 后会额外注册
-`personal.hybrid_search`，真实执行 BM25 + cosine + RRF。两个工具的网络属性分开声明，模型可自主选择，规则基线在
-provider 可用且已获网络授权时优先 hybrid。SQLite 仍只持久化页文本，向量在每次分析的个人库快照中计算和缓存，
+`personal.hybrid_search`，真实执行 BM25 + cosine + RRF。两个工具的网络属性分开声明，模型可自主选择。SQLite 仍只持久化页文本，向量在每次分析的个人库快照中计算和缓存，
 不会因为启用语义检索而改变用户的持久化同意。算法与部署限制见 [双路检索设计](HYBRID_RETRIEVAL.md)。
 
 ## 6. 记忆模型
@@ -275,12 +272,12 @@ Harness 能证明的是“没有执行任意代码、相同输入可复算、数
 
 | 故障 | 行为 | 是否隐藏 |
 |---|---|---|
-| 模型计划非 JSON、未知工具、非法参数 | 记录 `model_planner_fallback`，规则规划器接管 | 否 |
+| 模型计划非 JSON、未知工具、非法参数 | 研究请求快速失败，不回退规则 planner | 否 |
 | 模型过早 `finish` | Validation 发现 coverage 不足后回 planning | 否 |
 | 首选 RAG 无结果/失败 | gap 可解决时选择下一授权 provider | 否 |
 | 网络未双重授权 | Harness `network_denied`，不发请求、不消耗网络尝试 | 否 |
 | 网络 transport 暂时失败 | 只读 web/RAG 重试一次，按尝试计预算 | 否 |
-| LLM 合成非 JSON、无逐字 quote、引用被裁证据 | `llm_synthesis_fallback`，确定性复述 Evidence | 否 |
+| LLM 合成非 JSON、无逐字 quote、引用被裁证据 | 合成快速失败，不复述 Evidence | 否 |
 | 仅 web snippet | 生成 `inferred` claim，整体至少 degraded | 否 |
 | 无任何 Evidence | `failed / no_evidence` | 否 |
 | 最终引用或结构硬校验失败 | `failed / validation_failed` | 否 |
@@ -293,7 +290,7 @@ Harness 能证明的是“没有执行任意代码、相同输入可复算、数
 
 自动测试覆盖：
 
-- 四节点图结构、模型自主选工具、非法计划降级、过早结束回环；
+- 四节点图结构、模型自主选工具、非法计划快速失败、过早结束回环；
 - checkpoint 跨实例恢复、请求不匹配拒绝、恢复预算连续；
 - 网页 tracking URL/内容去重、来源多样性、私网 URL 拒绝、httpx transport 重试；
 - web evidence 上下文组装、snippet claim 降级；

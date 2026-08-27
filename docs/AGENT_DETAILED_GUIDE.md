@@ -1,25 +1,25 @@
 # MAS Finance Agent：完整架构、运行机制与能力说明
 
 状态：与 2.2 实现同步
-更新日期：2026-08-20
+更新日期：2026-08-27
 适用读者：产品负责人、金融研究员、Agent/后端开发者、架构与安全评审人员
 
-> 工具参数、金融场景映射和 AdaptivePlanner 决策细节另见
+> 工具参数、金融场景映射、MCP 渐进发现和报错分层见
 > [《MAS Finance 工具、金融场景与自适应调用逻辑》](TOOLS_AND_REASONING.md)；黑盒场景、白盒故障注入、已修复问题和上线门槛见
 > [《MAS Finance 企业级验证与故障注入报告》](ENTERPRISE_EVALUATION.md)；从旧实现开始的完整问题、根因、方案和验证见
 > [《MAS Finance 全过程构建复盘与问题总账》](BUILD_RETROSPECTIVE.md)。PDF 一次性、会话级与永久知识库的具体边界见
 > [《PDF、RAG 与记忆生命周期设计》](DOCUMENT_LIFECYCLE.md)，真实 DeepSeek、Harness 回退与 checkpoint 恢复见
 > [《真实 LLM、Harness 回退与 Checkpoint 恢复验证》](LIVE_LLM_EVALUATION.md)。个人记忆、个人知识库、
-> 上下文预算、MCP/企业工具与声明式公式的设计见
-> [《个人金融助手：记忆、上下文与扩展边界》](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。四节点图、模型自主规划、
-> Harness 配套执行、开放搜索和 LangGraph 恢复细节以
-> [《LangGraph 编排、自主规划与恢复设计》](LANGGRAPH_RUNTIME.md) 为准。
+> 上下文预算、MCP 接入与声明式公式见
+> [《个人金融助手：记忆、上下文与扩展边界》](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。四节点图的 checkpoint
+> 恢复细节见 [《LangGraph 编排、自主规划与恢复设计》](LANGGRAPH_RUNTIME.md)；规划每轮最多四个工具、MCP Host
+> 与失败语义以本文第 6、9 节及 [ARCHITECTURE.md](ARCHITECTURE.md) 第 5 节为准。
 > BM25、embedding、RRF、网络工具拆分与部署接口见 [《BM25 + Embedding 双路检索设计》](HYBRID_RETRIEVAL.md)。
 
 ## 1. 一句话定义
 
 MAS Finance 是一个“证据优先、模型自主规划、工具受控、结果可验证”的金融研究 Agent：它在 LangGraph
-四节点生命周期内由模型逐步选择研究工具，经配套 Harness 执行，再把事实写入可追溯证据账本，最终生成带引用报告。
+四节点生命周期内由模型逐步选择研究工具（每轮最多四个），经配套 Harness 与 MCP Host 执行，再把事实写入可追溯证据账本，最终生成带引用报告。
 
 它解决的是“如何可信地完成金融研究”，而不是“如何让模型自由聊天”。系统的核心约束是：
 
@@ -47,6 +47,7 @@ MAS Finance 是一个“证据优先、模型自主规划、工具受控、结�
 | 数据源降级 | 主 provider 失败、备用 provider 可用 | 记录失败缺口，下一轮尝试未调用的 provider | 已恢复缺口、最终证据与完整审计 |
 | LLM 报告合成 | 已建立的 EvidenceBundle | 验证模型逐字证据 quote；不通过则自动降级 | 受支持的 claims 或确定性证据复述 |
 | 可恢复 Agent run | tenant/thread/run 标识、LangGraph checkpointer | 每个 graph step 保存可序列化领域状态 | 重启后延续预算、序号、计划和证据；主服务当前使用本地 SQLite |
+| MCP / 外部只读工具 | `MAS_MCP_SERVERS` 或 AllTick/必盈许可 | Host 只读过滤后渐进发现；失败返回结构化 error_details，成功参数进 tool_usage_memory | EvidenceBundle、resolvable gap、审计 |
 | 同步与后台接口 | CLI、HTTP、上传、job API | 使用同一个领域服务和 Agent 实现 | JSON 状态、Markdown 报告、审计与产物 |
 
 ### 2.2 能回答的问题类型
@@ -64,7 +65,7 @@ MAS Finance 是一个“证据优先、模型自主规划、工具受控、结�
 
 ### 2.3 当前不会假装具备的能力
 
-- 没有证据时不会依靠模型常识补成“完整答案”。
+- 没有检索类证据时，不会把具体公司的行情、披露或文档事实补成“已证实答案”。概念解释可以由模型直接作答，并标明未经检索核验。
 - 不承诺实时行情；是否实时取决于 provider、字段和 `as_of`。
 - 不做买入/卖出指令、收益保证、自动交易或组合执行。
 - 不把 BM25 排名分数当成事实置信概率。
@@ -82,15 +83,18 @@ flowchart TB
     I --> S[应用服务层\n配置、依赖装配、文件生命周期]
     S --> A[Agent 控制层\n四节点 LangGraph]
     A --> H[Tool Harness\n权限、网络、副作用、预算、重试、审计]
+    H --> M[MCP Host\nallowlist Client、只读过滤、渐进发现]
     H --> D1[文档检索]
     H --> D2[行情 Provider]
     H --> D3[SEC Company Facts]
     H --> D4[确定性计算]
     H --> D5[LLM 合成]
+    M --> D6[外部 MCP / extmarket]
     D1 --> E[EvidenceBundle\nSourceRef / Evidence / Claim]
     D2 --> E
     D3 --> E
     D4 --> E
+    D6 --> E
     E --> A
     A --> V[冲突协调、报告渲染、确定性校验]
     V --> O[报告 / JSON 状态 / 审计 / 产物]
@@ -103,8 +107,9 @@ flowchart TB
 |---|---|---|
 | 接口层 | 请求格式、鉴权、上传协议、HTTP 状态映射 | 研究逻辑、provider 细节 |
 | 应用服务层 | 组装本次 run 的工具、配置、路径和生命周期 | 自己生成金融结论 |
-| Agent 控制层 | 规划、循环、覆盖评估、停止、恢复 | 直接发 HTTP、读取密钥 |
-| Harness | 所有工具调用的执行政策和审计 | 决定研究结论 |
+| Agent 控制层 | 规划、循环、覆盖评估、停止、恢复；有 LLM 时每轮最多四个工具 | 直接发 HTTP、读取密钥、发明 MCP 工具名 |
+| Harness | 所有工具调用的执行政策、结构化错误和审计 | 决定研究结论 |
+| MCP Host | 连接 allowlist server、只读/capability 过滤、发现元工具 | 把原始 MCP JSON 当 Evidence |
 | 数据与工具层 | 调用部署授权的数据源并转成统一领域契约 | 修改 Agent 权限或状态机 |
 | 契约与验证层 | 来源、证据、claim、引用和报告校验 | 猜测缺失数据 |
 
@@ -112,21 +117,26 @@ flowchart TB
 
 被删除的是旧的固定角色图和兼容节点，不是 LangGraph 能力。2.0 使用 LangGraph 作为唯一编排/恢复底座，
 因为它提供 step checkpoint、状态历史、待执行节点恢复和未来 interrupt/time-travel 接口。金融证据、规划、Harness、
-预算和校验仍是领域代码，不交给框架隐式完成。图中只有 intent、planning、validation、final_generation；
-Harness 是 planning 调用工具时的 middleware，不是节点。
+MCP Host、预算和校验仍是领域代码，不交给框架隐式完成。图中只有 intent、planning、validation、final_generation；
+Harness 是 planning 调用工具时的 middleware，不是节点。同一 planning 节点可并行执行最多四个已计划任务。
 
 ## 4. 项目结构与代码导航
 
 ```text
 Multi-Agent-project/
 ├── src/mas_finance/
-│   ├── graph.py           # 四节点 LangGraph、路由与恢复
-│   ├── agent.py           # 状态、规则规划基线、Assessor、报告与冲突协调
-│   ├── planning.py        # ModelPlanner 与 llm.plan tool
+│   ├── graph.py           # 四节点 LangGraph、路由、恢复；每轮最多四个工具并行执行
+│   ├── agent.py           # 状态、Assessor、报告与冲突协调
+│   ├── planning.py        # ModelPlanner、MCP 渐进发现上下文与 llm.plan tool
 │   ├── research.py        # 金融 intents、ResearchScope 和字段级 requirements
 │   ├── contracts.py       # SourceRef、Evidence、Claim、EvidenceBundle
-│   ├── harness.py         # 工具注册、权限、预算、重试、超时、脱敏审计
+│   ├── harness.py         # 工具注册、权限、预算、重试、ToolExecutionError、脱敏审计
+│   ├── mcp.py             # MCP Host/Client、只读过滤、search/describe/call 元工具
+│   ├── mcp_servers/       # 本地 stdio MCP server（AllTick/必盈行情）
+│   ├── rate_limit.py      # 进程内滑动窗口限流
 │   ├── memory_store.py    # 持久对话事件、动态压缩、实体/焦点状态与 namespace 隔离
+│   ├── memory_consolidation.py # 长期记忆候选提取
+│   ├── personal_knowledge.py # 用户隔离的持久 PDF 页文本库
 │   ├── embeddings.py      # embedding provider 与受限 HTTP API
 │   ├── corpus.py          # request/session/personal BM25、向量与 RRF
 │   ├── retrieval.py       # 检索结果 → EvidenceBundle
@@ -142,7 +152,7 @@ Multi-Agent-project/
 │   ├── sec.py             # SEC Company Facts 与 recent filings
 │   ├── calculator.py      # 证据约束下的确定性比率计算
 │   ├── llm.py             # 模型客户端与配置
-│   ├── synthesis.py       # quote 校验的 LLM 合成与确定性降级
+│   ├── synthesis.py       # quote 校验的 LLM 合成；非法输出快速失败
 │   ├── validators.py      # 引用、claim、section、gap、风险提示校验
 │   ├── service.py         # 单次分析与后台任务的应用服务
 │   ├── reporting.py       # 报告、状态、审计产物导出
@@ -183,17 +193,17 @@ sequenceDiagram
     S->>A: ResearchRequest
     A->>CP: LangGraph 保存 intent 状态
     loop 有缺口且预算/迭代允许
-        A->>A: ModelPlanner 从动态目录选择一个工具
-        A->>H: invoke(tool, arguments, context)
+        A->>A: ModelPlanner 从动态目录选择最多四个工具或 finish
+        A->>H: 本轮任务经 Harness 执行（可并行）
         H->>H: capability/副作用/网络/预算检查
-        H->>P: 调用所选工具背后的受控 provider
-        P-->>H: provider-specific result
-        H-->>A: ToolResult + audit event
-        A->>A: 转换并合并 EvidenceBundle
+        H->>P: 调用内置 provider 或 MCP Host 受控 tools/call
+        P-->>H: provider-specific result 或 MCP isError 结构化错误
+        H-->>A: ToolResult（含 error_details）+ audit event
+        A->>A: 成功则合并 EvidenceBundle；失败则记 gap，不盲重试同参
         A->>CP: planning step 提交 observation、证据、缺口、审计
         A->>A: validation 检查覆盖；不足则回 planning
     end
-    A->>A: 比率计算、LLM/确定性合成、冲突协调
+    A->>A: 比率计算、证据约束 LLM 合成、冲突协调
     A->>A: 渲染报告并执行硬校验
     A->>CP: 保存 completed/failed 状态
     A-->>S: ResearchOutcome
@@ -205,17 +215,20 @@ sequenceDiagram
 
 `FinanceAnalysisService` 不维护一个拥有所有权限的全局 Agent，而是为每次请求创建 Harness 并按输入注册工具：
 
-- 始终注册 `finance.knowledge` 和 `finance.calculate`；配置模型时注册 `llm.plan` 与 `llm.synthesize`，
-  未配置时使用规则 planner 和确定性合成器。
+- 始终注册 `finance.calculate`；研究请求必须能调用 `llm.task_frame`、`llm.plan`
+  与 `llm.synthesize`。缺少 LLM 配置时服务在进入工具或记忆写入前快速失败。
+- 进程启动时连接 `MAS_MCP_SERVERS` allowlist；配置 AllTick/必盈时自动挂 `extmarket`。有 LLM 时把具体 MCP
+  工具从规划目录隐藏，只注册 `mcp.search_tools` / `mcp.describe_tool` / `mcp.call_tool`。
 - 存在上传/会话文档时注册 lexical `corpus.search`；配置 embedding 时同时注册独立网络属性的
   `corpus.hybrid_search`。个人文档对应 `personal.search / personal.hybrid_search`。
-- 只有识别或显式传入实体时才注册 `market.snapshot` 和 `market.history`。
+- 始终注册已配置的 `market.snapshot` 和 `market.history`，由 TaskFrame 先从会话上下文解析实际对象。
 - 只有存在实体且配置 `MAS_SEC_USER_AGENT` 时才注册 `sec.company_facts` 和 `sec.recent_filings`。
 - 只有配置 `FRED_API_KEY` 时才注册 `macro.fred_series`。
 - 配置 `BOCHA_SEARCH_API_KEY` 或 `BRAVE_SEARCH_API_KEY` 时才注册 `web.search`；两者同时存在时优先 Bocha。
 - `allow_network` 必须同时被服务端策略和本次请求允许。
+- FRED、Bocha、Brave、内置行情与 MCP `tools/call` 另有每分钟滑动窗口限流。
 
-这样模型看到的是本次实际授权目录；它自主选择工具，但不能构造任意 URL、import 或函数。
+这样模型看到的是本次实际授权目录；它自主选择工具，但不能构造任意 URL、import、函数或未 allowlist 的 MCP server。
 
 ## 6. LangGraph 状态机
 
@@ -236,7 +249,7 @@ sequenceDiagram
 
 ```python
 START -> intent -> planning
-planning: model chooses and executes at most one harness-bound tool
+planning: model chooses and executes at most four harness-bound tools in this node
 planning -> validation when the action is checkpointed
 validation -> planning when evidence is insufficient and budget remains
 validation -> final_generation when covered or hard-stopped
@@ -250,27 +263,30 @@ validation -> END
 
 | 停止原因 | 触发条件 |
 |---|---|
-| `coverage_satisfied` | 所有请求要求的数据类别均已有证据 |
+| `coverage_satisfied` | 所有检索类需求均已覆盖，或问题不需要检索 |
 | `max_iterations` | 达到研究迭代上限仍有缺口 |
 | `tool_budget_exhausted` | 已达到总工具调用上限 |
 | `no_available_action` | 没有尚未尝试且获授权的 provider |
 | `validation_failed` | 报告/引用/claim 的硬校验失败 |
-| `no_evidence` | 最终证据账本为空 |
+| `no_evidence` | 需要检索或计算证据但最终账本为空 |
 
-默认值是 3 次研究迭代、12 次研究工具调用、8 次数据 provider 尝试和 1 次模型调用。领域请求允许的范围为：`top_k=1..20`、`max_iterations=1..8`、`max_tool_calls=1..100`、`max_network_calls=0..max_tool_calls`、`max_model_calls=0..4`。模型调用不占研究/数据预算；网络重试逐次占用 provider 尝试预算。
+服务默认是 6 次研究迭代、12 次研究工具调用、8 次数据 provider 尝试、8 次模型调用以及每轮最多 4 个并行工具。领域请求允许的范围为：`top_k=1..20`、`max_iterations=1..8`、`max_tool_calls=1..100`、`max_network_calls=0..max_tool_calls`、`max_model_calls=0..20`、`max_parallel_tool_calls=1..8`。模型调用不占研究/数据预算；网络重试逐次占用 provider 尝试预算。`ResearchRequest` 结构体本身的字段默认值仍是 3/12/8/1，由 `FinanceAnalysisService` 在装配时覆盖为上述服务默认。
 
 ### 6.4 规划策略
 
-当前 `AdaptivePlanner` 是需求驱动、可解释、可重复的 Planner：
+配置了 LLM 时，当前主路径是 `ModelPlanner`：
 
-1. `FinancialQueryAnalyzer` 先生成可持久化的 intents、requirements 和 calculations；
-2. 从 `CoverageDecision.missing` 读取尚未满足的 requirement；
-3. 对每个 entity/series/concept 分别创建 document、market、history、regulatory、filing、macro、calculation 或 knowledge 任务；
-4. 在同类工具中按配置顺序选择第一个尚未尝试的 provider；
-5. task ID 由工具名和参数稳定生成，恢复后不会重复执行已完成任务；
-6. Planner 即使产生越权工具名，也会在执行前被 Agent allowlist 再次过滤。
+1. `llm.task_frame` 先从当前请求、摘要、最近事件和实体回放生成中文目标、实体来源、requirements 与完成标准；LLM 未配置时服务快速失败；
+2. 规划 prompt 包含 coverage、`prior_actions`（含 `ok` / `error_code` / `error_details`）、gaps、有界证据、
+   builtins 契约、短 `mcp_tool_index`、`discovery_results` 和 `verified_tool_usage`；
+3. 模型返回 `call_tool`、最多四个工具的 `call_tools`，或 `finish`；DeepSeek 不使用 native `tools`；
+4. MCP 具体工具对规划目录隐藏。需要契约时先 `mcp.describe_tool`，执行走 `mcp.call_tool`；
+5. Graph 在同一 planning 节点执行本轮任务（可并行），相同 tool+arguments 的稳定 task ID 不会重跑；
+6. 覆盖不足或过早 `finish` 时 validation 把状态送回 planning；硬预算到达除外。
 
-未来可替换为规则+LLM 混合 Planner，但输出仍必须是 `ResearchPlan`，并受到同样的注册表、权限、预算和停止规则约束。
+没有密钥或计划/合成非法时，服务快速失败，不再调用规则 planner 或确定性合成器。
+
+工具参数、MCP 渐进发现和报错分层的细节见 [TOOLS_AND_REASONING.md](TOOLS_AND_REASONING.md) §4。
 
 ### 6.5 覆盖判断
 
@@ -283,7 +299,7 @@ validation -> END
 - `filings:<entity>`：存在所需 filing metadata；
 - `macro:<series>`：存在该 series 的 latest value；
 - `calculation:<request_id>`：存在相同 request ID 的 calculation evidence；
-- `knowledge:<concept>`：存在相同 concept 的版本化知识证据；
+- 概念/教育类问题可以没有 requirement；若模型仍输出 `knowledge` 类别，覆盖评估会忽略它，不强制检索词条；
 - 没有实体的文档问题使用 `document:query`。
 
 字段覆盖已经进入硬判断，但仍不等同于回答质量评分。时间新鲜度、来源权威度和语义相关度评分属于下一阶段增强项。
@@ -303,9 +319,11 @@ validation -> END
   "run_id": "run-acde1234",
   "allow_network": true,
   "top_k": 5,
-  "max_iterations": 3,
+  "max_iterations": 6,
   "max_tool_calls": 12,
   "max_network_calls": 8,
+  "max_model_calls": 8,
+  "max_parallel_tool_calls": 4,
   "require_documents": false,
   "require_market_data": true,
   "require_regulatory_data": true
@@ -407,7 +425,7 @@ Harness 是所有工具的唯一执行入口。工具不能因为 Planner 或 LL
 
 - 唯一 `name`；
 - 人类可读 `description`；
-- `capability`，例如 `document.search`、`market.read`、`regulatory.read`、`model.generate`；
+- `capability`，例如 `document.search`、`market.read`、`regulatory.read`、`mcp.discover`、`mcp.invoke`、`model.generate`；
 - `side_effect`；
 - 是否需要 `network_access`；
 - `timeout_seconds`；
@@ -454,20 +472,50 @@ Harness 是所有工具的唯一执行入口。工具不能因为 Planner 或 LL
   "attempts": 1,
   "data": {"bundle": {"sources": [], "evidence": [], "claims": []}},
   "error_code": null,
-  "error_message": null
+  "error_message": null,
+  "error_details": null
 }
 ```
 
+MCP `isError=true` 时 `ok` 为 false，`error_code` 来自 server 的结构化载荷（非法码会归一成 `mcp_tool_error`），
+`error_details` 保留 `retryable`、`suggested_action` 以及 server 提供的其它字段。
+
 ### 9.3 重试与超时语义
 
-- 自动重试只适用于 read-only 工具；写操作不得因不确定完成状态被自动重复。
+- 自动重试只适用于 read-only 工具，且必须命中该工具 `RetryPolicy.retryable_exceptions`；写操作不得因不确定完成状态被自动重复。
 - retry 次数和退避属于 ToolSpec，仍只消耗一次研究 tool-call budget，但每个网络 attempt 都消耗 data-network budget，审计同时记录 `budget_consumed` 与 `network_attempts`。
+- web/RAG/FRED/SEC 多为 `max_attempts=2`（transport 超时/连接失败）。契约错误、空结果、未映射的 HTTP 4xx/429 **不会**盲重试。
+- MCP 经 Host 绑定的工具以及 `mcp.call_tool` 默认 `max_attempts=1`。`isError=true` 变成 `ToolExecutionError`，不进自动重试，交给下一轮规划改参。
+- 进程内滑动窗口限流等待超时表现为一次 `TimeoutError`。
 - 同步工具的 Harness timeout 是“执行完成后的观测超时”，Python 无法安全强杀正在运行的同步调用。
 - 因此 HTTP、数据库等 provider 必须同时设置底层连接/读取 timeout；不能只依赖 Harness。
+
+完全相同的 tool+arguments 形成稳定 task ID：Graph 记录 `repeated_planner_action` 且不再执行。改参数才是新任务。
 
 ### 9.4 审计与脱敏
 
 审计保存 tenant/thread/run/call、工具、capability、副作用、状态、耗时、次数和错误码。敏感字段如 token、API key、authorization、password 会被遮蔽；长 query 不保存正文，只保留 SHA-256 与长度；LLM system/user prompt 被省略。这样可以调试执行路径，又避免将完整文档和秘密复制到审计日志。
+
+### 9.5 MCP Host 与报错闭环
+
+Agent 是 MCP Host：`MAS_MCP_SERVERS` 决定连接哪些本地 stdio 或固定 HTTPS JSON-RPC server。每个 server 一个 Client。
+进 Harness 前必须显式只读，capability 必须属于现有证据能力；拒绝项记为 `McpRejection`。`tools/call` 必须返回
+canonical `EvidenceBundle`。
+
+有 LLM 时的调用路径：
+
+```text
+mcp_tool_index（短描述）
+  → 可选 mcp.search_tools
+  → mcp.describe_tool（完整 JSON Schema）
+  → mcp.call_tool(name, arguments)
+  → Host 校验契约并调用远程工具
+  → 成功：合并 Evidence；参数写入用户隔离的 tool_usage_memory
+  → isError：ToolResult.error_details → 下一轮 prior_actions
+```
+
+空 bundle 仍 `ok=true` 时走 coverage/gaps，不是 `isError`。发现元工具本身不产生 Evidence。尚未实现 SSE Streamable HTTP 与 OAuth。完整分层表见
+[TOOLS_AND_REASONING.md](TOOLS_AND_REASONING.md) §4.2。
 
 ## 10. 数据源与适配层
 
@@ -499,7 +547,7 @@ PDF 解析默认最多 500 页、每份最多 5,000,000 个抽取字符。系统
 
 ### 10.2 市场数据
 
-`MarketDataClient` 支持显式选择 Yahoo、AlphaVantage 和 offline/disabled 模式；默认是 `offline`。provider 缺 key 或失败时直接 unavailable，不会隐式换源。Yahoo 标记为非契约化实验 adapter；生产应替换为有许可和 SLA 的供应商。`MarketEvidenceAdapter` 将快照拆成字段级证据，例如：
+`MarketDataClient` 支持显式选择 Yahoo、AlphaVantage 和 offline/disabled 模式；默认是 `offline`。provider 缺 key 或失败时直接 unavailable，不会隐式换源。Yahoo 标记为非契约化实验 adapter；生产应替换为有许可和 SLA 的供应商。配置 AllTick 或必盈许可时，进程额外挂载本地 MCP `extmarket`（snapshot/history）；模型经渐进发现调用。`MarketEvidenceAdapter` 将快照拆成字段级证据，例如：
 
 - `current_price`
 - `monthly_return`
@@ -603,7 +651,7 @@ Thread context 是预算内的 LLM 语义摘要、最近 user/tool/assistant 事
 4. quote 是引用 evidence content 的逐字子串；系统会删除所有不包含该 quote 的附带 citation，避免 citation laundering；
 5. 最多接收 20 条 claim。
 
-配置模型后，如果模型返回非 JSON、虚假 ID、无法匹配 quote、无有效 claim、网络被拒或调用报错，系统使用 `DeterministicSynthesizer` 逐条复述结构化证据/文档片段，并记录 `llm_synthesis_fallback` gap。未配置模型时直接使用确定性合成器，这属于正常运行路径，不记录 fallback gap。
+配置模型后，如果模型返回非 JSON、虚假 ID、无法匹配 quote、无有效 claim 或调用报错，合成快速失败，不再回退到 `DeterministicSynthesizer`。缺少 LLM 配置同样不是可运行路径。
 
 ### 12.2 这个保护能与不能证明什么
 
@@ -654,15 +702,9 @@ Validator 会检查：
 
 Conversation memory 与 checkpoint 分离：前者持久记录 user/tool/assistant 事件，后者恢复单个 run 的图状态。模型只看到 300K token 预算内的 LLM 语义摘要和最近原始事件；实体身份与焦点历史由代码独立保真，压缩不删除完整账本。它不保存 EvidenceBundle、原始 PDF 或隐藏推理，也不能作为事实来源。会话文档是另一平面：只在显式保留时保存解析页文本，原 PDF 仍删除；过期或 `DELETE /api/v1/session-documents/{thread_id}` 后释放。个人 memory/knowledge 也只能通过独立显式接口持久化，临时内容不会自动 promotion。完整语义见 [持久对话记忆](CONVERSATION_MEMORY.md)、[文档生命周期设计](DOCUMENT_LIFECYCLE.md) 与 [个人助手边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
 
-### 14.2 实体继承规则
+### 14.2 实体回放与指代
 
-线程记忆只能解决真实的连续指代，不能主导当前问题。顺序固定为：
-
-1. API 显式 entities；
-2. 当前 query/当前文档检测到的 entities；
-3. 只有明确指代时才继承历史 entities；前者/后者/复数按最近有序实体组，多个候选下的单数代词不猜。
-
-因此先问 Apple、再问“Microsoft 的最大回撤呢”只研究 Microsoft；再问“那它呢”才会继承上一实体。记忆永远不能作为事实 evidence。
+系统不以 marker 规则决定“它 / 前者 / 后者”是谁。`llm.task_frame` 读取当前请求、摘要、最近事件和带时间顺序的实体回放，声明它采用的实体及来源，再生成本轮 requirements。多个候选都合理时，TaskFrame 返回中文澄清问题，Agent 不调工具也不静默猜测。实体记忆永远不能作为事实 evidence。详见 [LLM TaskFrame](TASK_FRAME.md)。
 
 ### 14.3 为什么长期记忆必须显式
 
@@ -710,7 +752,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/analyze \
 {
   "thread_id": "research-apple-001",
   "run_id": "run-acde1234",
-  "llm_backend": "deepseek | deterministic",
+  "llm_backend": "deepseek | fixture | missing",
   "status": "succeeded",
   "stop_reason": "coverage_satisfied",
   "research_scope": {},
@@ -833,7 +875,7 @@ API 路由定义为 async，但当前同步 provider/领域服务直接在 event
 | 威胁 | 当前控制 |
 |---|---|
 | 文档 prompt injection | 文档只进入 Evidence，不获得控制权；工具与权限由代码注册 |
-| 任意网络访问/SSRF | provider API origin 固定；双重网络授权；Planner 只生成受约束搜索参数，不拥有任意 HTTP 能力 |
+| 任意网络访问/SSRF | provider API origin 固定；MCP HTTP URL 仅允许启动时配置的凭据无关 HTTPS；双重网络授权；Planner 只生成受约束搜索参数，不拥有任意 HTTP 能力 |
 | 工具越权 | run boundary、capability + side-effect allowlist；未知工具拒绝 |
 | 工具 payload 滥用 | 必填/额外字段、有限 JSON、输入/输出/账本/checkpoint 大小上限 |
 | 无限循环/成本失控 | 迭代、研究工具、provider attempts、模型调用分账硬预算 |
@@ -863,7 +905,7 @@ API 路由定义为 async，但当前同步 provider/领域服务直接在 event
 1. 实现 provider client：固定 endpoint、认证、timeout、限流和原始错误映射。
 2. 实现 anti-corruption adapter：把 provider 字段转换为 SourceRef/Evidence/EvidenceBundle。
 3. 创建 ToolSpec：声明 capability、是否联网、副作用、timeout 和 retry。
-4. 把工具名加入 Planner 对应 provider 顺序。
+4. 或者做成只读 MCP server，由 Host allowlist 接入；规划侧走渐进发现，不必把完整 schema 塞进 prompt。结构化错误应使用 `isError` + `error_code` / `retryable` / `suggested_action`。
 5. 增加契约、缺字段、错误、重试、网络拒绝和多租户测试。
 
 简化示例：

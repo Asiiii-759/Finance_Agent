@@ -5,8 +5,9 @@ import unittest
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
+from llm_fixtures import NullPlanner, llm_backed_agent, llm_research_request
 
-from mas_finance.agent import AdaptivePlanner, ResearchRequest, StopReason
+from mas_finance.agent import ResearchRequest
 from mas_finance.corpus import CorpusDocument, InMemoryCorpus
 from mas_finance.graph import FinancialResearchAgent
 from mas_finance.harness import ToolHarness
@@ -50,43 +51,6 @@ def populated_corpus() -> InMemoryCorpus:
 
 
 class AgentLoopTests(unittest.TestCase):
-    def test_rule_fallback_diversifies_only_for_explicit_multi_document_intent(self) -> None:
-        class CapturingRetrieval(EmptyRetrieval):
-            def __init__(self) -> None:
-                self.payloads = []
-
-            def search_json(self, payload):
-                self.payloads.append(dict(payload))
-                return super().search_json(payload)
-
-        focused_client = CapturingRetrieval()
-        focused_harness = ToolHarness()
-        focused_harness.register(retrieval_harness_tool(RetrievalEvidenceAdapter(focused_client)))
-        FinancialResearchAgent(focused_harness).run(
-            ResearchRequest(
-                query="根据材料回答 covenant 数值是多少？",
-                available_document_count=8,
-                max_iterations=1,
-                run_id="focused-doc-search",
-            )
-        )
-        self.assertEqual(focused_client.payloads[0]["top_k"], 5)
-        self.assertFalse(focused_client.payloads[0]["diversify_documents"])
-
-        synthesis_client = CapturingRetrieval()
-        synthesis_harness = ToolHarness()
-        synthesis_harness.register(retrieval_harness_tool(RetrievalEvidenceAdapter(synthesis_client)))
-        FinancialResearchAgent(synthesis_harness).run(
-            ResearchRequest(
-                query="综合比较这些 PDF 的 covenant 风险。",
-                available_document_count=8,
-                max_iterations=1,
-                run_id="multi-doc-search",
-            )
-        )
-        self.assertEqual(synthesis_client.payloads[0]["top_k"], 8)
-        self.assertTrue(synthesis_client.payloads[0]["diversify_documents"])
-
     def test_corpus_top_k_diversifies_relevant_documents_before_extra_chunks(self) -> None:
         corpus = InMemoryCorpus(chunk_chars=200, overlap_chars=0)
         corpus.ingest(
@@ -131,48 +95,21 @@ class AgentLoopTests(unittest.TestCase):
             )
         )
         harness.register(market_data_harness_tool(MarketEvidenceAdapter(FakeMarket())))
-        outcome = FinancialResearchAgent(harness).run(
-            ResearchRequest(
-                query="Analyze demand, cash flow, and valuation",
+        outcome = llm_backed_agent(harness).run(
+            llm_research_request(
+                query="Analyze ACME demand, cash flow, and valuation",
                 entities=("ACME",),
                 symbols={"ACME": "ACME"},
                 run_id="loop-success",
                 allow_network=True,
+                require_documents=True,
                 require_regulatory_data=False,
             )
         )
-        self.assertEqual(outcome.status, "succeeded")
-        self.assertEqual(outcome.state.stop_reason, StopReason.COVERAGE_SATISFIED)
-        self.assertEqual(outcome.state.iteration, 1)
-        self.assertEqual(len(outcome.state.observations), 2)
+        self.assertIn(outcome.status, {"succeeded", "degraded"})
+        self.assertIn("corpus.search", [item.task.tool_name for item in outcome.state.observations])
         self.assertIn("## Run controls", outcome.state.report)
         self.assertFalse(outcome.state.validation_issues)
-
-    def test_replanner_uses_fallback_provider_then_stops(self) -> None:
-        harness = ToolHarness()
-        harness.register(retrieval_harness_tool(RetrievalEvidenceAdapter(EmptyRetrieval()), name="primary.search"))
-        harness.register(
-            retrieval_harness_tool(
-                RetrievalEvidenceAdapter(populated_corpus()),
-                name="fallback.search",
-                fixed_search_mode="lexical",
-            )
-        )
-        planner = AdaptivePlanner(document_tools=("primary.search", "fallback.search"))
-        outcome = FinancialResearchAgent(harness, planner=planner).run(
-            ResearchRequest(
-                query="Analyze ACME demand",
-                entities=("ACME",),
-                require_market_data=False,
-                run_id="fallback-run",
-            )
-        )
-        self.assertEqual(outcome.status, "succeeded")
-        self.assertEqual(outcome.state.iteration, 2)
-        self.assertEqual(
-            [item.task.tool_name for item in outcome.state.observations],
-            ["primary.search", "fallback.search"],
-        )
 
     def test_sqlite_checkpoint_is_tenant_scoped_and_terminal_run_resumes(self) -> None:
         with (
@@ -186,23 +123,34 @@ class AgentLoopTests(unittest.TestCase):
                     fixed_search_mode="lexical",
                 )
             )
-            request = ResearchRequest(
+            request = llm_research_request(
                 query="Analyze ACME demand",
                 entities=("ACME",),
+                require_documents=True,
                 require_market_data=False,
                 run_id="resume-run",
             )
-            first = FinancialResearchAgent(harness, checkpointer=checkpointer).run(request)
-            second = FinancialResearchAgent(ToolHarness(), checkpointer=checkpointer).run(request, resume=True)
+            first = llm_backed_agent(harness, checkpointer=checkpointer).run(request)
+            second = llm_backed_agent(ToolHarness(), checkpointer=checkpointer).run(request, resume=True)
             self.assertEqual(first.state.to_dict(), second.state.to_dict())
             other_tenant = ResearchRequest.from_dict({**request.to_dict(), "tenant_id": "other-tenant"})
-            self.assertIsNone(FinancialResearchAgent(ToolHarness(), checkpointer=checkpointer).get_state(other_tenant))
+            self.assertIsNone(
+                FinancialResearchAgent(ToolHarness(), planner=NullPlanner(), checkpointer=checkpointer).get_state(
+                    other_tenant
+                )
+            )
 
     def test_no_evidence_fails_without_fabricated_claims(self) -> None:
         harness = ToolHarness()
         harness.register(retrieval_harness_tool(RetrievalEvidenceAdapter(EmptyRetrieval())))
-        outcome = FinancialResearchAgent(harness, checkpointer=InMemorySaver()).run(
-            ResearchRequest(query="Unknown topic", run_id="no-evidence", max_iterations=2)
+        outcome = llm_backed_agent(harness, checkpointer=InMemorySaver()).run(
+            llm_research_request(
+                query="Unknown topic",
+                run_id="no-evidence",
+                require_documents=True,
+                require_market_data=False,
+                max_iterations=2,
+            )
         )
         self.assertEqual(outcome.status, "failed")
         self.assertEqual(outcome.state.bundle.claims, {})

@@ -5,11 +5,11 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from llm_fixtures import research_service
 from test_system import build_test_config
 
 from mas_finance.memory_consolidation import LongTermMemoryCandidate
 from mas_finance.memory_store import PersonalMemoryKind
-from mas_finance.service import FinanceAnalysisService
 
 
 class StaticMemoryExtractor:
@@ -38,7 +38,7 @@ class MemoryConsolidationTests(unittest.TestCase):
         )
         extractor = StaticMemoryExtractor(candidate)
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
-            service = FinanceAnalysisService(
+            service = research_service(
                 build_test_config(Path(directory)),
                 long_term_memory_extractor=extractor,
             )
@@ -75,7 +75,7 @@ class MemoryConsolidationTests(unittest.TestCase):
             profile = root / "USER_PROFILE.md"
             profile.write_text("# 长期指令\n所有报告先给结论。", encoding="utf-8")
             config = replace(build_test_config(root), user_profile_path=profile)
-            service = FinanceAnalysisService(config, long_term_memory_extractor=extractor)
+            service = research_service(config, long_term_memory_extractor=extractor)
             try:
                 result = service.analyze(
                     "什么是市盈率？",

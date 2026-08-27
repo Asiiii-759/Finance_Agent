@@ -26,9 +26,9 @@
 - `finance.calculate` 白名单：ratio、percentage change、CAGR、PV/FV、loan payment、annualized return/volatility、Sharpe、max drawdown。
 - `finance.formula` 受限声明式 AST：模型可组织公式和参数但不能执行代码；数值保留输入血缘，公式语义固定标为待核验推断。
 - `/api/v1/tools` 公开每个计算 operation 的 required/optional inputs、公式和默认单位；多余字段、类型强转和不兼容单位被拒绝。
-- `finance.knowledge` 版本化金融定义和 caveat，不依赖模型常识。
+- 概念解释由模型直接作答，不依赖代码内金融词库；引用了检索证据才做逐字 quote 校验。
 - `finance-evidence-synthesis-v3` 上下文：trust zones、entity/source/domain 平衡、按意图可选 document 分散、规划 24K/生成 48K 可调字符预算、逐阶段 ContextManifest。
-- LLM JSON/逐字 quote 校验；被裁掉证据不可引用；一个 quote 不能附带无关 citation；失败确定性降级。
+- LLM JSON/逐字 quote 校验；被裁掉证据不可引用；一个 quote 不能附带无关 citation；非法合成快速失败。
 - DeepSeek 真实验证覆盖十种批量计算、知识、主备 RAG、间接提示注入、多源上下文和 checkpoint 恢复；生成输出上限提高到 4096，输入 evidence 预算独立扩到 48K 字符。
 - 报告 Markdown 注入转义、citation/footnote/gap/calculation lineage/risk notice 硬校验。
 - 持久 conversation event ledger：user/tool/assistant 全历史、tenant/user/thread namespace、300K token 默认 prompt 预算、85% 阈值 LLM 滚动摘要、最近原始事件、确定性实体/焦点历史、歧义代词拒绝猜测和显式删除关联 checkpoints。
@@ -54,7 +54,7 @@
 Ruff passed for src/tests
 mypy passed for all 46 source files
 compileall passed
-Real DeepSeek planner selected finance.knowledge from the dynamic catalog in one model call; no gaps
+Real DeepSeek planner selected authorized catalog tools; conceptual questions may finish without retrieval
 Real DeepSeek selected corpus.hybrid_search first for a semantic-only PDF query; cross-checked lexical, deduplicated one Evidence, succeeded in 5 model calls
 Bocha raw API and project EvidenceBundle path both returned two results; deepseek-v4-pro short live call succeeded
 Compose YAML parsed successfully; Docker CLI was unavailable, so no image-build claim is made

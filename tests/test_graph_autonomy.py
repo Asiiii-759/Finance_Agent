@@ -4,35 +4,22 @@ import json
 import unittest
 
 import httpx
+from llm_fixtures import NullPlanner, ScriptedLLM
 
 from mas_finance.agent import CoverageAssessor, ResearchRequest
 from mas_finance.contracts import EvidenceBundle
 from mas_finance.graph import FinancialResearchAgent
 from mas_finance.harness import ExecutionPolicy, ToolContext, ToolHarness
-from mas_finance.knowledge import finance_knowledge_harness_tool
-from mas_finance.llm import BaseLLMClient
+from mas_finance.metrics import financial_calculation_harness_tool
 from mas_finance.planning import ModelPlanner, llm_planning_harness_tool
 from mas_finance.research import FinancialQueryAnalyzer
+from mas_finance.task_frame import LLMTaskInterpreter, llm_task_frame_harness_tool
 from mas_finance.web_search import (
     BochaWebSearchClient,
     BraveWebSearchClient,
     WebSearchEvidenceAdapter,
     web_search_harness_tool,
 )
-
-
-class ScriptedLLM(BaseLLMClient):
-    backend_name = "scripted"
-
-    def __init__(self, responses: list[dict]) -> None:
-        self.responses = list(responses)
-        self.system_prompts: list[str] = []
-        self.user_prompts: list[str] = []
-
-    def chat(self, system_prompt, user_prompt, temperature=0.2, max_tokens=600):
-        self.system_prompts.append(system_prompt)
-        self.user_prompts.append(user_prompt)
-        return json.dumps(self.responses.pop(0), ensure_ascii=False)
 
 
 class FixtureWebSearch:
@@ -63,7 +50,7 @@ class FixtureWebSearch:
 
 class GraphAutonomyTests(unittest.TestCase):
     def test_graph_contains_only_business_nodes(self) -> None:
-        graph = FinancialResearchAgent(ToolHarness()).graph.get_graph()
+        graph = FinancialResearchAgent(ToolHarness(), planner=NullPlanner()).graph.get_graph()
         business_nodes = {name for name in graph.nodes if not name.startswith("__")}
         self.assertEqual(business_nodes, {"intent", "planning", "validation", "final_generation"})
 
@@ -73,14 +60,22 @@ class GraphAutonomyTests(unittest.TestCase):
             [
                 {
                     "action": "call_tool",
-                    "tool_name": "finance.knowledge",
-                    "arguments": {"query": "什么是市盈率？", "concepts": ["pe_ratio"], "top_k": 1},
-                    "reason": "使用受控知识库中的定义和注意事项。",
+                    "tool_name": "finance.calculate",
+                    "arguments": {
+                        "requests": [
+                            {
+                                "operation": "cagr",
+                                "inputs": {"beginning_value": 100.0, "ending_value": 121.0, "years": 2.0},
+                                        "label": "cagr",
+                            }
+                        ]
+                    },
+                    "reason": "使用白名单公式计算 CAGR。",
                 },
-                {"action": "finish", "reason": "该定义已有证据支持。"},
+                {"action": "finish", "reason": "计算结果已有证据支持。"},
             ]
         )
-        harness.register(finance_knowledge_harness_tool())
+        harness.register(financial_calculation_harness_tool())
         harness.register(
             llm_planning_harness_tool(
                 llm,
@@ -89,7 +84,7 @@ class GraphAutonomyTests(unittest.TestCase):
         )
         outcome = FinancialResearchAgent(harness, planner=ModelPlanner(harness)).run(
             ResearchRequest(
-                query="什么是市盈率？",
+                query="一项投资从100增长到121，用了2年，CAGR是多少？",
                 require_documents=False,
                 require_market_data=False,
                 require_regulatory_data=False,
@@ -98,10 +93,10 @@ class GraphAutonomyTests(unittest.TestCase):
             )
         )
         self.assertEqual(outcome.status, "succeeded")
-        self.assertEqual([item.task.tool_name for item in outcome.state.observations], ["finance.knowledge"])
+        self.assertEqual([item.task.tool_name for item in outcome.state.observations], ["finance.calculate"])
         self.assertEqual(
             [item["tool_name"] for item in outcome.audit_events],
-            ["llm.plan", "finance.knowledge", "llm.plan"],
+            ["llm.plan", "finance.calculate", "llm.plan"],
         )
         self.assertEqual(outcome.state.context_manifests[0]["phase"], "planning")
         self.assertIn("金融研究 Agent", llm.system_prompts[0])
@@ -110,9 +105,79 @@ class GraphAutonomyTests(unittest.TestCase):
             outcome.state.context_manifests[0]["max_evidence_characters"],
         )
 
+    def test_task_frame_replaces_rule_scope_on_the_llm_path(self) -> None:
+        harness = ToolHarness()
+        llm = ScriptedLLM(
+            [
+                {
+                    "goal": "解释市盈率的含义",
+                    "entities": [],
+                    "intents": ["financial_education"],
+                    "requirements": [],
+                    "success_criteria": ["给出市盈率的含义和注意事项"],
+                    "clarification_question": None,
+                },
+                {"action": "finish", "reason": "概念题无需检索，直接结束收集。"},
+            ]
+        )
+        harness.register(llm_task_frame_harness_tool(llm, network_access=False))
+        harness.register(llm_planning_harness_tool(llm, network_access=False))
+        outcome = FinancialResearchAgent(
+            harness,
+            planner=ModelPlanner(harness),
+            task_interpreter=LLMTaskInterpreter(harness),
+        ).run(
+            ResearchRequest(
+                query="解释市盈率",
+                require_documents=False,
+                run_id="task-frame-scope",
+                max_model_calls=3,
+            )
+        )
+        self.assertEqual(outcome.status, "succeeded")
+        self.assertEqual(outcome.state.scope.requirements, ())
+        self.assertEqual(outcome.state.task_frame["goal"], "解释市盈率的含义")
+        self.assertEqual(
+            [item["tool_name"] for item in outcome.audit_events],
+            ["llm.task_frame", "llm.plan"],
+        )
+
+    def test_task_frame_stops_for_ambiguous_history_reference(self) -> None:
+        harness = ToolHarness()
+        harness.register(
+            llm_task_frame_harness_tool(
+                ScriptedLLM(
+                    [
+                        {
+                            "goal": "查询历史中被指代公司的回撤",
+                            "entities": [],
+                            "success_criteria": [],
+                            "requirements": [],
+                            "clarification_question": "你指的是 Apple 还是 Microsoft？",
+                        }
+                    ]
+                ),
+                network_access=False,
+            )
+        )
+        outcome = FinancialResearchAgent(
+            harness,
+            planner=NullPlanner(),
+            task_interpreter=LLMTaskInterpreter(harness),
+        ).run(
+            ResearchRequest(
+                query="它的回撤呢？",
+                require_documents=False,
+                run_id="task-frame-clarification",
+                thread_context={"entity_replay": [{"entities": ["Apple", "Microsoft"]}]},
+            )
+        )
+        self.assertEqual(outcome.status, "needs_clarification")
+        self.assertEqual(outcome.state.stop_reason.value, "clarification_required")
+
     def test_validation_rejects_premature_model_finish(self) -> None:
         harness = ToolHarness()
-        harness.register(finance_knowledge_harness_tool())
+        harness.register(financial_calculation_harness_tool())
         harness.register(
             llm_planning_harness_tool(
                 ScriptedLLM(
@@ -120,11 +185,19 @@ class GraphAutonomyTests(unittest.TestCase):
                         {"action": "finish", "reason": "I think this is enough."},
                         {
                             "action": "call_tool",
-                            "tool_name": "finance.knowledge",
-                            "arguments": {"query": "解释市盈率", "concepts": ["pe_ratio"], "top_k": 1},
-                            "reason": "The validator requires grounded definition evidence.",
+                            "tool_name": "finance.calculate",
+                            "arguments": {
+                                "requests": [
+                                    {
+                                        "operation": "cagr",
+                                        "inputs": {"beginning_value": 100.0, "ending_value": 121.0, "years": 2.0},
+                                        "label": "cagr",
+                                    }
+                                ]
+                            },
+                            "reason": "覆盖校验仍缺少计算结果。",
                         },
-                        {"action": "finish", "reason": "The missing evidence requirement is now satisfied."},
+                        {"action": "finish", "reason": "计算结果已经覆盖任务需求。"},
                     ]
                 ),
                 network_access=False,
@@ -132,7 +205,7 @@ class GraphAutonomyTests(unittest.TestCase):
         )
         outcome = FinancialResearchAgent(harness, planner=ModelPlanner(harness)).run(
             ResearchRequest(
-                query="解释市盈率",
+                query="一项投资从100增长到121，用了2年，CAGR是多少？",
                 require_documents=False,
                 run_id="premature-finish",
                 max_iterations=3,
@@ -145,7 +218,7 @@ class GraphAutonomyTests(unittest.TestCase):
 
     def test_model_can_choose_open_web_search(self) -> None:
         harness = ToolHarness()
-        harness.register(finance_knowledge_harness_tool())
+        harness.register(financial_calculation_harness_tool())
         harness.register(web_search_harness_tool(WebSearchEvidenceAdapter(FixtureWebSearch())))
         llm = ScriptedLLM(
             [
@@ -179,7 +252,7 @@ class GraphAutonomyTests(unittest.TestCase):
         )
         self.assertEqual(outcome.status, "degraded")
         catalog = {item["name"] for item in json.loads(llm.user_prompts[0])["available_tools"]}
-        self.assertEqual(catalog, {"finance.knowledge", "web.search"})
+        self.assertEqual(catalog, {"finance.calculate", "web.search"})
         self.assertEqual([item.task.tool_name for item in outcome.state.observations], ["web.search"])
         evidence = next(iter(outcome.state.bundle.evidence.values()))
         self.assertEqual(evidence.source.source_type.value, "web")
@@ -249,9 +322,9 @@ class GraphAutonomyTests(unittest.TestCase):
         self.assertEqual(len(sources), 1)
         self.assertEqual(sources[0]["locator"], "https://reports.pbc.gov.cn/financial-statistics")
 
-    def test_invalid_model_tool_selection_uses_visible_rule_fallback(self) -> None:
+    def test_invalid_model_tool_selection_fails_fast(self) -> None:
         harness = ToolHarness()
-        harness.register(finance_knowledge_harness_tool())
+        harness.register(financial_calculation_harness_tool())
         harness.register(
             llm_planning_harness_tool(
                 ScriptedLLM(
@@ -262,22 +335,21 @@ class GraphAutonomyTests(unittest.TestCase):
                             "arguments": {"url": "http://127.0.0.1"},
                             "reason": "Invalid autonomous action.",
                         },
-                        {"action": "finish", "reason": "The deterministic fallback gathered grounded evidence."},
+                        {"action": "finish", "reason": "已收集到可引用的证据。"},
                     ]
                 ),
                 network_access=False,
             )
         )
-        outcome = FinancialResearchAgent(harness, planner=ModelPlanner(harness)).run(
-            ResearchRequest(
-                query="解释市盈率",
-                require_documents=False,
-                run_id="invalid-model-tool",
-                max_model_calls=2,
+        with self.assertRaisesRegex(RuntimeError, "model planning response is unusable"):
+            FinancialResearchAgent(harness, planner=ModelPlanner(harness)).run(
+                ResearchRequest(
+                    query="解释市盈率",
+                    require_documents=False,
+                    run_id="invalid-model-tool",
+                    max_model_calls=2,
+                )
             )
-        )
-        self.assertEqual([item.task.tool_name for item in outcome.state.observations], ["finance.knowledge"])
-        self.assertIn("model_planner_fallback", {gap.code for gap in outcome.state.gaps})
 
     def test_brave_client_uses_fixed_origin_and_normalizes_results(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
@@ -418,28 +490,43 @@ class GraphAutonomyTests(unittest.TestCase):
             [
                 {
                     "action": "call_tools",
-                    "reason": "同时取两个受控定义。",
+                    "reason": "同时计算 CAGR 和百分比变化。",
                     "tools": [
                         {
-                            "tool_name": "finance.knowledge",
-                            "arguments": {"query": "什么是市盈率？", "concepts": ["pe_ratio"], "top_k": 1},
-                            "reason": "需要市盈率定义。",
+                            "tool_name": "finance.calculate",
+                            "arguments": {
+                                "requests": [
+                                    {
+                                        "operation": "cagr",
+                                        "inputs": {"beginning_value": 100.0, "ending_value": 121.0, "years": 2.0},
+                                        "label": "cagr",
+                                    }
+                                ]
+                            },
+                            "reason": "计算 CAGR。",
                         },
                         {
-                            "tool_name": "finance.knowledge",
-                            "arguments": {"query": "什么是 ROE？", "concepts": ["roe"], "top_k": 1},
-                            "reason": "需要 ROE 定义。",
+                            "tool_name": "finance.calculate",
+                            "arguments": {
+                                "requests": [
+                                    {
+                                        "operation": "percentage_change",
+                                        "inputs": {"beginning_value": 100, "ending_value": 121},
+                                    }
+                                ]
+                            },
+                            "reason": "计算百分比变化。",
                         },
                     ],
                 },
-                {"action": "finish", "reason": "两个定义都已有证据。"},
+                {"action": "finish", "reason": "两个计算结果都已入账。"},
             ]
         )
-        harness.register(finance_knowledge_harness_tool())
+        harness.register(financial_calculation_harness_tool())
         harness.register(llm_planning_harness_tool(llm, network_access=False))
         outcome = FinancialResearchAgent(harness, planner=ModelPlanner(harness)).run(
             ResearchRequest(
-                query="解释市盈率和 ROE",
+                query="一项投资从100增长到121，用了2年，CAGR和百分比变化是多少？",
                 require_documents=False,
                 require_market_data=False,
                 require_regulatory_data=False,
@@ -450,10 +537,10 @@ class GraphAutonomyTests(unittest.TestCase):
         )
         self.assertEqual(outcome.status, "succeeded")
         self.assertEqual(len(outcome.state.observations), 2)
-        self.assertEqual({item.task.tool_name for item in outcome.state.observations}, {"finance.knowledge"})
+        self.assertEqual({item.task.tool_name for item in outcome.state.observations}, {"finance.calculate"})
         self.assertEqual(
             [item["tool_name"] for item in outcome.audit_events],
-            ["llm.plan", "finance.knowledge", "finance.knowledge", "llm.plan"],
+            ["llm.plan", "finance.calculate", "finance.calculate", "llm.plan"],
         )
 
 

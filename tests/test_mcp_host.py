@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+from llm_fixtures import research_service
 
 from mas_finance import MCPHost as PublicMCPHost
 from mas_finance import McpServerConfig as PublicMcpServerConfig
@@ -252,7 +253,7 @@ class MCPHostTests(unittest.TestCase):
             client_factory=lambda _config: client,
         )
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
-            service = FinanceAnalysisService(_config(Path(directory)), mcp_host=host)
+            service = research_service(_config(Path(directory)), mcp_host=host)
             try:
                 catalog = {item["name"]: item for item in service.describe_tools()}
                 self.assertEqual(catalog["portfolio.policy_search"]["availability"], "mcp_connected")
@@ -262,7 +263,10 @@ class MCPHostTests(unittest.TestCase):
                     export_artifacts=False,
                 )["result"]
                 self.assertEqual(result["status"], "succeeded")
-                self.assertEqual(result["observations"][0]["task"]["tool_name"], "portfolio.policy_search")
+                self.assertIn(
+                    "mcp.call_tool",
+                    [item["task"]["tool_name"] for item in result["observations"]],
+                )
                 self.assertTrue(client.calls)
             finally:
                 service.close()
@@ -284,7 +288,7 @@ class MCPHostTests(unittest.TestCase):
             client_factory=lambda _config: client,
         )
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
-            service = FinanceAnalysisService(_config(Path(directory)), mcp_host=host)
+            service = research_service(_config(Path(directory)), mcp_host=host)
             try:
                 result = service.analyze(
                     "根据组合政策说明单一发行人限额",
@@ -326,7 +330,7 @@ class MCPHostTests(unittest.TestCase):
             env={"PYTHONPATH": str(ROOT / "src")},
         )
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
-            service = FinanceAnalysisService(_config(Path(directory)), mcp_host=MCPHost((server,)))
+            service = research_service(_config(Path(directory)), mcp_host=MCPHost((server,)))
             try:
                 self.assertEqual(
                     [item.spec.name for item in service.mcp_tools],
@@ -339,7 +343,10 @@ class MCPHostTests(unittest.TestCase):
                     export_artifacts=False,
                 )["result"]
                 self.assertEqual(result["status"], "succeeded")
-                self.assertEqual(result["observations"][0]["task"]["tool_name"], "localpolicy.policy_search")
+                self.assertIn(
+                    "mcp.call_tool",
+                    [item["task"]["tool_name"] for item in result["observations"]],
+                )
             finally:
                 service.close()
 
@@ -407,7 +414,7 @@ class MCPHostTests(unittest.TestCase):
             client_factory=lambda _config: client,
         )
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
-            service = FinanceAnalysisService(_config(Path(directory)), mcp_host=host)
+            service = research_service(_config(Path(directory)), mcp_host=host)
             try:
                 result = service.analyze(
                     "根据组合政策说明单一发行人限额",
@@ -415,7 +422,7 @@ class MCPHostTests(unittest.TestCase):
                     export_artifacts=False,
                 )["result"]
                 self.assertEqual(result["status"], "succeeded")
-                self.assertEqual(result["observations"][0]["task"]["tool_name"], "httppolicy.policy_search")
+                self.assertEqual(result["observations"][0]["task"]["tool_name"], "mcp.call_tool")
             finally:
                 service.close()
 

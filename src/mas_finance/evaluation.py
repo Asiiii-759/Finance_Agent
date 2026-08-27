@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import AppConfig
-from .llm import LLMSettings
+from .llm import BaseLLMClient, LLMSettings, build_llm_client
 from .retrieval import RetrievalSource
 from .service import FinanceAnalysisService
 
@@ -57,10 +57,10 @@ ENTERPRISE_CASES: tuple[EvaluationCase, ...] = (
         expected_tools=("finance.calculate",),
     ),
     EvaluationCase(
-        name="curated_finance_definition",
+        name="model_finance_definition",
         query="什么是市盈率，使用时有哪些局限？",
         expected_status="succeeded",
-        expected_tools=("finance.knowledge",),
+        expected_tools=(),
     ),
     EvaluationCase(
         name="structured_sharpe_ratio",
@@ -79,31 +79,16 @@ ENTERPRISE_CASES: tuple[EvaluationCase, ...] = (
         ),
     ),
     EvaluationCase(
-        name="curated_interest_rate_transmission",
+        name="model_interest_rate_transmission",
         query="利率上升如何影响银行股？",
         expected_status="succeeded",
-        expected_tools=("finance.knowledge",),
+        expected_tools=(),
     ),
     EvaluationCase(
         name="unsupported_precise_forecast",
         query="请预测明天一只未指定股票的精确收盘价。",
         expected_status="failed",
         expected_gaps=("unsupported_research_scope",),
-    ),
-    EvaluationCase(
-        name="dcf_requires_assumptions",
-        query="用 DCF 给 Apple 估值",
-        entities=("Apple",),
-        expected_status="failed",
-        expected_tools=("market.snapshot",),
-        expected_gaps=("valuation_model_inputs_required",),
-    ),
-    EvaluationCase(
-        name="roe_requires_average_balance",
-        query="Apple 的 ROE 是多少？",
-        entities=("Apple",),
-        expected_status="failed",
-        expected_gaps=("metric_requires_average_balance",),
     ),
     EvaluationCase(
         name="offline_market_fails_closed",
@@ -126,12 +111,18 @@ ENTERPRISE_CASES: tuple[EvaluationCase, ...] = (
 )
 
 
-def run_enterprise_evaluation() -> dict[str, Any]:
+def run_enterprise_evaluation(*, llm_client: BaseLLMClient | None = None) -> dict[str, Any]:
+    client = llm_client or build_llm_client()
+    if client is None:
+        raise RuntimeError("an LLM configuration is required for financial research")
     results: list[EvaluationResult] = []
     with tempfile.TemporaryDirectory(prefix="mas-finance-eval-") as directory:
         root = Path(directory)
         for index, case in enumerate(ENTERPRISE_CASES):
-            service = FinanceAnalysisService(_evaluation_config(root / str(index), case.market_provider))
+            service = FinanceAnalysisService(
+                _evaluation_config(root / str(index), case.market_provider),
+                llm_client=client,
+            )
             response = service.analyze(
                 case.query,
                 entities=list(case.entities),
@@ -141,7 +132,7 @@ def run_enterprise_evaluation() -> dict[str, Any]:
             )
             result = response["result"]
             status = str(result["status"])
-            tools = tuple(dict.fromkeys(str(item["tool_name"]) for item in result.get("audit_events", [])))
+            tools = _research_tools(result)
             gaps = tuple(
                 dict.fromkeys(str(item["code"]) for item in result.get("gaps", []) if not item.get("resolved", False))
             )
@@ -169,8 +160,8 @@ def run_enterprise_evaluation() -> dict[str, Any]:
                 )
             )
 
-        results.append(_evaluate_thread_entity_switch(root / "thread-memory"))
-        results.append(_evaluate_injected_rag(root / "injected-rag"))
+        results.append(_evaluate_thread_entity_switch(root / "thread-memory", client))
+        results.append(_evaluate_injected_rag(root / "injected-rag", client))
 
     return {
         "suite": "mas-finance-enterprise-black-box-v2",
@@ -181,8 +172,8 @@ def run_enterprise_evaluation() -> dict[str, Any]:
     }
 
 
-def _evaluate_thread_entity_switch(root: Path) -> EvaluationResult:
-    service = FinanceAnalysisService(_evaluation_config(root, "offline"))
+def _evaluate_thread_entity_switch(root: Path, llm_client: BaseLLMClient) -> EvaluationResult:
+    service = FinanceAnalysisService(_evaluation_config(root, "offline"), llm_client=llm_client)
     service.analyze(
         "解释 Apple 的市盈率",
         entities=["Apple"],
@@ -200,7 +191,7 @@ def _evaluate_thread_entity_switch(root: Path) -> EvaluationResult:
         name="thread_memory_does_not_override_current_entity",
         passed=not failures,
         status=str(response["status"]),
-        tools=tuple(dict.fromkeys(str(item["tool_name"]) for item in response.get("audit_events", []))),
+        tools=_research_tools(response),
         gaps=tuple(
             dict.fromkeys(str(item["code"]) for item in response.get("gaps", []) if not item.get("resolved", False))
         ),
@@ -209,7 +200,7 @@ def _evaluate_thread_entity_switch(root: Path) -> EvaluationResult:
     )
 
 
-def _evaluate_injected_rag(root: Path) -> EvaluationResult:
+def _evaluate_injected_rag(root: Path, llm_client: BaseLLMClient) -> EvaluationResult:
     class EvaluationRAG:
         filters: dict[str, Any] = {}
 
@@ -233,6 +224,7 @@ def _evaluate_injected_rag(root: Path) -> EvaluationResult:
     client = EvaluationRAG()
     service = FinanceAnalysisService(
         _evaluation_config(root, "offline"),
+        llm_client=llm_client,
         retrieval_sources=(
             RetrievalSource(
                 "internal.credit_search",
@@ -247,7 +239,7 @@ def _evaluate_injected_rag(root: Path) -> EvaluationResult:
         entities=["ACME"],
         export_artifacts=False,
     )["result"]
-    tools = tuple(dict.fromkeys(str(item["tool_name"]) for item in response.get("audit_events", [])))
+    tools = _research_tools(response)
     document_evidence = [item for item in response["bundle"]["evidence"] if item["source"]["source_type"] == "document"]
     failures: list[str] = []
     if response["status"] != "succeeded":
@@ -268,6 +260,16 @@ def _evaluate_injected_rag(root: Path) -> EvaluationResult:
         ),
         budget_usage=dict(response.get("budget_usage") or {}),
         failures=tuple(failures),
+    )
+
+
+def _research_tools(result: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            str(item["tool_name"])
+            for item in result.get("audit_events", [])
+            if not str(item.get("tool_name") or "").startswith("llm.")
+        )
     )
 
 

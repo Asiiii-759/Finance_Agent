@@ -202,7 +202,6 @@ def _safe_thread_context(value: Mapping[str, Any]) -> dict[str, Any]:
         "entity_replay",
         "focus_history",
         "focus_entities",
-        "reference_resolution",
         "run_state",
         "manifest",
     }

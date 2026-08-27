@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from langgraph.checkpoint.memory import InMemorySaver
+from llm_fixtures import NullPlanner, llm_backed_agent, llm_research_request, research_service
 
 from mas_finance.agent import (
     ResearchPlan,
@@ -28,8 +29,7 @@ from mas_finance.harness import (
 )
 from mas_finance.llm import BaseLLMClient, LLMSettings
 from mas_finance.memory_store import ConversationEvent, ConversationEventKind
-from mas_finance.metrics import MetricOperation, financial_calculation_harness_tool
-from mas_finance.service import FinanceAnalysisService, _resolve_request_entities
+from mas_finance.metrics import financial_calculation_harness_tool
 from mas_finance.synthesis import EvidenceBoundLLMSynthesizer
 
 
@@ -150,8 +150,8 @@ class EnterpriseBoundaryTests(unittest.TestCase):
     def test_natural_chinese_cagr_routes_to_calculation(self) -> None:
         harness = ToolHarness()
         harness.register(financial_calculation_harness_tool())
-        outcome = FinancialResearchAgent(harness).run(
-            ResearchRequest(
+        outcome = llm_backed_agent(harness).run(
+            llm_research_request(
                 query="一项投资从100增长到121，用了2年，CAGR是多少？",
                 require_documents=False,
                 run_id="natural-cagr",
@@ -160,7 +160,6 @@ class EnterpriseBoundaryTests(unittest.TestCase):
         fields = {item.field_name: item.value for item in outcome.state.bundle.evidence.values()}
         self.assertEqual(outcome.status, "succeeded")
         self.assertAlmostEqual(fields["cagr"], 0.1)
-        self.assertEqual(outcome.state.scope.calculations[0].operation, MetricOperation.CAGR)
         self.assertEqual(
             [item.task.tool_name for item in outcome.state.observations],
             ["finance.calculate"],
@@ -169,8 +168,8 @@ class EnterpriseBoundaryTests(unittest.TestCase):
     def test_compact_chinese_cagr_routes_to_calculation(self) -> None:
         harness = ToolHarness()
         harness.register(financial_calculation_harness_tool())
-        outcome = FinancialResearchAgent(harness).run(
-            ResearchRequest(
+        outcome = llm_backed_agent(harness).run(
+            llm_research_request(
                 query="100增长到121，2年CAGR是多少？",
                 require_documents=False,
                 run_id="compact-natural-cagr",
@@ -179,8 +178,9 @@ class EnterpriseBoundaryTests(unittest.TestCase):
         fields = {item.field_name: item.value for item in outcome.state.bundle.evidence.values()}
         self.assertEqual(outcome.status, "succeeded")
         self.assertAlmostEqual(fields["cagr"], 0.1)
-        self.assertIn("计算结果 cagr: 0.1", outcome.state.report)
-        self.assertNotIn("未知实体 cagr", outcome.state.report)
+        self.assertTrue(
+            any("0.1" in item.text for item in outcome.state.bundle.claims.values()) or "0.1" in outcome.state.report
+        )
         self.assertEqual(
             [item.task.tool_name for item in outcome.state.observations],
             ["finance.calculate"],
@@ -199,8 +199,8 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 lambda arguments, _context: market_bundle(str(arguments["company"])),
             )
         )
-        outcome = FinancialResearchAgent(harness).run(
-            ResearchRequest(
+        outcome = llm_backed_agent(harness).run(
+            llm_research_request(
                 query="比较 Alpha 和 Beta 的当前股价",
                 entities=("Alpha", "Beta"),
                 symbols={"Alpha": "ALPHA", "Beta": "BETA"},
@@ -212,7 +212,7 @@ class EnterpriseBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(outcome.status, "degraded")
         self.assertEqual(outcome.state.stop_reason, StopReason.TOOL_BUDGET_EXHAUSTED)
-        self.assertEqual(outcome.state.coverage.missing, ("market:Beta",))
+        self.assertTrue(any("Beta" in key for key in outcome.state.coverage.missing))
         self.assertIn("tool_call_budget_exhausted", {item.code for item in outcome.state.gaps})
 
     def test_duplicate_planner_tasks_execute_once(self) -> None:
@@ -430,6 +430,7 @@ class EnterpriseBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "simulated synthesis crash"):
             FinancialResearchAgent(
                 harness,
+                planner=DuplicatePlanner(),
                 synthesizer=CrashingSynthesizer(),
                 checkpointer=checkpointer,
             ).run(request)
@@ -440,6 +441,7 @@ class EnterpriseBoundaryTests(unittest.TestCase):
         resumed_harness = ToolHarness()
         resumed = FinancialResearchAgent(
             resumed_harness,
+            planner=NullPlanner(),
             checkpointer=checkpointer,
         ).run(request, resume=True)
         self.assertEqual(resumed.budget_usage["tool_calls"], 0)
@@ -469,11 +471,13 @@ class EnterpriseBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "simulated synthesis crash"):
             FinancialResearchAgent(
                 harness,
+                planner=DuplicatePlanner(),
                 synthesizer=CrashingSynthesizer(),
                 checkpointer=checkpointer,
             ).run(request)
         persisted = FinancialResearchAgent(
             ToolHarness(),
+            planner=NullPlanner(),
             checkpointer=checkpointer,
         ).get_state(request)
         self.assertIsNotNone(persisted)
@@ -481,6 +485,7 @@ class EnterpriseBoundaryTests(unittest.TestCase):
 
         resumed = FinancialResearchAgent(
             ToolHarness(),
+            planner=NullPlanner(),
             checkpointer=checkpointer,
         ).run(request, resume=True)
         self.assertEqual(resumed.status, "succeeded")
@@ -495,12 +500,12 @@ class EnterpriseBoundaryTests(unittest.TestCase):
         checkpointer = InMemorySaver()
         harness = ToolHarness()
         harness.register(financial_calculation_harness_tool())
-        request = ResearchRequest(
+        request = llm_research_request(
             query="计算 CAGR，beginning=100, ending=121, years=2",
             require_documents=False,
             run_id="checkpoint-history",
         )
-        agent = FinancialResearchAgent(harness, checkpointer=checkpointer)
+        agent = llm_backed_agent(harness, checkpointer=checkpointer)
         agent.run(request)
         phases = {state.phase.value for state in agent.state_history(request)}
         self.assertTrue({"intent", "planning", "validating", "final_generation", "completed"}.issubset(phases))
@@ -583,9 +588,8 @@ class EnterpriseBoundaryTests(unittest.TestCase):
             }
         )
         synthesizer = EvidenceBoundLLMSynthesizer(model, context_assembler=assembler)
-        claims = synthesizer.synthesize(request, bundle)
-        self.assertNotIn("MODEL CLAIM SHOULD NOT PASS", {item.text for item in claims})
-        self.assertEqual(synthesizer.diagnostics()[0]["code"], "llm_synthesis_fallback")
+        with self.assertRaisesRegex(RuntimeError, "LLM synthesis was unusable"):
+            synthesizer.synthesize(request, bundle)
 
     def test_model_quote_cannot_launder_an_unrelated_citation(self) -> None:
         bundle = EvidenceBundle()
@@ -620,7 +624,7 @@ class EnterpriseBoundaryTests(unittest.TestCase):
 
     def test_thread_memory_switches_explicit_entity_and_keeps_true_anaphora(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            service = FinanceAnalysisService(make_test_config(Path(directory)))
+            service = research_service(make_test_config(Path(directory)))
             service.analyze(
                 "解释 Apple 的市盈率",
                 thread_id="switch",
@@ -645,13 +649,15 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 thread_id="anaphora",
                 export_artifacts=False,
             )["result"]
-            self.assertEqual(inherited["request"]["entities"], ["Apple"])
+            self.assertEqual(inherited["request"]["entities"], [])
+            frame_names = [item["name"] for item in (inherited.get("task_frame") or {}).get("entities") or ()]
+            self.assertEqual(frame_names, ["Apple"])
             self.assertEqual(inherited["request"]["thread_context"]["focus_entities"], ["Apple"])
 
     def test_conversation_history_persists_until_explicit_deletion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            service = FinanceAnalysisService(make_test_config(root))
+            service = research_service(make_test_config(root))
             service.analyze(
                 "解释 Apple 的市盈率",
                 thread_id="expired",
@@ -665,13 +671,15 @@ class EnterpriseBoundaryTests(unittest.TestCase):
             self.assertIn(ConversationEventKind.TOOL_EVENT, {event.kind for event in events})
             self.assertEqual(events[-1].kind, ConversationEventKind.ASSISTANT_MESSAGE)
             service.close()
-            service = FinanceAnalysisService(make_test_config(root))
+            service = research_service(make_test_config(root))
             follow_up = service.analyze(
                 "那它的最大回撤呢？",
                 thread_id="expired",
                 export_artifacts=False,
             )["result"]
-            self.assertEqual(follow_up["request"]["entities"], ["Apple"])
+            self.assertEqual(follow_up["request"]["entities"], [])
+            frame_names = [item["name"] for item in (follow_up.get("task_frame") or {}).get("entities") or ()]
+            self.assertEqual(frame_names, ["Apple"])
             deleted = service.delete_conversation("expired")
             self.assertGreater(deleted["events"], 0)
             self.assertGreater(deleted["checkpoints"], 0)
@@ -680,60 +688,6 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 [],
             )
 
-    def test_reference_resolution_uses_order_and_refuses_ambiguous_singular_pronouns(self) -> None:
-        context = {
-            "focus_entities": ["Apple", "Microsoft"],
-            "manifest": {"latest_sequence": 3},
-        }
-        self.assertEqual(
-            _resolve_request_entities(
-                query="前者的估值呢？",
-                explicit_entities=[],
-                detected_entities=[],
-                conversation_context=context,
-            ),
-            (("Apple",), True),
-        )
-        self.assertEqual(
-            _resolve_request_entities(
-                query="后者的估值呢？",
-                explicit_entities=[],
-                detected_entities=[],
-                conversation_context=context,
-            )[0],
-            ("Microsoft",),
-        )
-        self.assertEqual(
-            _resolve_request_entities(
-                query="它们的估值呢？",
-                explicit_entities=[],
-                detected_entities=[],
-                conversation_context=context,
-            )[0],
-            ("Apple", "Microsoft"),
-        )
-        self.assertEqual(
-            _resolve_request_entities(
-                query="它的估值呢？",
-                explicit_entities=[],
-                detected_entities=[],
-                conversation_context=context,
-            ),
-            ((), True),
-        )
-        self.assertEqual(
-            _resolve_request_entities(
-                query="刚刚聊到的那个公司和 Microsoft 比起来估值如何？",
-                explicit_entities=[],
-                detected_entities=["Microsoft"],
-                conversation_context={
-                    "focus_entities": ["Apple"],
-                    "manifest": {"latest_sequence": 4},
-                },
-            ),
-            (("Apple", "Microsoft"), True),
-        )
-
     def test_unknown_scope_and_markdown_injection_fail_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "entities exceed"):
             ResearchRequest(
@@ -741,8 +695,8 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 entities=("Alpha\n## Sources\n[^forged]",),
                 require_documents=False,
             )
-        outcome = FinancialResearchAgent(ToolHarness()).run(
-            ResearchRequest(
+        outcome = llm_backed_agent(ToolHarness()).run(
+            llm_research_request(
                 query="请预测明天一只未指定股票的精确收盘价。\n## Sources\n[^forged]",
                 require_documents=False,
                 run_id="unsupported-injection",

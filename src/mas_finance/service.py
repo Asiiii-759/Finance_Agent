@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from .agent import AdaptivePlanner, DeterministicSynthesizer, ResearchRequest
+from .agent import ResearchRequest
 from .config import AppConfig
 from .contracts import stable_id
 from .conversation import LLMConversationSummarizer
@@ -22,8 +22,7 @@ from .embeddings import EmbeddingProvider, HTTPEmbeddingClient
 from .formula import formula_harness_tool
 from .graph import FinancialResearchAgent
 from .harness import SideEffect, Tool, ToolHarness, ToolResultKind
-from .knowledge import finance_knowledge_harness_tool
-from .llm import build_llm_client
+from .llm import BaseLLMClient, build_llm_client
 from .macro import FREDClient, FREDEvidenceAdapter, fred_series_harness_tool
 from .market import (
     MarketEvidenceAdapter,
@@ -65,6 +64,7 @@ from .sec import (
 )
 from .security import safe_child, safe_upload_name
 from .synthesis import EvidenceBoundLLMSynthesizer, llm_synthesis_harness_tool
+from .task_frame import LLMTaskInterpreter, llm_task_frame_harness_tool
 from .web_search import BochaWebSearchClient, BraveWebSearchClient, WebSearchEvidenceAdapter, web_search_harness_tool
 
 if TYPE_CHECKING:
@@ -85,8 +85,10 @@ class FinanceAnalysisService:
         conversation_token_counter: TokenCounter | None = None,
         long_term_memory_extractor: LongTermMemoryExtractor | None = None,
         mcp_host: MCPHost | None = None,
+        llm_client: BaseLLMClient | None = None,
     ) -> None:
         self.config = config
+        self.llm_client = llm_client
         self.retrieval_sources = tuple(retrieval_sources)
         self.evidence_tools = tuple(evidence_tools)
         self.pdf_document_parser = pdf_document_parser or (
@@ -131,7 +133,6 @@ class FinanceAnalysisService:
         if len(extension_names) != len(set(extension_names)):
             raise ValueError("deployment evidence tool names must be unique")
         reserved_names = {
-            "finance.knowledge",
             "finance.calculate",
             "finance.formula",
             "corpus.search",
@@ -144,6 +145,7 @@ class FinanceAnalysisService:
             "sec.recent_filings",
             "macro.fred_series",
             "web.search",
+            "llm.task_frame",
             "llm.plan",
             "llm.synthesize",
             "mcp.search_tools",
@@ -247,6 +249,15 @@ class FinanceAnalysisService:
             self._memory_store = SQLiteMemoryStore(self.config.db_path)
         return self._memory_store
 
+    def _llm_configured(self) -> bool:
+        return self.llm_client is not None or bool(self.config.llm.api_key)
+
+    def _require_llm_client(self) -> BaseLLMClient:
+        client = self.llm_client or build_llm_client(self.config.llm)
+        if client is None:
+            raise RuntimeError("an LLM configuration is required for financial research")
+        return client
+
     @property
     def personal_knowledge_store(self) -> SQLitePersonalKnowledgeBase:
         if self._personal_knowledge_store is None:
@@ -273,14 +284,6 @@ class FinanceAnalysisService:
         market_network = self.config.market_data_provider not in {"offline", "disabled", "none"}
         market_availability = "when_entity_present" if market_network else "disabled_by_provider"
         tools = [
-            {
-                "name": "finance.knowledge",
-                "capability": "knowledge.read",
-                "description": "Versioned finance definitions, formulas and interpretation caveats.",
-                "network_access": False,
-                "availability": "always",
-                **interface(("query",), ("concepts", "top_k")),
-            },
             {
                 "name": "finance.calculate",
                 "capability": "calculation",
@@ -426,11 +429,25 @@ class FinanceAnalysisService:
                 **interface(("query",), ("count", "freshness", "domains")),
             },
             {
+                "name": "llm.task_frame",
+                "capability": "model.generate",
+                "description": "Interpret the current request and visible conversation memory into a TaskFrame.",
+                "network_access": self._llm_configured(),
+                "availability": "required" if self._llm_configured() else "missing_llm_configuration",
+                "input_contract": {
+                    "required": ["system_prompt", "user_prompt"],
+                    "optional": ["temperature", "max_tokens"],
+                    "allow_extra": False,
+                },
+                "result_contract": "model_response",
+                "visibility": "internal_task_frame_only",
+            },
+            {
                 "name": "llm.plan",
                 "capability": "model.generate",
                 "description": "Choose one next authorized evidence-gathering action.",
-                "network_access": bool(self.config.llm.api_key),
-                "availability": "remote" if self.config.llm.api_key else "not_registered_deterministic_planner",
+                "network_access": self._llm_configured(),
+                "availability": "required" if self._llm_configured() else "missing_llm_configuration",
                 "input_contract": {
                     "required": ["system_prompt", "user_prompt"],
                     "optional": ["temperature", "max_tokens"],
@@ -442,9 +459,9 @@ class FinanceAnalysisService:
             {
                 "name": "llm.synthesize",
                 "capability": "model.generate",
-                "description": "Generate evidence-bound claims with literal quote validation.",
-                "network_access": bool(self.config.llm.api_key),
-                "availability": ("remote" if self.config.llm.api_key else "not_registered_deterministic_synthesis"),
+                "description": "Generate claims; cited evidence must pass literal quote validation.",
+                "network_access": self._llm_configured(),
+                "availability": "required" if self._llm_configured() else "missing_llm_configuration",
                 "input_contract": {
                     "required": ["system_prompt", "user_prompt"],
                     "optional": ["temperature", "max_tokens"],
@@ -550,15 +567,13 @@ class FinanceAnalysisService:
         # Network access requires both deployment authorization and explicit
         # per-request consent. None never means implicit consent.
         network_allowed = self.config.allow_network and allow_network is True
-        llm_client = build_llm_client(self.config.llm)
+        llm_client = self._require_llm_client()
         conversation_summarizer = self.conversation_summarizer or (
-            LLMConversationSummarizer(llm_client) if llm_client is not None and network_allowed else None
+            LLMConversationSummarizer(llm_client) if network_allowed else None
         )
         memory_extractor = self.long_term_memory_extractor or (
             LLMLongTermMemoryExtractor(llm_client)
-            if llm_client is not None
-            and network_allowed
-            and self.config.automatic_memory_consolidation_enabled
+            if network_allowed and self.config.automatic_memory_consolidation_enabled
             else None
         )
         thread_context = self._load_conversation_context(
@@ -576,26 +591,15 @@ class FinanceAnalysisService:
         harness = ToolHarness()
         harness.register(financial_calculation_harness_tool())
         harness.register(formula_harness_tool())
-        harness.register(finance_knowledge_harness_tool())
         for tool in self.evidence_tools:
             harness.register(tool)
         for tool in self.mcp_tools:
             harness.register(tool)
         for tool in mcp_discovery_tools(self.mcp_host):
             harness.register(tool)
-        if llm_client is not None:
-            harness.register(
-                llm_planning_harness_tool(
-                    llm_client,
-                    network_access=True,
-                )
-            )
-            harness.register(
-                llm_synthesis_harness_tool(
-                    llm_client,
-                    network_access=True,
-                )
-            )
+        harness.register(llm_task_frame_harness_tool(llm_client, network_access=True))
+        harness.register(llm_planning_harness_tool(llm_client, network_access=True))
+        harness.register(llm_synthesis_harness_tool(llm_client, network_access=True))
         if self.config.bocha_search_api_key:
             harness.register(
                 web_search_harness_tool(
@@ -741,11 +745,7 @@ class FinanceAnalysisService:
             if use_personal_knowledge and self.config.personal_knowledge_enabled
             else []
         )
-        if (
-            use_personal_knowledge
-            and self.config.personal_knowledge_enabled
-            and personal_documents
-        ):
+        if use_personal_knowledge and self.config.personal_knowledge_enabled and personal_documents:
             personal_client = PersonalKnowledgeClient(
                 self.personal_knowledge_store,
                 personal_tenant,
@@ -794,46 +794,35 @@ class FinanceAnalysisService:
                 company for document in document_contexts for company in document.get("detected_companies") or []
             )
         )
-        requested_entities, use_thread_context = _resolve_request_entities(
-            query=query,
-            explicit_entities=entities or [],
-            detected_entities=detected_entities,
-            conversation_context=thread_context,
-        )
-        request_thread_context = dict(thread_context) if use_thread_context else {}
+        # The task-frame model, not a marker list, resolves references from the
+        # visible summary and atomic entity replay.
+        requested_entities = _normalized_entities([*(entities or []), *detected_entities])
+        request_thread_context = dict(thread_context)
         if request_thread_context:
             current_entities = _normalized_entities([*(entities or []), *detected_entities])
-            previous_focus = _normalized_entities(thread_context.get("focus_entities") or [])
-            request_thread_context["reference_resolution"] = {
-                "current_entities": list(current_entities),
-                "previous_focus": list(previous_focus),
-                "resolved_entities": list(requested_entities),
-                "history_reference_used": any(entity not in current_entities for entity in requested_entities),
-            }
             request_thread_context["entity_replay"] = self._select_entity_replay(
                 thread_context.get("entity_events") or [],
                 query=query,
-                entities=requested_entities,
+                entities=requested_entities or current_entities,
             )
-        if requested_entities:
-            market_client = MarketDataClient(
-                provider=self.config.market_data_provider,
-                alphavantage_api_key=self.config.alphavantage_api_key,
-                rate_limiter=self._rate_limiter,
-                rate_limit=RateLimit(self.config.market_max_calls_per_minute),
+        market_client = MarketDataClient(
+            provider=self.config.market_data_provider,
+            alphavantage_api_key=self.config.alphavantage_api_key,
+            rate_limiter=self._rate_limiter,
+            rate_limit=RateLimit(self.config.market_max_calls_per_minute),
+        )
+        harness.register(
+            market_data_harness_tool(
+                MarketEvidenceAdapter(market_client),
+                network_access=self.config.market_data_provider not in {"offline", "disabled", "none"},
             )
-            harness.register(
-                market_data_harness_tool(
-                    MarketEvidenceAdapter(market_client),
-                    network_access=self.config.market_data_provider not in {"offline", "disabled", "none"},
-                )
+        )
+        harness.register(
+            market_history_harness_tool(
+                MarketHistoryEvidenceAdapter(market_client),
+                network_access=self.config.market_data_provider not in {"offline", "disabled", "none"},
             )
-            harness.register(
-                market_history_harness_tool(
-                    MarketHistoryEvidenceAdapter(market_client),
-                    network_access=self.config.market_data_provider not in {"offline", "disabled", "none"},
-                )
-            )
+        )
 
         remembered_symbols = {
             str(entity): str(state["symbol"])
@@ -847,7 +836,7 @@ class FinanceAnalysisService:
                 resolved_symbols[entity] = str(candidate).strip()
             elif re.fullmatch(r"[A-Za-z0-9.^=_:-]{1,32}", entity):
                 resolved_symbols[entity] = entity
-        if requested_entities and self.config.sec_user_agent:
+        if self.config.sec_user_agent:
             sec_client = SECCompanyFactsClient(self.config.sec_user_agent)
             harness.register(sec_company_facts_harness_tool(SECCompanyFactsAdapter(sec_client)))
             harness.register(sec_recent_filings_harness_tool(SECRecentFilingsAdapter(sec_client)))
@@ -868,11 +857,7 @@ class FinanceAnalysisService:
         document_research_required = (
             bool(document_contexts)
             or require_documents is True
-            or (
-                bool(document_tool_names)
-                and require_documents is None
-                and _requests_document_research(query)
-            )
+            or (bool(document_tool_names) and require_documents is None and _requests_document_research(query))
         )
         request = ResearchRequest(
             query=query,
@@ -884,7 +869,7 @@ class FinanceAnalysisService:
             run_id=actual_run_id,
             allow_network=network_allowed,
             max_iterations=6,
-            max_model_calls=8 if llm_client is not None else 1,
+            max_model_calls=8,
             max_parallel_tool_calls=4,
             require_documents=document_research_required,
             require_market_data=require_market_data,
@@ -911,31 +896,21 @@ class FinanceAnalysisService:
         try:
             outcome = FinancialResearchAgent(
                 harness,
-                planner=(
-                    ModelPlanner(
-                        harness,
-                        fallback=self._adaptive_planner(document_tool_names),
-                        max_evidence_chars=self.config.planning_evidence_characters,
-                        mcp_tool_index=self._mcp_tool_index(),
-                        tool_usage_context=tool_usage_context,
-                    )
-                    if llm_client is not None
-                    else self._adaptive_planner(document_tool_names)
+                planner=ModelPlanner(
+                    harness,
+                    max_evidence_chars=self.config.planning_evidence_characters,
+                    mcp_tool_index=self._mcp_tool_index(),
+                    tool_usage_context=tool_usage_context,
                 ),
-                synthesizer=(
-                    EvidenceBoundLLMSynthesizer(
-                        llm_client,
-                        harness=harness,
-                        max_evidence_chars=self.config.synthesis_evidence_characters,
-                        max_output_tokens=self.config.synthesis_output_tokens,
-                    )
-                    if llm_client is not None
-                    else DeterministicSynthesizer()
+                synthesizer=EvidenceBoundLLMSynthesizer(
+                    llm_client,
+                    harness=harness,
+                    max_evidence_chars=self.config.synthesis_evidence_characters,
+                    max_output_tokens=self.config.synthesis_output_tokens,
                 ),
                 checkpointer=self._open_graph_checkpointer(),
-                planner_hidden_tool_names=(
-                    frozenset(tool.spec.name for tool in self.mcp_tools) if llm_client is not None else frozenset()
-                ),
+                task_interpreter=LLMTaskInterpreter(harness),
+                planner_hidden_tool_names=frozenset(tool.spec.name for tool in self.mcp_tools),
             ).run(request, resume=resume)
         finally:
             self._close_graph_checkpointer()
@@ -1021,7 +996,7 @@ class FinanceAnalysisService:
 
         return {
             "thread_id": actual_thread_id,
-            "llm_backend": (llm_client.backend_name if llm_client is not None else "deterministic"),
+            "llm_backend": llm_client.backend_name,
             "result": result,
             "artifacts": artifacts,
             "document_diagnostics": [
@@ -1166,20 +1141,7 @@ class FinanceAnalysisService:
 
     def _mcp_planner_names(self, category: str) -> tuple[str, ...]:
         return tuple(
-            tool.spec.name
-            for tool in self.mcp_tools
-            if self.mcp_host.planner_category_for(tool.spec.name) == category
-        )
-
-    def _adaptive_planner(self, document_tool_names: Sequence[str]) -> AdaptivePlanner:
-        return AdaptivePlanner(
-            document_tools=tuple(document_tool_names),
-            market_tools=("market.snapshot", *self._mcp_planner_names("market")),
-            market_history_tools=("market.history", *self._mcp_planner_names("market_history")),
-            regulatory_tools=("sec.company_facts", *self._mcp_planner_names("regulatory")),
-            filing_tools=("sec.recent_filings", *self._mcp_planner_names("filings")),
-            macro_tools=("macro.fred_series", *self._mcp_planner_names("macro")),
-            web_tools=("web.search", *self._mcp_planner_names("web")),
+            tool.spec.name for tool in self.mcp_tools if self.mcp_host.planner_category_for(tool.spec.name) == category
         )
 
     def _load_conversation_context(
@@ -1318,9 +1280,7 @@ class FinanceAnalysisService:
         query_terms = _memory_terms(query)
         ranked: list[tuple[int, str, dict]] = []
         for item in self.list_personal_memories(tenant_id=tenant_id, user_id=user_id):
-            memory_terms = _memory_terms(
-                " ".join((item["title"], item["content"], " ".join(item["tags"])))
-            )
+            memory_terms = _memory_terms(" ".join((item["title"], item["content"], " ".join(item["tags"]))))
             overlap = len(query_terms.intersection(memory_terms))
             always_relevant = item["kind"] in {
                 PersonalMemoryKind.PROFILE.value,
@@ -1412,9 +1372,7 @@ class FinanceAnalysisService:
                 }
             )
             value = PersonalMemory.from_dict(
-                {
-                    key: matched[key] for key in ("kind", "title", "content", "tags")
-                }
+                {key: matched[key] for key in ("kind", "title", "content", "tags")}
             ).to_dict()
             if candidate.operation == "conflict":
                 self.memory_store.put(
@@ -1750,45 +1708,6 @@ class FinanceAnalysisService:
         return saved_paths
 
 
-def _resolve_request_entities(
-    *,
-    query: str,
-    explicit_entities: list[str],
-    detected_entities: list[str],
-    conversation_context: dict,
-) -> tuple[tuple[str, ...], bool]:
-    explicit = _normalized_entities(explicit_entities)
-    detected = _normalized_entities(detected_entities)
-    remembered = _normalized_entities(conversation_context.get("focus_entities") or [])
-    contextual = _is_contextual_followup(query)
-    has_history = int(conversation_context.get("manifest", {}).get("latest_sequence") or 0) > 0
-    current = explicit or detected
-    if current and _references_prior_focus(query):
-        prior = tuple(entity for entity in remembered if entity not in current)
-        if _references_entity_group(query):
-            return tuple(dict.fromkeys((*prior, *current))), True
-        if len(prior) == 1:
-            return tuple(dict.fromkeys((*prior, *current))), True
-        return current, True
-    if explicit:
-        return explicit, has_history
-    if detected:
-        return detected, has_history
-    if _references_first_entity(query):
-        return remembered[:1], True
-    if _references_last_entity(query):
-        return remembered[-1:], True
-    if _references_entity_group(query):
-        return remembered, True
-    if _references_previous_entity(query):
-        # A singular pronoun after a multi-entity turn is ambiguous.  Keep the
-        # context visible to the planner but do not guess which entity it means.
-        return (remembered if len(remembered) == 1 else ()), True
-    if contextual:
-        return remembered, True
-    return (), False
-
-
 def _validate_thread_id(thread_id: str) -> None:
     if not thread_id.strip() or len(thread_id) > 200 or any(ord(item) < 32 or ord(item) == 127 for item in thread_id):
         raise ValueError("thread_id is invalid")
@@ -1796,63 +1715,6 @@ def _validate_thread_id(thread_id: str) -> None:
 
 def _normalized_entities(values: Sequence[object]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(text for item in values if (text := str(item).strip()) and len(text) <= 200))[:50]
-
-
-def _references_previous_entity(query: str) -> bool:
-    normalized = f" {query.casefold()} "
-    return any(
-        marker in normalized
-        for marker in (
-            " 它",
-            "其",
-            "该公司",
-            "这家公司",
-            "上述公司",
-            "刚才那个公司",
-            "刚刚那个公司",
-            "刚刚聊到的那个公司",
-            "之前那个公司",
-            " it ",
-            " its ",
-            " that company ",
-            "the company we just discussed",
-            "the previous company",
-        )
-    )
-
-
-def _references_first_entity(query: str) -> bool:
-    normalized = f" {query.casefold()} "
-    return any(marker in normalized for marker in ("前者", "第一个", "第一家", " former ", " first one "))
-
-
-def _references_last_entity(query: str) -> bool:
-    normalized = f" {query.casefold()} "
-    return any(marker in normalized for marker in ("后者", "最后一个", "最后一家", " latter ", " last one "))
-
-
-def _references_entity_group(query: str) -> bool:
-    normalized = f" {query.casefold()} "
-    return any(
-        marker in normalized
-        for marker in ("它们", "这些公司", "上述公司们", "两者", " they ", " them ", " those companies ", " both ")
-    )
-
-
-def _is_contextual_followup(query: str) -> bool:
-    normalized = f" {query.casefold()} "
-    return _references_previous_entity(query) or any(
-        marker in normalized for marker in ("呢", "那么", "那 ", "继续", "what about", "how about", "and what")
-    )
-
-
-def _references_prior_focus(query: str) -> bool:
-    return (
-        _references_previous_entity(query)
-        or _references_first_entity(query)
-        or _references_last_entity(query)
-        or _references_entity_group(query)
-    )
 
 
 def _requests_document_research(query: str) -> bool:

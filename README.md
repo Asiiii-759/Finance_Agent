@@ -8,9 +8,9 @@
 intent → planning ↔ validation → final_generation → validation → END
 ```
 
-`planning` 由模型优先选择最多四个下一步工具动作并在同一节点内经 Harness 执行；Harness
-是执行 middleware，不是图节点。MCP 工具走渐进发现。校验节点可以拒绝模型过早结束并送回规划。未配置模型或模型计划违反契约时，
-规则规划器作为可见降级基线接管。
+`planning` 由模型选择最多四个下一步工具动作并在同一节点内经 Harness 执行；Harness
+是执行 middleware，不是图节点。MCP 工具走渐进发现。校验节点可以拒绝模型过早结束并送回规划。
+LLM 是研究链路的必需依赖：未配置模型或模型计划违反契约时，请求快速失败，不再回退到规则 planner。
 
 没有证据时系统会失败关闭，不使用演示数据或模型常识填空。项目不包含交易/下单能力。
 
@@ -19,7 +19,7 @@ intent → planning ↔ validation → final_generation → validation → END
 - PDF 上传、PaddleOCR-VL-1.6 或部署注入的成熟 PDF 解析 MCP、页级引用，以及 request/session/personal BM25 + embedding/RRF 双路检索
 - 可注入内部/外部 RAG 源，以及固定 HTTPS canonical JSON 搜索网关
 - 部署期 MCP Host/Client：按 allowlist 连接本地 stdio 或固定 HTTPS MCP server，只把只读 Evidence 工具送进 Harness
-- 中英金融场景识别、结构化 ResearchScope、模型自主逐步规划与确定性规划降级
+- 中英金融场景识别、结构化 ResearchScope、模型自主逐步规划（非法 JSON 快速失败）
 - 受控开放网页搜索：模型生成检索式、时效窗口和域名范围；URL/内容去重、来源分散度校验，snippet 只能形成带复核提示的推断
 - 显式 provider 行情快照、adjusted/raw 历史收益、波动率和最大回撤（默认 offline）
 - SEC EDGAR Company Facts、最近 filing 元数据与扩展财务比率
@@ -31,12 +31,12 @@ intent → planning ↔ validation → final_generation → validation → END
 - 工具输入/输出契约、run identity、capability、网络、副作用、分账预算、重试、超时和审计控制
 - 主/备数据源重规划、模型 `finish` 证据校验与明确停止原因
 - LangGraph SQLite checkpointer、状态历史和跨 Agent 实例恢复，以及 tenant/user/thread 隔离记忆
-- 持久对话事件账本、“LLM 旧摘要 + 最近 20K token 完整 run”、确定性实体/焦点指代，以及显式写入的个人记忆和持久 PDF 知识库
+- 持久对话事件账本、“LLM 旧摘要 + 最近 20K token 完整 run”、模型经 entity_replay 消解指代，以及显式写入的个人记忆和持久 PDF 知识库
 - 按 entity/source/domain 平衡、按研究意图可选 document 分散、保留 provenance 的 Prompt ContextAssembler；规划 24K、生成 48K evidence 字符预算可调，并输出逐阶段 manifest
 - 只读 canonical-evidence 工具注入边界，可接企业 RAG、MCP gateway 或 licensed feed；未注入时不启用
-- 带逐字 evidence quote 验证的 LLM 合成与确定性降级
+- 带逐字 evidence quote 验证的 LLM 合成；非法输出快速失败
 - FastAPI、后台作业、CLI、报告与审计产物
-- 11 个可独立运行的黑盒验收场景和 145 项自动化测试
+- 9 个可独立运行的黑盒验收场景和 165 项自动化测试
 
 完整的运行机制、状态契约、数据源、记忆、安全边界和扩展方法见
 [Agent 详细说明](docs/AGENT_DETAILED_GUIDE.md)；架构决策摘要见
@@ -239,7 +239,7 @@ PADDLEOCR_MODEL=PaddleOCR-VL-1.6
 PDF 不再走本地 PyMuPDF 文本提取。运行时必须配置 PaddleOCR，或通过 `create_app` / `FinanceAnalysisService`
 注入实现 `PDFDocumentParser` 契约的成熟 PDF 解析 MCP adapter；两者都返回从 1 开始、连续的页级文本。
 PaddleOCR 只消费页级 Markdown，不下载远端图片资源。未配置解析器时上传快速失败。
-未配置 LLM 时使用确定性规划器和只复述证据的确定性合成器。
+未配置 LLM 时研究请求快速失败，不进入工具或记忆写入。
 embedding 未配置时只注册 BM25 工具；配置 OpenAI-compatible HTTPS endpoint 后额外注册 hybrid/RRF 工具，
 模型可自主选择，远程调用继续要求双重网络授权。系统不会把 DeepSeek 对话接口误作 embedding 接口。
 

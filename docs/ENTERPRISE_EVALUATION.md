@@ -65,7 +65,7 @@ python -m mas_finance.evaluation
 | Provider | 空响应、超时、限流、缺字段 | retry 受网络预算限制；失败转 gap |
 | 市场数据 | 只有 raw close | 指标可用但状态降级，公开未计分红 |
 | Context | evidence 截断、跨 entity 竞争 | 分组轮询；只允许引用 manifest 内 ID |
-| LLM | 非 JSON、虚假 ID、错误 quote | 确定性合成并产生 fallback gap |
+| LLM | 非 JSON、虚假 ID、错误 quote | 合成快速失败 |
 | Memory | 过期、畸形、实体切换 | 删除过期记录；当前问题优先 |
 | Checkpoint | graph step 后崩溃、请求不匹配、NaN | 从待执行节点恢复或明确拒绝，不刷新预算 |
 | Report | Markdown/footnote 注入 | 转义不可信字段；校验未知引用 |
@@ -77,9 +77,9 @@ python -m mas_finance.evaluation
 | 场景 | 期望工具 | 期望状态或关键 gap | 验证目的 |
 |---|---|---|---|
 | 中文自然语言 CAGR | `finance.calculate` | `succeeded` | 中英解析与公式路由 |
-| 市盈率定义与局限 | `finance.knowledge` | `succeeded` | 不依赖模型常识 |
+| 市盈率定义与局限 | 无研究工具 | `succeeded` | 概念题由模型直接作答 |
 | 结构化 Sharpe | `finance.calculate` | `succeeded` | 白名单计算与输入血缘 |
-| 利率影响银行股 | `finance.knowledge` | `succeeded` | 用版本化机制解释而非模型常识 |
+| 利率影响银行股 | 无研究工具 | `succeeded` | 机制解释不强制检索词条 |
 | 预测未指定股票明日精确价 | 无 | `unsupported_research_scope` | 不可证实预测失败关闭 |
 | 无假设 DCF | 市场快照可尝试 | `valuation_model_inputs_required` | 不发明预测、折现率、终值 |
 | ROE 直接计算 | 无 SEC 时无动作 | `metric_requires_average_balance` | 不用期末权益冒充平均权益 |

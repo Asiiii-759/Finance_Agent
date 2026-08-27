@@ -10,6 +10,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from httpx import ASGITransport, AsyncClient
+from llm_fixtures import research_app, research_service
 from pdf_fixtures import MCPPDFParserFixture, write_stub_pdf
 
 from mas_finance.api.app import create_app
@@ -48,7 +49,7 @@ def build_test_config(root: Path, api_key: str | None = None) -> AppConfig:
 class FinanceSystemTestCase(unittest.TestCase):
     def test_personal_memory_is_explicit_scoped_recalled_and_deletable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            service = FinanceAnalysisService(build_test_config(Path(directory)))
+            service = research_service(build_test_config(Path(directory)))
             preference = service.save_personal_memory(
                 kind=PersonalMemoryKind.PREFERENCE,
                 title="回答风格",
@@ -204,7 +205,7 @@ class FinanceSystemTestCase(unittest.TestCase):
             parser = MCPPDFParserFixture(
                 {pdf_path.name: {1: "ACME revenue demand and operating cash flow remained resilient in 2026"}}
             )
-            response = FinanceAnalysisService(
+            response = research_service(
                 config, pdf_document_parser=parser, pdf_parser_network_access=False
             ).analyze(
                 "Analyze ACME demand and cash flow",
@@ -221,10 +222,16 @@ class FinanceSystemTestCase(unittest.TestCase):
             state_payload = json.loads(Path(response["artifacts"]["state_path"]).read_text(encoding="utf-8"))
             self.assertEqual(state_payload["request"]["thread_id"], "test-e2e")
 
+    def test_analyze_fails_fast_without_llm_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = FinanceAnalysisService(build_test_config(Path(directory)))
+            with self.assertRaisesRegex(RuntimeError, "LLM configuration is required"):
+                service.analyze("什么是市盈率？", export_artifacts=False)
+
     def test_api_endpoint(self) -> None:
         tmp_root = ROOT / "test_artifacts" / f"api-test-{uuid4().hex[:8]}"
         tmp_root.mkdir(parents=True, exist_ok=True)
-        app = create_app(build_test_config(tmp_root, api_key=None))
+        app = research_app(build_test_config(tmp_root, api_key=None))
 
         async def scenario():
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -247,17 +254,16 @@ class FinanceSystemTestCase(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["thread_id"], "test-api")
         self.assertTrue(payload["run_id"].startswith("run-"))
-        self.assertIn(payload["stop_reason"], {"no_available_action", "no_evidence"})
         self.assertIn("report", payload)
         self.assertTrue(payload["report"])
-        self.assertEqual(payload["llm_backend"], "deterministic")
+        self.assertEqual(payload["llm_backend"], "fixture")
         self.assertNotIn("state", payload)
         self.assertEqual(invalid.status_code, 422)
 
     def test_api_structured_financial_calculation(self) -> None:
         tmp_root = ROOT / "test_artifacts" / f"calculation-test-{uuid4().hex[:8]}"
         tmp_root.mkdir(parents=True, exist_ok=True)
-        app = create_app(build_test_config(tmp_root, api_key=None))
+        app = research_app(build_test_config(tmp_root, api_key=None))
 
         async def scenario():
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -297,14 +303,14 @@ class FinanceSystemTestCase(unittest.TestCase):
     def test_tool_catalog_and_thread_memory_deletion(self) -> None:
         tmp_root = ROOT / "test_artifacts" / f"tool-catalog-test-{uuid4().hex[:8]}"
         tmp_root.mkdir(parents=True, exist_ok=True)
-        app = create_app(build_test_config(tmp_root, api_key=None))
+        app = research_app(build_test_config(tmp_root, api_key=None))
 
         async def scenario():
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
                 analysis = await client.post(
                     "/api/v1/analyze",
                     json={
-                        "query": "什么是 CAGR？",
+                        "query": "什么是市盈率？",
                         "thread_id": "memory-delete-test",
                         "export_artifacts": False,
                     },
@@ -321,6 +327,7 @@ class FinanceSystemTestCase(unittest.TestCase):
         catalog = {item["name"]: item for item in tools.json()}
         names = set(catalog)
         self.assertIn("finance.calculate", names)
+        self.assertNotIn("finance.knowledge", names)
         cagr_contract = catalog["finance.calculate"]["operation_contract"]["cagr"]
         self.assertEqual(
             cagr_contract["required_inputs"],
@@ -330,8 +337,9 @@ class FinanceSystemTestCase(unittest.TestCase):
         self.assertIn("market.history", names)
         self.assertEqual(
             catalog["llm.synthesize"]["availability"],
-            "not_registered_deterministic_synthesis",
+            "required",
         )
+        self.assertEqual(catalog["llm.task_frame"]["availability"], "required")
         config_payload = config.json()
         self.assertEqual(config_payload["database_backend"], "sqlite")
         self.assertNotIn("database_url", config_payload)
@@ -377,7 +385,7 @@ class FinanceSystemTestCase(unittest.TestCase):
         tmp_root = ROOT / "test_artifacts" / f"upload-test-{uuid4().hex[:8]}"
         tmp_root.mkdir(parents=True, exist_ok=True)
         parser = MCPPDFParserFixture({"Apple_report.pdf": {1: "Apple revenue 400 EBITDA 120 risk warning"}})
-        app = create_app(
+        app = research_app(
             build_test_config(tmp_root, api_key=None),
             pdf_document_parser=parser,
             pdf_parser_network_access=False,
@@ -414,7 +422,7 @@ class FinanceSystemTestCase(unittest.TestCase):
         tmp_root = ROOT / "test_artifacts" / f"session-upload-test-{uuid4().hex[:8]}"
         tmp_root.mkdir(parents=True, exist_ok=True)
         parser = MCPPDFParserFixture({"maturity.pdf": {1: "ACME refinancing maturity is September 2027."}})
-        app = create_app(
+        app = research_app(
             build_test_config(tmp_root, api_key=None),
             pdf_document_parser=parser,
             pdf_parser_network_access=False,
@@ -474,7 +482,7 @@ class FinanceSystemTestCase(unittest.TestCase):
     def test_job_endpoints_and_auth(self) -> None:
         tmp_root = ROOT / "test_artifacts" / f"job-test-{uuid4().hex[:8]}"
         tmp_root.mkdir(parents=True, exist_ok=True)
-        app = create_app(build_test_config(tmp_root, api_key="secret-key"))
+        app = research_app(build_test_config(tmp_root, api_key="secret-key"))
 
         async def scenario():
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

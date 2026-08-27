@@ -2,10 +2,11 @@
 
 > 本文是架构决策摘要。面向使用、开发与评审的逐层说明见
 > [《MAS Finance Agent：完整架构、运行机制与能力说明》](AGENT_DETAILED_GUIDE.md)。
+> 工具目录、MCP 渐进发现与报错分层见 [《工具、金融场景与自适应调用逻辑》](TOOLS_AND_REASONING.md)。
 
 状态：已采纳并进入实现
 版本：2.2
-日期：2026-08-20
+日期：2026-08-27
 
 ## 1. 产品边界
 
@@ -28,13 +29,17 @@
 ```text
 Multi-Agent-project/
 ├── src/mas_finance/
-│   ├── graph.py           # 四节点 LangGraph、路由、恢复和单动作执行
-│   ├── agent.py           # 状态、规则规划基线、覆盖评估和报告领域对象
-│   ├── planning.py        # 模型自主规划与 llm.plan Harness tool
+│   ├── graph.py           # 四节点 LangGraph、路由、恢复；每轮最多四个工具并行执行
+│   ├── agent.py           # 状态、覆盖评估和报告领域对象
+│   ├── planning.py        # 模型自主规划、渐进发现上下文与 llm.plan Harness tool
 │   ├── research.py        # 中英金融意图、ResearchScope 与 evidence requirements
 │   ├── contracts.py       # Source / Evidence / Claim 稳定契约
-│   ├── harness.py         # 工具权限、预算、重试、审计
+│   ├── harness.py         # 工具权限、预算、重试、结构化执行错误、审计
+│   ├── mcp.py             # MCP Host/Client、只读过滤、渐进发现元工具
+│   ├── mcp_servers/       # 本地 stdio MCP server（当前含 AllTick/必盈行情）
+│   ├── rate_limit.py      # 进程内滑动窗口限流
 │   ├── memory_store.py    # 持久对话事件、滚动摘要、实体/焦点状态与 namespace 隔离
+│   ├── memory_consolidation.py # 长期记忆候选提取
 │   ├── personal_knowledge.py # 用户隔离的持久 PDF 页文本库
 │   ├── embeddings.py      # embedding provider 协议与受限 HTTP 边界
 │   ├── corpus.py          # BM25、向量、RRF 与文档分散检索后端
@@ -67,7 +72,7 @@ Multi-Agent-project/
 ```text
 START → intent → planning ─────────────┐
                    │                   │
-                   │ 每次一个工具动作  │
+                   │ 每轮最多四个工具   │
                    ↓                   │
                validation ──证据不足──┘
                    │
@@ -79,17 +84,23 @@ START → intent → planning ─────────────┐
 ```
 
 图只有 `intent / planning / validation / final_generation` 四个业务节点。不存在 `ToolHarness`、`act`、
-`critic` 或按角色命名的工具节点。`planning` 每次读取动态工具目录，由 `ModelPlanner` 选择一个工具及参数，
-并在同一节点内经 Harness 执行；节点返回后 LangGraph 保存 observation、证据和 audit。一个节点只执行一个工具，
-因此恢复粒度不会退化成“重跑整批工具”。模型选择违反工具契约、模型不可用或预算不足时，
-`AdaptivePlanner` 作为可见降级基线接管。
+`critic` 或按角色命名的工具节点。`planning` 每次读取动态工具目录：配置了 LLM 时由 `ModelPlanner` 选择
+1–4 个已注册工具（或 `finish`），并在同一节点内经 Harness 执行；多个任务按 `max_parallel_tool_calls`
+（默认 4）并行 invoke。节点返回后 LangGraph 保存 observation、证据和 audit。同一 `ResearchPlan` 若因预算
+被截断，恢复后继续执行尚未 observation 的 task，而不是重跑整批。
+
+有 LLM 时，MCP（Model Context Protocol，模型上下文协议）具体工具对规划目录隐藏；模型只看到 builtins、
+短 `mcp_tool_index` 和三个发现元工具（`mcp.search_tools` / `mcp.describe_tool` / `mcp.call_tool`）。
+DeepSeek 请求不带 native `tools` 字段。LLM 是研究链路的必需依赖：缺少配置、模型不可用或规划/合成 JSON
+非法时快速失败，不回退到规则 planner 或确定性合成器。
 
 `validation` 有两种确定性职责：生成前检查 evidence requirements，拒绝模型过早 `finish` 并路由回 planning；模型工具执行后即使已达到最低 coverage，也会再回 planning，由模型基于新证据明确继续或 finish（硬预算到达除外）；
-生成后检查 claim/citation/report 契约并结束。它不替模型选择工具。无模型规则基线满足 requirement 后直接结束。`final_generation` 只负责基于证据建立 claims
+生成后检查 claim/citation/report 契约并结束。它不替模型选择工具。`final_generation` 只负责基于证据建立 claims
 和报告，不进行研究工具选择。
 
 停止原因是稳定枚举：
 
+- `clarification_required`
 - `coverage_satisfied`
 - `max_iterations`
 - `tool_budget_exhausted`
@@ -97,10 +108,11 @@ START → intent → planning ─────────────┐
 - `validation_failed`
 - `no_evidence`
 
-服务默认最多 6 次规划迭代、12 次研究工具调用、8 次数据 provider 尝试和 7 次模型调用（规划加最终生成）；
-请求可在受控范围内调整。模型只能选择运行时已注册的 `ToolSpec`，不能构造 import、任意函数或任意 HTTP
-客户端。相同 tool+arguments 会形成稳定 task ID，重复动作不会再次执行。模型调用不占研究工具预算，网络 retry
-逐次占数据 provider 尝试预算。
+服务默认最多 6 次规划迭代、12 次研究工具调用、8 次数据 provider 尝试和 8 次模型调用（规划加最终生成）；
+领域请求允许 `max_iterations=1..8`、`max_tool_calls=1..100`、`max_network_calls=0..max_tool_calls`、
+`max_model_calls=0..20`、`max_parallel_tool_calls=1..8`。模型只能选择运行时已注册的 `ToolSpec`，不能构造
+import、任意函数或任意 HTTP 客户端。相同 tool+arguments 会形成稳定 task ID，重复动作记
+`repeated_planner_action` 且不会再次执行。模型调用不占研究工具预算，网络 retry 逐次占数据 provider 尝试预算。
 
 ## 4. 数据契约与证据账本
 
@@ -121,9 +133,9 @@ START → intent → planning ─────────────┐
 
 `EvidenceBundle.add_claim()` 强制引用完整性。最终校验器还会检查报告中的 citation、footnote、data gap 和风险提示。
 
-## 5. Harness 工程
+## 5. Harness、MCP Host 与失败语义
 
-`ToolHarness` 是每一次模型工具选择配套的执行 middleware，不是 LangGraph 节点。顺序固定：注册表解析 →
+`ToolHarness` 是每一次工具选择配套的执行 middleware，不是 LangGraph 节点。顺序固定：注册表解析 →
 run identity/预算上限绑定 → capability → side effect → network → 输入契约 → 分账预算 → provider timeout/retry →
 输出契约 → 审计脱敏。它不决定“应该研究什么”或“调用哪个工具”；这些属于 planner。核心输入契约拒绝缺失字段、
 多余字段、非有限 JSON 和超大载荷；数据工具只能返回可验证的 `EvidenceBundle`，模型工具只能返回有界 model response。
@@ -135,7 +147,30 @@ run identity/预算上限绑定 → capability → side effect → network → �
 - `external_write`
 - `financial_transaction`（默认拒绝）
 
-自动重试仅适用于 read-only 工具。同步工具的超时目前是“观测超时”；HTTP/数据库 provider 必须同时设置底层 I/O timeout。审计参数会遮蔽 token、API key、authorization、password，并截断异常大文本。
+自动重试仅适用于 read-only 工具，且必须命中该 `ToolSpec` 声明的 exception 类型。同步工具的超时目前是“观测超时”；HTTP/数据库 provider 必须同时设置底层 I/O timeout。审计参数会遮蔽 token、API key、authorization、password，并截断异常大文本。`ToolExecutionError` 会把 `error_code`、`error_message` 和 `error_details` 写入 `ToolResult`，供下一轮规划使用；它不在默认 retry 集合里。
+
+### 5.1 MCP Host
+
+Agent 同时是 MCP Host：`MAS_MCP_SERVERS` 部署 allowlist 连接本地 stdio 或固定 HTTPS JSON-RPC Client。
+进 Harness 前过滤只读注解、既有证据 capability 和合法参数名；拒绝项记为 `McpRejection`，不进模型目录。
+`tools/call` 必须能变成 canonical `EvidenceBundle`，原始 MCP JSON 不能当 Evidence。配置 AllTick 或必盈许可时
+自动挂载本地 `extmarket` server。FRED、Bocha、Brave、内置行情与 MCP `tools/call` 使用进程内滑动窗口限流。
+计算工具和内部研报 RAG 仍留在进程内。HTTP MCP URL 必须是启动时固定的凭据无关 HTTPS；stdio command 由部署配置。
+
+### 5.2 报错之后怎么走
+
+失败不是单一“自动再打一次”：
+
+| 层 | 触发 | 行为 |
+|---|---|---|
+| Harness 自动重试 | `TimeoutError` / `ConnectionError` 等 ToolSpec 声明的异常 | web/RAG/FRED/SEC 多为 `max_attempts=2`；MCP 绑定工具默认 `max_attempts=1`，限流超时也只失败一次 |
+| MCP 结构化错误 | `isError=true` → `ToolExecutionError` | `ok=false`，保留 `retryable`、`suggested_action` 等 `error_details`；Graph 记 resolvable gap，不合并 Evidence |
+| 规划改参 | 下一轮 `prior_actions` 含错误细节 | 模型可改 arguments 再 `mcp.call_tool`；完全相同 task ID 不重跑 |
+| 空结果但仍成功 | adapter 返回 bundle + `gaps`，`isError=false` | Coverage 仍缺；系统不会把 `AAPL` 改写成 `AAPL.US` |
+
+发现元工具查不到名字会抛普通 `ValueError`，不是 MCP `isError` 契约。JSON-RPC 传输失败同样走通用工具错误。
+Host 会转发 server 给出的 `field` / `candidates`；内置 `extmarket` 当前携带 `error_code`、`retryable`、
+`received_arguments` 和 `suggested_action`，不保证每次都带枚举候选。
 
 ## 6. 记忆模型
 
@@ -145,10 +180,11 @@ run identity/预算上限绑定 → capability → side effect → network → �
 | Conversation memory | tenant/user/thread/kind | 完整 user/tool/assistant 事件与有界 prompt 投影 | `SQLiteMemoryStore` |
 | Personal memory | tenant/user/kind | 显式 profile/preference/experience/skill | SQLiteMemoryStore；同槽位显式覆盖 |
 | Personal knowledge | tenant/user/document | 解析页文本与来源元数据 | SQLite 文本 + BM25；配置后可在查询期 embedding/RRF；显式上传/删除 |
+| Tool usage memory | tenant/user/`tool_usage_memory` | 曾成功的 MCP 参数示例与 schema fingerprint | 仅 Harness `success`；schema 变化后停用；最多五条进入规划上下文 |
 | Domain corpus | tenant/KB/version | 文档 chunk、metadata、索引 | retrieval backend |
 | Audit | tenant/thread/run/call | 脱敏参数、状态、耗时、错误码 | run state + artifact；生产待 append-only store |
 
-对话完整事件账本默认保留到用户显式删除；进入模型的投影默认上限为 300K token。达到预算 85% 时，专用 LLM 滚动生成结构化语义摘要，最近原始事件继续保留，原账本不删除。实体身份不交给摘要模型：系统从用户事件确定性构建 `entity_state + focus_history`，用于前者、后者、复数及“刚刚那个公司”的指代解析；歧义单数不猜。记忆不保存 EvidenceBundle，也不能作为事实来源。详见 [持久对话记忆与动态上下文](CONVERSATION_MEMORY.md)。
+对话完整事件账本默认保留到用户显式删除；进入模型的投影默认上限为 300K token。达到预算 85% 时，专用 LLM 滚动生成结构化语义摘要，最近原始事件继续保留，原账本不删除。实体事件是带时间和顺序的原子回放索引；TaskFrame 模型结合摘要、最近事件和回放理解指代，无法可靠消解时返回澄清问题，不调用工具。LLM 是研究链路的必需依赖，未配置则快速失败。记忆不保存 EvidenceBundle，也不能作为事实来源。详见 [持久对话记忆与动态上下文](CONVERSATION_MEMORY.md) 与 [LLM TaskFrame](TASK_FRAME.md)。
 
 个人长期记忆只由显式 CRUD 创建，最多召回八条且作为低权限 personal context；个人 PDF 必须走独立持久上传接口，临时上传不会自动入库。完整边界见 [个人金融助手：记忆、上下文与扩展边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
 
@@ -164,27 +200,28 @@ Agent 只理解“返回 EvidenceBundle 的工具”，不理解某个供应商 
   当前内置 Bocha 与 Brave adapters 使用各自固定认证 API origin；两者同时配置时优先 Bocha。结果 URL
   可以来自公开网络并登记为 `SourceType.WEB`。
   返回内容明确标记为 search-result snippet；当前不提供任意 URL fetch。
-- 行情：`market.snapshot` 返回字段级快照；`market.history` 显式记录 adjusted/raw price basis 并生成收益、年化波动率和最大回撤。默认 provider 为 offline；AlphaVantage 与 Yahoo 必须显式配置，且绝不静默跨 provider fallback。Yahoo 只标记为实验适配器。
+- 行情：`market.snapshot` 返回字段级快照；`market.history` 显式记录 adjusted/raw price basis 并生成收益、年化波动率和最大回撤。默认 provider 为 offline；AlphaVantage 与 Yahoo 必须显式配置，且绝不静默跨 provider fallback。Yahoo 只标记为实验适配器。配置 AllTick/必盈时额外挂载 MCP `extmarket`（snapshot/history）；模型经渐进发现调用。
+- MCP / 企业只读工具：Host allowlist 接入后进入同一条 Harness；规划侧用渐进发现，不把完整 JSON Schema 一次性塞进 prompt。尚未实现 SSE Streamable HTTP 与 OAuth。
 - 监管：`sec.company_facts` 使用 SEC Company Facts XBRL；`sec.recent_filings` 使用 submissions recent filings 元数据。两者要求声明组织与联系邮箱的 User-Agent。接口依据：[SEC EDGAR APIs](https://www.sec.gov/search-filings/edgar-application-programming-interfaces)。
 - 宏观：`macro.fred_series` 使用 FRED 官方 series/observations API，要求独立 API key。
 - 计算：`finance.calculate` 只执行白名单公式并将用户输入、公式版本和结果登记为 Evidence；账本内比率仍要求相同实体/单位/期间。
 - 自拟计算：`finance.formula` 只执行声明式 AST 白名单；能保证安全与可复算，不能保证金融语义，所以 claim 标为 inferred。
-- 教育解释：`finance.knowledge` 返回版本化概念、公式和解释 caveat，不依赖模型常识。
+- 教育解释：概念、公式含义和机制由模型直接判断；引用检索证据时才做逐字 quote 校验。没有代码内金融词库。
 
 增加新数据源的标准步骤：固定 provider 客户端（含 timeout/认证）→ anti-corruption adapter → `ToolSpec` →
-契约测试 → 服务注册。模型下一轮自动从动态目录看到新工具；只有希望无模型模式也使用它时，才需要把能力类别加入
-`AdaptivePlanner` 基线。模型不能直接访问 provider 或读取密钥。
+契约测试 → 服务注册。模型下一轮自动从动态目录看到新工具。模型不能直接访问 provider 或读取密钥。
 
 ## 8. LLM 使用边界
 
-LLM 负责两类受约束决策：`ModelPlanner` 每轮从动态目录选择一个工具动作或 `finish`；
+LLM 负责两类受约束决策：`ModelPlanner` 每轮从动态目录选择 1–4 个工具动作或 `finish`；
 `EvidenceBoundLLMSynthesizer` 基于证据生成 claims。模型不负责权限、预算、算术或引用合法性。
-规划上下文包含用户请求、规则产生的 intent hints、coverage、历史动作、未解决 gaps、有限 evidence 摘要和工具输入契约；
-文档、网页和记忆都明确标记为不可信数据。模型输出必须是严格 JSON，工具名和参数先过 ToolSpec/Harness。
-最终 claims 必须提供 evidence IDs 与逐字 quote；失败分别产生可见的 `model_planner_fallback` 或
-`llm_synthesis_fallback`，由确定性基线接管。
+规划上下文包含用户请求、模型产生的 TaskFrame/requirements、coverage、`prior_actions`（含 `ok` / `error_code` /
+`error_details`）、未解决 gaps、有限 evidence 摘要、工具输入契约、MCP 短索引、发现结果和
+`verified_tool_usage`；文档、网页、记忆和工具错误都明确标记为不可信数据。模型输出必须是严格 JSON，
+工具名和参数先过 ToolSpec/Harness。MCP 完整 schema 只在 `mcp.describe_tool` 之后进入下一轮上下文。
+最终 claims 若引用 evidence，必须提供 evidence IDs 与逐字 quote；无引用的概念判断允许作为 inferred。规划或合成输出不可用时快速失败，不由确定性基线接管。
 
-这不是完整的语义蕴含证明，因此后续仍应加入 NLI/人工抽检。任何模型输出都不能成为事实 claim 的唯一 source。
+这不是完整的语义蕴含证明，因此后续仍应加入 NLI/人工抽检。检索性事实 claim 不能仅以模型输出为 source。
 
 ## 9. API 与任务
 
@@ -198,8 +235,8 @@ API 路由使用 async 接口，但当前容器的线程执行器不可用，所
 
 - 上传：数量、大小、`.pdf` 后缀、PDF magic、归一化文件名和根目录约束。
 - 检索：文档内容是不可信数据，不能改变系统提示或工具权限。
-- 外部访问：仅固定 provider endpoint；run 默认禁网。
-- 输出：无证据失败关闭，缺口可见，引用完整性和免责声明为硬校验。
+- 外部访问：仅固定 provider endpoint；MCP HTTP URL 只能是启动时配置的凭据无关 HTTPS；run 默认禁网。
+- 输出：检索/计算题无证据失败关闭；概念题允许无引用 inferred claim；缺口可见，引用完整性和免责声明为硬校验。
 - 产物：安全文件名、随机后缀、防覆盖；生产需加密与 retention。
 - 部署：API key 常量时间比较；反向代理还需 body/rate limit。
 - 交易：主项目不提供 broker tool；未来必须拆成独立服务并要求人工批准和独立风控。
@@ -216,7 +253,7 @@ python -m compileall -q src tests
 pip check
 ```
 
-覆盖范围包括：契约引用完整性和 content-addressed 防篡改、工具输入/输出契约、权限/分账预算/脱敏、provider 故障、无证据失败、SQLite checkpoint 恢复、持久对话/动态压缩/指代/显式删除、上下文裁剪、citation laundering、金融指标血缘、PDF 上传安全、API 鉴权/作业/上传和产物路径安全。可运行评测矩阵见 [企业级验证与故障注入报告](ENTERPRISE_EVALUATION.md)。
+覆盖范围包括：契约引用完整性和 content-addressed 防篡改、工具输入/输出契约、权限/分账预算/脱敏、MCP Host 过滤与结构化错误、provider 故障、无证据失败、SQLite checkpoint 恢复、持久对话/动态压缩/指代/显式删除、上下文裁剪、citation laundering、金融指标血缘、PDF 上传安全、API 鉴权/作业/上传和产物路径安全。可运行评测矩阵见 [企业级验证与故障注入报告](ENTERPRISE_EVALUATION.md)。
 
 ## 12. 后续优先级
 

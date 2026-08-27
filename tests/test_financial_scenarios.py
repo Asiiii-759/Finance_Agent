@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from mas_finance.agent import ResearchRequest
-from mas_finance.graph import FinancialResearchAgent
+from llm_fixtures import llm_backed_agent, llm_research_request
+
 from mas_finance.harness import ToolHarness
 from mas_finance.macro import FREDEvidenceAdapter, fred_series_harness_tool
 from mas_finance.market import MarketHistoryEvidenceAdapter, market_history_harness_tool
@@ -84,8 +84,8 @@ class FinancialScenarioTests(unittest.TestCase):
     def test_comparative_profitability_uses_sec_then_aligned_ratios(self) -> None:
         harness = ToolHarness()
         harness.register(sec_company_facts_harness_tool(SECCompanyFactsAdapter(FixtureSEC())))
-        outcome = FinancialResearchAgent(harness).run(
-            ResearchRequest(
+        outcome = llm_backed_agent(harness).run(
+            llm_research_request(
                 query="比较 Apple 和 Microsoft 的净利率和盈利能力",
                 entities=("Apple", "Microsoft"),
                 symbols={"Apple": "AAPL", "Microsoft": "MSFT"},
@@ -109,8 +109,8 @@ class FinancialScenarioTests(unittest.TestCase):
     def test_market_risk_question_uses_adjusted_series_with_lineage(self) -> None:
         harness = ToolHarness()
         harness.register(market_history_harness_tool(MarketHistoryEvidenceAdapter(FixtureHistory())))
-        outcome = FinancialResearchAgent(harness).run(
-            ResearchRequest(
+        outcome = llm_backed_agent(harness).run(
+            llm_research_request(
                 query="Alpha过去1年的收益率、波动率和最大回撤是多少？",
                 entities=("Alpha",),
                 symbols={"Alpha": "ALPHA"},
@@ -138,8 +138,8 @@ class FinancialScenarioTests(unittest.TestCase):
 
         harness = ToolHarness()
         harness.register(market_history_harness_tool(MarketHistoryEvidenceAdapter(UnadjustedHistory())))
-        outcome = FinancialResearchAgent(harness).run(
-            ResearchRequest(
+        outcome = llm_backed_agent(harness).run(
+            llm_research_request(
                 query="Alpha过去1年的收益率和最大回撤是多少？",
                 entities=("Alpha",),
                 symbols={"Alpha": "ALPHA"},
@@ -154,8 +154,8 @@ class FinancialScenarioTests(unittest.TestCase):
     def test_macro_question_uses_latest_fred_observation_and_cited_change(self) -> None:
         harness = ToolHarness()
         harness.register(fred_series_harness_tool(FREDEvidenceAdapter(FixtureFRED())))
-        outcome = FinancialResearchAgent(harness).run(
-            ResearchRequest(
+        outcome = llm_backed_agent(harness).run(
+            llm_research_request(
                 query="美国失业率目前是多少？",
                 require_documents=False,
                 allow_network=True,

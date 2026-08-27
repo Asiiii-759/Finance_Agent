@@ -1,13 +1,18 @@
 # 真实 LLM、Harness 回退与 Checkpoint 恢复验证
 
-状态：已执行
+状态：已执行（历史记录，2026-08-12）
 日期：2026-08-12
 模型：DeepSeek V4 Flash，thinking disabled
+
+当前运行时已不再把规则 planner / 确定性合成器当作降级路径：LLM 是研究链路必需依赖，模型网络拒绝、非法 JSON
+或不可用输出会使请求快速失败。内置 `finance.knowledge` 词库也已删除，概念题由模型直接作答。
+下文表格保留当时实测结果，其中“确定性合成接管 / `llm_synthesis_fallback`”以及选择 `finance.knowledge`
+描述的是当时的行为，不是现行契约。
 
 ## 1. 验证原则
 
 真实 LLM 只验证模型真正参与的系统边界：自主工具选择、Evidence 上下文组织、JSON claim 契约、逐字引用、
-提示注入隔离、模型预算、确定性降级和 checkpoint 恢复后的合成。公式正确性、权限拒绝、重试计数、畸形 JSON、
+提示注入隔离、模型预算和 checkpoint 恢复后的合成。公式正确性、权限拒绝、重试计数、畸形 JSON、
 租户隔离和 provider schema 不能依赖概率模型判断，仍使用确定性断言与故障注入。
 
 因此“所有工具都用 LLM 测”不等于让 LLM 重新计算或决定测试是否通过，而是：工具先按代码契约产生 Evidence，再由真实模型消费，最终由代码验证 claim 和 citation。
@@ -66,18 +71,18 @@
 
 ## 4. Harness 回退实际验证
 
-1.4 的规则回退不是一个宽泛 `try/except`。2.0 中正常路线改为 ModelPlanner 自主选择一个动作；以下规则 planner
-仅在模型不可用、输出非 JSON、工具名不存在或参数违反契约时作为可见降级：
+当时 1.4/2.0 的规则 planner 不是宽泛 `try/except`，而是在模型不可用或 JSON 非法时的可见降级。现行契约已取消这条路径：
+LLM 未配置、模型 JSON 非法或合成 quote 不可用时快速失败，不再产生 `model_planner_fallback` / `llm_synthesis_fallback`。
+
+当时实测仍覆盖了下列 Harness 边界（与现行 fail-fast 不冲突的部分继续成立）：
 
 1. 模型从本次动态工具目录选择工具、参数或 finish；
 2. ToolSpec/Harness 拒绝目录外工具与非法参数；
-3. 降级时规则 Planner 按同一 requirement 的有序 provider 列表选择未尝试工具；
-4. 空结果产生可见 gap，不算完成 coverage；下一轮模型或基线可选其他 provider；
-5. 网络、capability、side effect 和预算拒绝发生在调用前，attempts 为 0；
-6. 只有 read-only 工具允许按明确 exception 类型自动 retry；每个网络 attempt 都单独计数；
-7. planning/synthesis 降级分别产生 `model_planner_fallback` / `llm_synthesis_fallback`。
+3. 空结果产生可见 gap，不算完成 coverage；
+4. 网络、capability、side effect 和预算拒绝发生在调用前，attempts 为 0；
+5. 只有 read-only 工具允许按明确 exception 类型自动 retry；每个网络 attempt 都单独计数。
 
-真实 LLM参与了主备 RAG 完成后的合成和模型网络拒绝后的降级验证。retry、预算耗尽、side-effect 拒绝、秘密脱敏等精确边界由自动化故障注入覆盖，因为让远端模型制造这些条件既不稳定也没有额外证明力。
+retry、预算耗尽、side-effect 拒绝、秘密脱敏等精确边界由自动化故障注入覆盖，因为让远端模型制造这些条件既不稳定也没有额外证明力。
 
 ## 5. Checkpoint 恢复语义
 

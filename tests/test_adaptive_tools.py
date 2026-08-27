@@ -2,18 +2,14 @@ from __future__ import annotations
 
 import math
 import statistics
-import tempfile
 import unittest
-from pathlib import Path
+
+from llm_fixtures import llm_backed_agent, llm_research_request
 
 from mas_finance.agent import CoverageAssessor, ResearchRequest
-from mas_finance.config import AppConfig
 from mas_finance.context import FinancialContextAssembler
 from mas_finance.contracts import Evidence, EvidenceBundle, SourceRef, SourceType
-from mas_finance.graph import FinancialResearchAgent
 from mas_finance.harness import ToolHarness
-from mas_finance.knowledge import finance_knowledge_harness_tool
-from mas_finance.llm import LLMSettings
 from mas_finance.macro import FREDEvidenceAdapter
 from mas_finance.market import MarketHistoryEvidenceAdapter
 from mas_finance.metrics import (
@@ -25,7 +21,6 @@ from mas_finance.metrics import (
 )
 from mas_finance.research import FinancialIntent, FinancialQueryAnalyzer
 from mas_finance.sec import SECRecentFilingsAdapter
-from mas_finance.service import FinanceAnalysisService
 
 
 class MetricToolTests(unittest.TestCase):
@@ -163,8 +158,8 @@ class MetricToolTests(unittest.TestCase):
     def test_natural_language_calculation_is_planned_as_a_tool(self) -> None:
         harness = ToolHarness()
         harness.register(financial_calculation_harness_tool())
-        outcome = FinancialResearchAgent(harness).run(
-            ResearchRequest(
+        outcome = llm_backed_agent(harness).run(
+            llm_research_request(
                 query="计算 CAGR，beginning=100, ending=150, years=3",
                 require_documents=False,
                 require_market_data=False,
@@ -272,23 +267,23 @@ class AdaptiveScopeTests(unittest.TestCase):
         history = next(item for item in scope.requirements if item.key == "market_history:Apple")
         self.assertEqual(history.parameters["range"], "5y")
 
-    def test_finance_definition_uses_curated_knowledge_tool(self) -> None:
-        harness = ToolHarness()
-        harness.register(finance_knowledge_harness_tool())
-        outcome = FinancialResearchAgent(harness).run(
-            ResearchRequest(
+    def test_finance_definition_answers_without_curated_knowledge_tool(self) -> None:
+        outcome = llm_backed_agent(ToolHarness()).run(
+            llm_research_request(
                 query="什么是市盈率，应该如何理解？",
                 require_documents=False,
                 require_market_data=False,
                 require_regulatory_data=False,
-                run_id="pe-knowledge",
+                run_id="pe-concept",
             )
         )
         self.assertEqual(outcome.status, "succeeded")
-        self.assertEqual(outcome.state.observations[0].task.tool_name, "finance.knowledge")
-        evidence = next(iter(outcome.state.bundle.evidence.values()))
-        self.assertEqual(evidence.entity, "pe_ratio")
-        self.assertIn("curated_finance_knowledge", evidence.tags)
+        self.assertEqual(outcome.state.observations, [])
+        self.assertFalse(outcome.state.bundle.evidence)
+        self.assertTrue(outcome.state.bundle.claims)
+        claim = next(iter(outcome.state.bundle.claims.values()))
+        self.assertEqual(claim.status.value, "inferred")
+        self.assertEqual(claim.evidence_ids, ())
 
 
 class DataAdapterTests(unittest.TestCase):
@@ -456,53 +451,6 @@ class ContextAndMemoryTests(unittest.TestCase):
         self.assertTrue(all("provider" in item["source"] for item in payload["evidence"]))
         self.assertNotIn("forbidden", payload["thread_context"])
         self.assertEqual(manifest.omitted_evidence_count, 0)
-
-    def test_service_reuses_only_minimal_thread_context(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            db_path = root / "finance.db"
-            config = AppConfig(
-                output_dir=root / "outputs",
-                upload_dir=root / "uploads",
-                db_path=db_path,
-                database_url=f"sqlite:///{db_path.as_posix()}",
-                redis_url=None,
-                redis_queue_name="test",
-                market_data_provider="offline",
-                alphavantage_api_key=None,
-                host="127.0.0.1",
-                port=8000,
-                api_key=None,
-                llm=LLMSettings(None, "https://api.deepseek.com", "deepseek-v4-flash", 10),
-                allow_network=False,
-                conversation_memory_enabled=True,
-            )
-            service = FinanceAnalysisService(config)
-            service.analyze(
-                "解释 Apple 的市盈率",
-                thread_id="follow-up",
-                entities=["Apple"],
-                export_artifacts=False,
-            )
-            second = service.analyze(
-                "那它的最大回撤呢？",
-                thread_id="follow-up",
-                export_artifacts=False,
-            )
-            request = second["result"]["request"]
-            self.assertEqual(request["entities"], ["Apple"])
-            self.assertEqual(request["thread_context"]["focus_entities"], ["Apple"])
-            self.assertEqual(
-                request["thread_context"]["reference_resolution"],
-                {
-                    "current_entities": [],
-                    "previous_focus": ["Apple"],
-                    "resolved_entities": ["Apple"],
-                    "history_reference_used": True,
-                },
-            )
-            self.assertEqual(request["thread_context"]["recent_events"][0]["content"], "解释 Apple 的市盈率")
-            self.assertFalse(request["thread_context"]["manifest"]["memory_is_evidence"])
 
 
 if __name__ == "__main__":

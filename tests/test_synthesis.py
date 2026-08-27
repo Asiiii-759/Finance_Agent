@@ -142,17 +142,62 @@ class SynthesisTests(unittest.TestCase):
         with self.assertRaises(httpx.HTTPStatusError):
             redirect.chat("system", "user", max_tokens=8)
 
-    def test_literal_quote_allows_evidence_bound_claim(self) -> None:
+    def test_parametric_claim_allowed_without_evidence(self) -> None:
+        class ConceptLLM:
+            backend_name = "concept"
+
+            def chat(self, system_prompt, user_prompt, temperature=0.0, max_tokens=1400):
+                del system_prompt, user_prompt, temperature, max_tokens
+                return json.dumps(
+                    {
+                        "claims": [
+                            {
+                                "text": "市盈率等于股价除以每股收益，高低本身不是买卖信号。",
+                                "evidence_ids": [],
+                                "evidence_quote": "",
+                            }
+                        ]
+                    }
+                )
+
+        synthesizer = EvidenceBoundLLMSynthesizer(ConceptLLM())
+        claims = synthesizer.synthesize(ResearchRequest(query="什么是市盈率？"), EvidenceBundle())
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0].status.value, "inferred")
+        self.assertEqual(claims[0].evidence_ids, ())
+        self.assertIn("未经检索核验", claims[0].caveat)
+
+    def test_cited_claim_without_literal_quote_is_rejected(self) -> None:
+        class FakeCiteLLM:
+            backend_name = "fake-cite"
+
+            def chat(self, system_prompt, user_prompt, temperature=0.0, max_tokens=1400):
+                payload = json.loads(user_prompt)
+                item = payload["evidence"][0]
+                return json.dumps(
+                    {
+                        "claims": [
+                            {
+                                "text": "这段话没有出现在证据里。",
+                                "evidence_ids": [item["evidence_id"]],
+                                "evidence_quote": "this quote is not in the source",
+                            }
+                        ]
+                    }
+                )
+
+        synthesizer = EvidenceBoundLLMSynthesizer(FakeCiteLLM())
+        with self.assertRaisesRegex(RuntimeError, "LLM synthesis was unusable"):
+            synthesizer.synthesize(ResearchRequest(query="demand"), evidence_bundle())
         synthesizer = EvidenceBoundLLMSynthesizer(GoodLLM())
         claims = synthesizer.synthesize(ResearchRequest(query="demand"), evidence_bundle())
         self.assertEqual(claims[0].text, "ACME described demand as resilient.")
         self.assertEqual(synthesizer.diagnostics(), ())
 
-    def test_invalid_model_output_is_visible_and_falls_back(self) -> None:
+    def test_invalid_model_output_fails_fast(self) -> None:
         synthesizer = EvidenceBoundLLMSynthesizer(BadLLM())
-        claims = synthesizer.synthesize(ResearchRequest(query="demand"), evidence_bundle())
-        self.assertTrue(claims)
-        self.assertEqual(synthesizer.diagnostics()[0]["code"], "llm_synthesis_fallback")
+        with self.assertRaisesRegex(RuntimeError, "LLM synthesis was unusable"):
+            synthesizer.synthesize(ResearchRequest(query="demand"), evidence_bundle())
 
     def test_llm_call_uses_harness_and_omits_prompts_from_audit(self) -> None:
         harness = ToolHarness()

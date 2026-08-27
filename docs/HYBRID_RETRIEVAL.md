@@ -19,7 +19,7 @@ query + authorized chunks                         ├─ RRF(k=60) ─ top-k ─
 lexical 工具，不把 BM25 结果标成 hybrid/RRF。
 
 这不是固定 workflow。模型从动态工具目录自主选择 lexical、hybrid、企业 RAG、网页或其他金融工具；Harness
-只限制执行边界。无模型或模型计划失败时，规则基线在 embedding 可用且网络已授权时优先 hybrid，再尝试 lexical。
+只限制执行边界。
 
 ## 2. 为什么必须双路
 

@@ -102,7 +102,7 @@ Evidence、网页、PDF、RAG chunk、thread memory 和 provider error 都标记
 - 生成前：计算 coverage、对齐期间/实体、派生可验证比率、恢复已被备用来源覆盖的 gap；
 - 生成后：检查 claim/evidence 引用、报告 citation、冲突、gap 和必需 section。
 
-模型选择 `finish` 不等于流程结束。若 requirements 仍缺失且尚有预算，validation 路由回 planning。模型执行工具后即使最低 coverage 已满足，也会获得一次基于新 Evidence 的后续规划机会；只有模型明确 finish 或到达硬预算才进入生成。确定性规则 planner 不需要这次确认调用。
+模型选择 `finish` 不等于流程结束。若 requirements 仍缺失且尚有预算，validation 路由回 planning。模型执行工具后即使最低 coverage 已满足，也会获得一次基于新 Evidence 的后续规划机会；只有模型明确 finish 或到达硬预算才进入生成。
 达到迭代/工具预算、没有可用 provider 或覆盖完成时，才进入 final generation。
 
 ### 3.4 `final_generation`
@@ -117,19 +117,10 @@ Evidence、网页、PDF、RAG chunk、thread memory 和 provider error 都标记
 
 算术仍由 `finance.calculate` 或确定性 derived-ratio 函数完成，模型不直接计算金融指标。
 
-## 4. ModelPlanner 与规则基线
+## 4. ModelPlanner 是唯一规划路径
 
-部署配置了模型时，`ModelPlanner` 是首选 planner。以下情况才调用 `AdaptivePlanner`：
-
-- 没有可用模型；
-- `llm.plan` 被网络或模型预算拒绝；
-- 模型返回非 JSON；
-- 模型选择未注册工具；
-- 参数缺失、多余或非有限；
-- provider/model 调用失败。
-
-降级不会静默发生，状态中会出现 `model_planner_fallback`。规则 planner 不是正常主路线，也不替模型做开放式判断；
-它保证计算、显式文档、行情、SEC、宏观和知识等已知需求在模型不可用时仍可工作。
+研究请求必须配置 LLM。`ModelPlanner` 在模型返回非 JSON、选择未注册工具、参数非法或调用失败时快速失败，
+不调用规则 planner，也不产生 `model_planner_fallback`。
 
 模型重复相同 tool+arguments 时会得到相同 task ID，已观察动作不会再次执行，并记录
 `repeated_planner_action`。这防止低质量循环浪费 provider 费用。
@@ -231,7 +222,6 @@ Yahoo 不是全局默认路线。行情工具是否存在取决于部署注册�
 - `macro.fred_series`：宏观；
 - `corpus.search` 和注入式 retrieval tools：上传、session 或企业 RAG；
 - `web.search`：开放检索；
-- `finance.knowledge`：版本化金融定义；
 - `finance.calculate`：白名单计算。
 
 模型看到的是本次实际注册目录，不会看到缺少凭据或部署未启用的 SEC、FRED、RAG、搜索工具。行情的 offline
@@ -256,7 +246,8 @@ LangGraph checkpointer 不是长期用户记忆。它可能包含敏感 evidence
 自动化测试覆盖：
 
 - 图中只有四个业务节点；
-- 模型真实选择 `finance.knowledge`；
+- 模型真实选择 `finance.calculate` 等目录内工具；
+- 概念题可以不调用研究工具直接合成；
 - 模型自主选择 `web.search`；
 - validation 拒绝过早 `finish`；
 - 未注册任意 URL 工具被拒绝并可见降级；
@@ -267,9 +258,7 @@ LangGraph checkpointer 不是长期用户记忆。它可能包含敏感 evidence
 - Bocha/Brave 固定认证 origin、查询参数和结果 schema；
 - 总计 140 项金融、hybrid RAG、OCR、API、安全、恢复、记忆、上下文和自主规划测试。
 
-2026-08-12 的真实 DeepSeek 小规模测试中，模型在一个 planning call 内从动态目录选择了
-`finance.knowledge`，随后系统获得 1 条 evidence 和 1 条 supported claim；audit 顺序为
-`llm.plan → finance.knowledge`，无 gap。
+2026-08-12 的真实 DeepSeek 小规模测试中，当时目录仍包含 `finance.knowledge`。现行契约已删除该内置词库，概念题改为模型直接合成。
 
 ## 11. 仍然明确存在的边界
 

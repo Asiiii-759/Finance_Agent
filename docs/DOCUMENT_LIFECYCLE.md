@@ -128,7 +128,7 @@ query + top_k + server-owned filters + optional diversify_documents
 
 对话记忆保存 user/tool/assistant 事件，并将 LLM 旧摘要、最近 20K token 完整 run 和确定性实体/焦点状态作为有界非证据上下文，用于理解多轮意图与指代；它不是事实来源。会话或个人文档正文只在用户显式启用时进入当次 corpus，检索出的有限 evidence cards 才会进入 LLM 上下文。未召回页面、原 PDF、密钥和模型隐藏推理都不会进入 prompt。
 
-文档内文本始终是不可信数据，即使包含“忽略系统规则”也不能注册工具、改变网络权限或扩大预算。LLM 输出还必须提供 context manifest 内 evidence 的逐字 quote；失败时使用确定性合成并暴露 gap。
+文档内文本始终是不可信数据，即使包含“忽略系统规则”也不能注册工具、改变网络权限或扩大预算。LLM 输出还必须提供 context manifest 内 evidence 的逐字 quote；失败时合成快速失败。
 
 ## 7. 已验证场景
 

@@ -10,6 +10,7 @@ from ..config import AppConfig
 from ..documents import PDFDocumentParser
 from ..embeddings import EmbeddingProvider
 from ..harness import Tool
+from ..llm import BaseLLMClient
 from ..logging_utils import configure_logging, request_logging_middleware
 from ..memory_store import ConversationSummarizer, PersonalMemoryKind, TokenCounter
 from ..retrieval import RetrievalSource
@@ -37,6 +38,7 @@ def create_app(
     embedding_provider: EmbeddingProvider | None = None,
     conversation_summarizer: ConversationSummarizer | None = None,
     conversation_token_counter: TokenCounter | None = None,
+    llm_client: BaseLLMClient | None = None,
 ) -> FastAPI:
     configure_logging()
     app_config = config or AppConfig.from_env()
@@ -49,6 +51,7 @@ def create_app(
         embedding_provider=embedding_provider,
         conversation_summarizer=conversation_summarizer,
         conversation_token_counter=conversation_token_counter,
+        llm_client=llm_client,
     )
     auth_dependency = build_api_key_dependency(app_config.api_key)
 
@@ -115,7 +118,7 @@ def create_app(
 
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
-        backend = "deepseek" if app_config.llm.api_key else "deterministic"
+        backend = "deepseek" if app_config.llm.api_key else "missing"
         return HealthResponse(status="ok", llm_backend=backend)
 
     @app.get("/api/v1/config")
@@ -269,6 +272,8 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         return analyze_response(response)
 
     @app.post("/api/v1/analyze-upload", response_model=AnalyzeResponse)
@@ -307,6 +312,8 @@ def create_app(
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
         finally:
             for saved_path in saved_paths:
                 Path(saved_path).unlink(missing_ok=True)

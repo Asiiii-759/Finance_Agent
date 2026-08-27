@@ -5,6 +5,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+from llm_fixtures import research_service
 from pdf_fixtures import MCPPDFParserFixture, write_stub_pdf
 
 from mas_finance.config import AppConfig
@@ -13,7 +14,6 @@ from mas_finance.corpus import InMemoryCorpus
 from mas_finance.harness import SideEffect, ToolArgumentContract, ToolResultKind, ToolSpec, function_tool
 from mas_finance.llm import LLMSettings
 from mas_finance.retrieval import RetrievalEvidenceAdapter, RetrievalSource
-from mas_finance.service import FinanceAnalysisService
 
 
 def make_config(root: Path, *, allow_network: bool = False) -> AppConfig:
@@ -104,7 +104,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
                 }
             )
             embedding = SemanticEmbedding()
-            service = FinanceAnalysisService(
+            service = research_service(
                 make_config(root),
                 embedding_provider=embedding,
                 pdf_document_parser=parser,
@@ -145,7 +145,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
                 {pdf_path.name: {1: "My treasury rule requires ample cash reserves before any private investment."}}
             )
             embedding = SemanticEmbedding()
-            service = FinanceAnalysisService(
+            service = research_service(
                 make_config(root),
                 embedding_provider=embedding,
                 pdf_document_parser=parser,
@@ -193,7 +193,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
                     ValueError,
                     "read-only canonical evidence",
                 ):
-                    FinanceAnalysisService(config, evidence_tools=(tool,))
+                    research_service(config, evidence_tools=(tool,))
 
     def test_deployment_evidence_tool_can_inject_mcp_shaped_read_only_capability(self) -> None:
         source = SourceRef.create(
@@ -218,7 +218,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             lambda _arguments, _context: {"bundle": bundle.to_dict(), "gaps": []},
         )
         with tempfile.TemporaryDirectory() as directory:
-            service = FinanceAnalysisService(make_config(Path(directory)), evidence_tools=(tool,))
+            service = research_service(make_config(Path(directory)), evidence_tools=(tool,))
             result = service.analyze(
                 "根据组合政策说明单一发行人限额",
                 require_documents=True,
@@ -241,13 +241,13 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
                 }
             )
 
-            first = FinanceAnalysisService(
+            first = research_service(
                 make_config(root), pdf_document_parser=parser, pdf_parser_network_access=False
             )
             stored = first.ingest_personal_documents([str(pdf_path)], user_id="alice")
             first.close()
 
-            second = FinanceAnalysisService(make_config(root))
+            second = research_service(make_config(root))
             result = second.analyze(
                 "根据我的知识库，duration、convexity 和 credit spread 要怎么检查？",
                 require_documents=True,
@@ -266,8 +266,11 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
                 export_artifacts=False,
                 user_id="bob",
             )["result"]
-            self.assertEqual(hidden["status"], "degraded")
-            self.assertIn("document:query", hidden["coverage"]["missing"])
+            self.assertEqual(hidden["status"], "failed")
+            self.assertTrue(
+                any(str(item).startswith("document:") for item in hidden["coverage"]["missing"]),
+                hidden["coverage"]["missing"],
+            )
             self.assertNotIn(
                 "personal_knowledge",
                 {item["source"]["provider"] for item in hidden["bundle"]["evidence"]},
@@ -281,7 +284,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             pdf_path = root / "bounded.pdf"
             write_stub_pdf(pdf_path)
             parser = MCPPDFParserFixture({pdf_path.name: {1: "Bounded session document text."}})
-            service = FinanceAnalysisService(
+            service = research_service(
                 replace(make_config(root), max_session_document_sessions=1),
                 pdf_document_parser=parser,
                 pdf_parser_network_access=False,
@@ -310,7 +313,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             parser = MCPPDFParserFixture(
                 {pdf_path.name: {1: "ACME covenant headroom narrowed to 18 million in the second quarter."}}
             )
-            service = FinanceAnalysisService(
+            service = research_service(
                 make_config(root), pdf_document_parser=parser, pdf_parser_network_access=False
             )
 
@@ -343,7 +346,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
     def test_session_documents_require_explicit_thread_and_are_namespace_isolated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            service = FinanceAnalysisService(make_config(root))
+            service = research_service(make_config(root))
             with self.assertRaisesRegex(ValueError, "thread_id is required"):
                 service.analyze(
                     "分析会话文档",
@@ -353,7 +356,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
 
             pdf_path = root / "private.pdf"
             write_stub_pdf(pdf_path)
-            service = FinanceAnalysisService(
+            service = research_service(
                 make_config(root),
                 pdf_document_parser=MCPPDFParserFixture(
                     {pdf_path.name: {1: "Tenant A private liquidity forecast."}}
@@ -385,7 +388,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             write_stub_pdf(pdf_path)
 
             with self.assertRaisesRegex(ValueError, "PaddleOCR or MCP"):
-                FinanceAnalysisService(make_config(root)).analyze(
+                research_service(make_config(root)).analyze(
                     "分析扫描件中的风险",
                     document_paths=[str(pdf_path)],
                     export_artifacts=False,
@@ -405,7 +408,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             pdf_path = root / "scan.pdf"
             write_stub_pdf(pdf_path)
             ocr = OCR()
-            service = FinanceAnalysisService(
+            service = research_service(
                 make_config(root, allow_network=True),
                 pdf_document_parser=ocr,
                 pdf_parser_network_access=True,
@@ -447,7 +450,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
                 }
             )
 
-            response = FinanceAnalysisService(
+            response = research_service(
                 make_config(root), pdf_document_parser=parser, pdf_parser_network_access=False
             ).analyze(
                 "根据这份 PDF，ACME 的主要风险是什么？",
@@ -478,7 +481,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
                 provider="enterprise_credit_corpus",
                 fixed_filters={"tenant_id": "tenant-a", "acl_group": "research"},
             )
-            service = FinanceAnalysisService(make_config(root), retrieval_sources=(source,))
+            service = research_service(make_config(root), retrieval_sources=(source,))
 
             response = service.analyze(
                 "根据内部文档说明 ACME 的 covenant 风险",
@@ -507,7 +510,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             client = EvidenceRAGClient()
-            service = FinanceAnalysisService(
+            service = research_service(
                 make_config(root),
                 retrieval_sources=(RetrievalSource("internal.search", client, "internal"),),
             )
@@ -548,7 +551,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             root = Path(directory)
             empty = EvidenceRAGClient(empty=True)
             useful = EvidenceRAGClient()
-            service = FinanceAnalysisService(
+            service = research_service(
                 make_config(root),
                 retrieval_sources=(
                     RetrievalSource("internal.primary", empty, "primary"),
@@ -569,7 +572,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             self.assertEqual(useful.calls, 1)
 
             remote = EvidenceRAGClient()
-            denied_service = FinanceAnalysisService(
+            denied_service = research_service(
                 make_config(root, allow_network=True),
                 retrieval_sources=(RetrievalSource("external.web_search", remote, "web", network_access=True),),
             )
@@ -601,14 +604,14 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = make_config(Path(directory))
             with self.assertRaisesRegex(ValueError, "unique"):
-                FinanceAnalysisService(config, retrieval_sources=(source, source))
+                research_service(config, retrieval_sources=(source, source))
             with self.assertRaisesRegex(ValueError, "reserved"):
-                FinanceAnalysisService(
+                research_service(
                     config,
                     retrieval_sources=(RetrievalSource("corpus.search", client, "bad"),),
                 )
             with self.assertRaisesRegex(ValueError, "at most four"):
-                FinanceAnalysisService(
+                research_service(
                     config,
                     retrieval_sources=tuple(
                         RetrievalSource(f"internal.search_{index}", client, f"provider-{index}") for index in range(5)

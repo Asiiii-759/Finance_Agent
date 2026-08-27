@@ -8,7 +8,6 @@ from mas_finance.agent import ResearchRequest
 from mas_finance.contracts import Evidence, EvidenceBundle, SourceRef, SourceType
 from mas_finance.graph import FinancialResearchAgent
 from mas_finance.harness import ToolHarness
-from mas_finance.knowledge import finance_knowledge_harness_tool
 from mas_finance.llm import BaseLLMClient
 from mas_finance.mcp import (
     MCPHost,
@@ -22,6 +21,7 @@ from mas_finance.mcp_servers.market import (
     parse_biying_history,
     parse_biying_realtime,
 )
+from mas_finance.metrics import financial_calculation_harness_tool
 from mas_finance.planning import ModelPlanner, llm_planning_harness_tool
 
 
@@ -116,7 +116,7 @@ class ProgressiveDiscoveryTests(unittest.TestCase):
         host.connect()
         try:
             harness = ToolHarness()
-            harness.register(finance_knowledge_harness_tool())
+            harness.register(financial_calculation_harness_tool())
             for tool in host.tools():
                 harness.register(tool)
             for tool in mcp_discovery_tools(host):

@@ -17,7 +17,6 @@ from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
 from .agent import (
-    AdaptivePlanner,
     AgentPhase,
     CoverageAssessor,
     DeterministicSynthesizer,
@@ -40,7 +39,29 @@ from .calculator import derive_standard_ratios
 from .contracts import EvidenceBundle, stable_id
 from .harness import ExecutionPolicy, SideEffect, ToolContext, ToolHarness, ToolSpec
 from .research import FinancialQueryAnalyzer
+from .task_frame import LLMTaskInterpreter
 from .validators import Severity, validate_research_output
+
+_GROUNDING_CATEGORIES = frozenset(
+    {
+        "document",
+        "market",
+        "market_history",
+        "regulatory",
+        "filings",
+        "macro",
+        "calculation",
+        "derived_metric",
+        "web",
+        "unsupported",
+    }
+)
+
+
+def _requires_grounding(state: ResearchState) -> bool:
+    if state.scope is None:
+        return False
+    return any(item.category in _GROUNDING_CATEGORIES for item in state.scope.requirements)
 
 
 class FinancialGraphState(TypedDict, total=False):
@@ -55,10 +76,11 @@ class FinancialResearchAgent:
         self,
         harness: ToolHarness,
         *,
-        planner: Planner | None = None,
+        planner: Planner,
         synthesizer: Synthesizer | None = None,
         assessor: CoverageAssessor | None = None,
         scope_analyzer: FinancialQueryAnalyzer | None = None,
+        task_interpreter: LLMTaskInterpreter | None = None,
         checkpointer: BaseCheckpointSaver[Any] | None = None,
         allowed_capabilities: frozenset[str] = frozenset(
             {
@@ -76,10 +98,11 @@ class FinancialResearchAgent:
         planner_hidden_tool_names: frozenset[str] = frozenset(),
     ) -> None:
         self.harness = harness
-        self.planner = planner or AdaptivePlanner()
+        self.planner = planner
         self.synthesizer = synthesizer or DeterministicSynthesizer()
         self.assessor = assessor or CoverageAssessor()
         self.scope_analyzer = scope_analyzer or FinancialQueryAnalyzer()
+        self.task_interpreter = task_interpreter
         self.allowed_capabilities = allowed_capabilities
         self.planner_hidden_tool_names = planner_hidden_tool_names
         self.checkpointer = checkpointer or InMemorySaver()
@@ -143,6 +166,18 @@ class FinancialResearchAgent:
     def _intent_node(self, graph_state: FinancialGraphState) -> dict[str, Any]:
         request = ResearchRequest.from_dict(graph_state["request"])
         self.harness.clear_run(request.run_id)
+        if self.task_interpreter is not None:
+            frame = self.task_interpreter.interpret(request, self._planner_catalog())
+            state = ResearchState(
+                request=request,
+                scope=frame.scope,
+                task_frame=frame.to_dict(),
+                phase=AgentPhase.INTENT,
+            )
+            if frame.requires_clarification:
+                state.stop_reason = StopReason.CLARIFICATION_REQUIRED
+                state.report = f"需要澄清后才能继续：{frame.clarification_question}"
+            return {"research": state.to_dict()}
         state = ResearchState(
             request=request,
             scope=self.scope_analyzer.analyze(request),
@@ -240,6 +275,9 @@ class FinancialResearchAgent:
     def _validation_node(self, graph_state: FinancialGraphState) -> dict[str, Any]:
         state = self._state(graph_state)
         state.phase = AgentPhase.VALIDATING
+        if state.stop_reason is StopReason.CLARIFICATION_REQUIRED:
+            state.phase = AgentPhase.COMPLETED
+            return self._update(state)
         if state.report:
             validation = validate_research_output(
                 bundle=state.bundle,
@@ -251,7 +289,7 @@ class FinancialResearchAgent:
                 state.phase = AgentPhase.FAILED
                 state.stop_reason = StopReason.VALIDATION_FAILED
                 state.report = render_report(state)
-            elif not state.bundle.evidence:
+            elif not state.bundle.evidence and not state.bundle.claims:
                 state.phase = AgentPhase.FAILED
                 state.stop_reason = StopReason.NO_EVIDENCE
             else:
@@ -261,11 +299,14 @@ class FinancialResearchAgent:
         derive_standard_ratios(state.bundle)
         state.coverage = self.assessor.assess(state.request, state.bundle, state.scope)
         self._resolve_recovered_gaps(state)
+        if self._only_unsupported_requirements_remain(state):
+            self._mark_no_available_action(state)
+            return self._update(state)
         planner_finish_required = bool(getattr(self.planner, "requires_explicit_finish", False))
         model_declared_finish = bool(state.plans and state.plans[-1].ready_for_validation)
         if (
             state.coverage.complete
-            and state.bundle.evidence
+            and (state.bundle.evidence or not _requires_grounding(state))
             and (
                 not planner_finish_required
                 or model_declared_finish
@@ -280,8 +321,6 @@ class FinancialResearchAgent:
     def _final_generation_node(self, graph_state: FinancialGraphState) -> dict[str, Any]:
         state = self._state(graph_state)
         state.phase = AgentPhase.FINAL_GENERATION
-        if not state.bundle.evidence:
-            state.stop_reason = StopReason.NO_EVIDENCE
         derive_standard_ratios(state.bundle)
         state.bundle.claims.clear()
         claims = reconcile_conflicts(
@@ -290,6 +329,7 @@ class FinancialResearchAgent:
                 state.request,
                 state.bundle,
                 research_context={
+                    "task_frame": state.task_frame,
                     "scope": state.scope.to_dict() if state.scope else None,
                     "coverage": state.coverage.to_dict() if state.coverage else None,
                     "unresolved_gaps": [gap.to_dict() for gap in state.gaps if not gap.resolved],
@@ -297,6 +337,10 @@ class FinancialResearchAgent:
                 },
             ),
         )
+        if not state.bundle.evidence and _requires_grounding(state):
+            # 需要检索或计算时，不允许把无引用的概念判断当成已完成答案。
+            state.stop_reason = StopReason.NO_EVIDENCE
+            claims = []
         diagnostics = getattr(self.synthesizer, "diagnostics", lambda: ())()
         context_manifest = getattr(self.synthesizer, "context_manifest", lambda: None)()
         if context_manifest:
@@ -402,7 +446,7 @@ class FinancialResearchAgent:
 
     def _mark_no_available_action(self, state: ResearchState) -> None:
         state.coverage = self.assessor.assess(state.request, state.bundle, state.scope)
-        if state.coverage.complete and state.bundle.evidence:
+        if state.coverage.complete and (state.bundle.evidence or not _requires_grounding(state)):
             state.stop_reason = StopReason.COVERAGE_SATISFIED
             return
         requirements = {item.key: item for item in state.scope.requirements} if state.scope else {}
@@ -440,6 +484,14 @@ class FinancialResearchAgent:
                     )
                 )
         state.stop_reason = StopReason.NO_AVAILABLE_ACTION
+
+    def _only_unsupported_requirements_remain(self, state: ResearchState) -> bool:
+        if not state.scope or not state.coverage or not state.coverage.missing:
+            return False
+        requirements = {item.key: item for item in state.scope.requirements}
+        return all(
+            key in requirements and requirements[key].category == "unsupported" for key in state.coverage.missing
+        )
 
     @staticmethod
     def _unfinished_plan(state: ResearchState, observed: set[str]) -> ResearchPlan | None:
@@ -525,12 +577,15 @@ class FinancialResearchAgent:
         if state.coverage is None:
             return
         missing = set(state.coverage.missing)
-        task_by_id = {item.task.task_id: item.task for item in state.observations}
         updated: list[ResearchGap] = []
         for gap in state.gaps:
-            task = task_by_id.get(gap.task_id or "")
-            requirement = task.requirement_key or f"{task.category}:{task.entity or 'query'}" if task else None
-            recovered = gap.resolvable and requirement is not None and requirement not in missing
+            if gap.resolved or not gap.resolvable:
+                updated.append(gap)
+                continue
+            # 只有明确对应到某个 requirement 且该需求已覆盖时，才把可恢复缺口标成已解决。
+            # 模型计划通常不带 requirement_key；此时不能用 category:entity 去猜，
+            # 否则 `market:Apple` 对不上 `market:Apple:1`，未覆盖的 network_denied 也会被误标 resolved。
+            recovered = gap.requirement_key not in missing if gap.requirement_key is not None else not missing
             updated.append(
                 ResearchGap(
                     code=gap.code,
@@ -540,7 +595,7 @@ class FinancialResearchAgent:
                     tool_name=gap.tool_name,
                     task_id=gap.task_id,
                     resolvable=gap.resolvable,
-                    resolved=gap.resolved or recovered,
+                    resolved=recovered,
                 )
             )
         state.gaps = updated

@@ -24,6 +24,7 @@ class AgentPhase(StrEnum):
 
 
 class StopReason(StrEnum):
+    CLARIFICATION_REQUIRED = "clarification_required"
     COVERAGE_SATISFIED = "coverage_satisfied"
     MAX_ITERATIONS = "max_iterations"
     TOOL_BUDGET_EXHAUSTED = "tool_budget_exhausted"
@@ -338,6 +339,7 @@ class CoverageDecision:
 class ResearchState:
     request: ResearchRequest
     scope: ResearchScope | None = None
+    task_frame: dict[str, Any] | None = None
     phase: AgentPhase = AgentPhase.INTENT
     iteration: int = 0
     plans: list[ResearchPlan] = field(default_factory=list)
@@ -353,9 +355,10 @@ class ResearchState:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "request": self.request.to_dict(),
             "scope": self.scope.to_dict() if self.scope else None,
+            "task_frame": dict(self.task_frame) if self.task_frame else None,
             "phase": self.phase.value,
             "iteration": self.iteration,
             "plans": [plan.to_dict() for plan in self.plans],
@@ -372,11 +375,12 @@ class ResearchState:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ResearchState:
-        if int(value.get("schema_version", 0)) != 3:
+        if int(value.get("schema_version", 0)) not in {3, 4}:
             raise ValueError("unsupported checkpoint schema")
         return cls(
             request=ResearchRequest.from_dict(value["request"]),
             scope=ResearchScope.from_dict(value["scope"]) if value.get("scope") else None,
+            task_frame=dict(value["task_frame"]) if value.get("task_frame") else None,
             phase=AgentPhase(str(value["phase"])),
             iteration=int(value.get("iteration", 0)),
             plans=[ResearchPlan.from_dict(item) for item in value.get("plans") or ()],
@@ -404,130 +408,6 @@ class Synthesizer(Protocol):
         *,
         research_context: Mapping[str, Any] | None = None,
     ) -> Sequence[Claim]: ...
-
-
-class AdaptivePlanner:
-    """Requirement-driven planner with ordered fallback providers."""
-
-    def __init__(
-        self,
-        *,
-        document_tools: Sequence[str] = ("corpus.search",),
-        market_tools: Sequence[str] = ("market.snapshot",),
-        market_history_tools: Sequence[str] = ("market.history",),
-        regulatory_tools: Sequence[str] = ("sec.company_facts",),
-        filing_tools: Sequence[str] = ("sec.recent_filings",),
-        macro_tools: Sequence[str] = ("macro.fred_series",),
-        calculation_tools: Sequence[str] = ("finance.calculate",),
-        web_tools: Sequence[str] = ("web.search",),
-    ) -> None:
-        self.document_tools = tuple(document_tools)
-        self.market_tools = tuple(market_tools)
-        self.market_history_tools = tuple(market_history_tools)
-        self.regulatory_tools = tuple(regulatory_tools)
-        self.filing_tools = tuple(filing_tools)
-        self.macro_tools = tuple(macro_tools)
-        self.calculation_tools = tuple(calculation_tools)
-        self.web_tools = tuple(web_tools)
-
-    def plan(self, state: ResearchState, available_tools: Mapping[str, ToolSpec]) -> ResearchPlan:
-        attempted = {observation.task.task_id for observation in state.observations}
-        tasks: list[ToolTask] = []
-        scope = state.scope or FinancialQueryAnalyzer().analyze(state.request)
-        missing = set(state.coverage.missing if state.coverage else (item.key for item in scope.requirements))
-        for requirement in scope.requirements:
-            if requirement.key not in missing:
-                continue
-            task = self._first_untried_requirement(
-                state.request,
-                scope,
-                requirement,
-                available_tools,
-                attempted,
-            )
-            if task:
-                tasks.append(task)
-
-        return ResearchPlan(
-            iteration=state.iteration + 1,
-            rationale=(
-                "Select the next untried authorized provider for uncovered requirements: " + ", ".join(sorted(missing))
-            ),
-            tasks=tuple(tasks),
-        )
-
-    def _first_untried_requirement(
-        self,
-        request: ResearchRequest,
-        scope: ResearchScope,
-        requirement: ResearchRequirement,
-        available: Mapping[str, ToolSpec],
-        attempted: set[str],
-    ) -> ToolTask | None:
-        candidates = {
-            "document": self.document_tools,
-            "market": self.market_tools,
-            "market_history": self.market_history_tools,
-            "regulatory": self.regulatory_tools,
-            "filings": self.filing_tools,
-            "macro": self.macro_tools,
-            "calculation": self.calculation_tools,
-            "knowledge": ("finance.knowledge",),
-            "web": self.web_tools,
-        }.get(requirement.category, ())
-        for name in candidates:
-            if name not in available:
-                continue
-            arguments: dict[str, Any]
-            if requirement.category == "document":
-                query = f"{requirement.entity}: {request.query}" if requirement.entity else request.query
-                diversify_documents = _requests_multi_document_synthesis(request.query)
-                arguments = {
-                    "query": query,
-                    "top_k": (
-                        min(20, max(request.top_k, request.available_document_count))
-                        if diversify_documents
-                        else request.top_k
-                    ),
-                }
-                if diversify_documents:
-                    arguments["diversify_documents"] = True
-            elif requirement.category in {"market", "regulatory"}:
-                arguments = {
-                    "company": requirement.entity,
-                    "symbol": request.symbols.get(requirement.entity or ""),
-                    "required_fields": list(requirement.fields),
-                }
-            elif requirement.category in {"filings", "market_history"}:
-                arguments = {
-                    "company": requirement.entity,
-                    "symbol": request.symbols.get(requirement.entity or ""),
-                    **dict(requirement.parameters),
-                }
-            elif requirement.category == "macro":
-                arguments = dict(requirement.parameters)
-            elif requirement.category == "calculation":
-                calculation = next(
-                    item for item in scope.calculations if item.request_id == requirement.parameters.get("request_id")
-                )
-                arguments = {"requests": [calculation.to_dict()]}
-            elif requirement.category == "knowledge":
-                arguments = {"query": request.query, **dict(requirement.parameters)}
-            elif requirement.category == "web":
-                arguments = {"query": request.query, "count": min(request.top_k, 10)}
-            else:
-                continue
-            task = ToolTask.create(
-                tool_name=name,
-                arguments=arguments,
-                reason=requirement.reason,
-                category=requirement.category,
-                entity=requirement.entity,
-                requirement_key=requirement.key,
-            )
-            if task.task_id not in attempted:
-                return task
-        return None
 
 
 def _requests_multi_document_synthesis(query: str) -> bool:
@@ -609,6 +489,20 @@ class DeterministicSynthesizer:
             else:
                 continue
             claims.append(Claim.create(text=text, status=ClaimStatus.SUPPORTED, evidence_ids=(item.evidence_id,)))
+        if not claims and not bundle.evidence:
+            caveat = (
+                "该结论来自概念判断，未经检索核验。"
+                if chinese
+                else "This conclusion is a conceptual judgment and was not verified by retrieval."
+            )
+            prefix = "根据金融概念：" if chinese else "Conceptual answer: "
+            claims.append(
+                Claim.create(
+                    text=f"{prefix}{request.query[:360]}",
+                    status=ClaimStatus.INFERRED,
+                    caveat=caveat,
+                )
+            )
         return claims
 
 
@@ -622,6 +516,9 @@ class CoverageAssessor:
         actual_scope = scope or FinancialQueryAnalyzer().analyze(request)
         missing: list[str] = []
         for requirement in actual_scope.requirements:
+            if requirement.category == "knowledge":
+                # 概念定义由模型自身判断，不强制检索词条。
+                continue
             candidates = self._candidates(requirement, bundle)
             fields = {item.field_name for item in candidates if item.field_name}
             distinct_documents = {
@@ -661,7 +558,6 @@ class CoverageAssessor:
                 item
                 for item in candidates
                 if item.source.source_type == SourceType.DOCUMENT
-                and "curated_finance_knowledge" not in item.tags
             ]
         if requirement.category == "market":
             return [
@@ -698,12 +594,6 @@ class CoverageAssessor:
                 for item in candidates
                 if item.source.source_type == SourceType.CALCULATION and item.field_name in requirement.fields
             ]
-        if requirement.category == "knowledge":
-            return [
-                item
-                for item in candidates
-                if item.source.source_type == SourceType.DOCUMENT and "curated_finance_knowledge" in item.tags
-            ]
         if requirement.category == "web":
             web = [item for item in candidates if item.source.source_type == SourceType.WEB]
             if any(item.source.metadata.get("quality_tier") == "public_authority" for item in web):
@@ -711,6 +601,12 @@ class CoverageAssessor:
             domains = {item.source.metadata.get("domain") for item in web if item.source.metadata.get("domain")}
             return web if len(domains) >= 2 else []
         return []
+
+
+def _claim_requires_degraded_status(claim: Claim) -> bool:
+    if claim.status == ClaimStatus.SUPPORTED:
+        return False
+    return not (claim.status == ClaimStatus.INFERRED and not claim.evidence_ids)
 
 
 @dataclass(frozen=True)
@@ -721,12 +617,18 @@ class ResearchOutcome:
 
     @property
     def status(self) -> str:
-        if self.state.phase == AgentPhase.FAILED or not self.state.bundle.evidence:
+        if self.state.stop_reason is StopReason.CLARIFICATION_REQUIRED:
+            return "needs_clarification"
+        if self.state.phase == AgentPhase.FAILED or self.state.stop_reason is StopReason.NO_EVIDENCE:
             return "failed"
-        has_qualified_claims = any(claim.status != ClaimStatus.SUPPORTED for claim in self.state.bundle.claims.values())
+        if not self.state.bundle.claims and not self.state.bundle.evidence:
+            return "failed"
+        has_degrading_claims = any(
+            _claim_requires_degraded_status(claim) for claim in self.state.bundle.claims.values()
+        )
         if (
             any(not gap.resolved for gap in self.state.gaps)
-            or has_qualified_claims
+            or has_degrading_claims
             or (self.state.coverage and not self.state.coverage.complete)
         ):
             return "degraded"

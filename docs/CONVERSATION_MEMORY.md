@@ -57,7 +57,6 @@ MAS_CONVERSATION_RECENT_TOKENS=20000
 - `focus_entities`：最近一个焦点组。
 - `entity_events`：按时间保存的原子对象/动作记录，最多 100 条；
 - `entity_replay`：本轮真正进入模型的相关或最近事件，最多 20 条；
-- `reference_resolution`：本轮的当前实体、上一焦点、最终解析实体，以及是否真正使用了历史指代。
 
 这些状态由事件账本确定性构建，不让 LLM 提取或改写。原子事件只记录“提到、比较请求、计算请求、工具成功/失败、回答完成”
 等可观察动作，不把结果当作 Evidence。因此即使旧原文已被语义摘要覆盖，“刚刚聊到的那个公司”仍可查到上一个焦点组，
@@ -72,7 +71,7 @@ MAS_CONVERSATION_RECENT_TOKENS=20000
 - “刚刚那个公司/之前那个公司”选择上一个唯一焦点，并可与当前明确实体组合成比较；
 - “继续/呢/what about”可承接当前焦点组。
 
-处理顺序是：读取上轮 `focus_entities` → 检测本轮实体 → 代码解析指代 → 将最终实体写入 `ResearchRequest.entities` → 将 `reference_resolution` 和有界线程上下文一起交给规划与生成模型。当前问题的实体在本轮通过 `ResearchRequest.entities` 进入 prompt，完成后写入事件账本，下轮才出现在 `entity_state/focus_history`。无历史关联的全新无实体问题不注入线程上下文。
+处理顺序是：读取线程摘要、最近事件、`entity_state` 与实体回放 → 交给 LLM TaskFrame 解析本轮目标和指代 → 将 TaskFrame 和有界线程上下文交给规划与生成模型。模型必须为历史实体声明事件来源；多个候选无法可靠区分时返回澄清问题，不调用工具。当前问题的显式或检测实体会进入 `ResearchRequest.entities`，完成后写入事件账本。
 
 ## 5. 删除与 LangGraph checkpoint
 

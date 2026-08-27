@@ -169,7 +169,7 @@ def validate_research_output(
             ValidationIssue(
                 code="no_evidence",
                 severity=Severity.WARNING,
-                message="No evidence was available; the report must remain a failure/gap response.",
+                message="No retrieved evidence was available; conceptual claims were not retrieval-checked.",
             )
         )
     return ValidationResult(tuple(issues))

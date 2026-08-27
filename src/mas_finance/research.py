@@ -8,7 +8,6 @@ from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from .knowledge import detect_finance_concepts
 from .metrics import MetricRequest, infer_metric_requests
 
 
@@ -389,17 +388,6 @@ class FinancialQueryAnalyzer:
                     reason="The question references a known macroeconomic series.",
                 )
             )
-        for concept in concepts if needs_knowledge else ():
-            requirements.append(
-                ResearchRequirement(
-                    key=f"knowledge:{concept}",
-                    category="knowledge",
-                    entity=concept,
-                    fields=("definition",),
-                    parameters={"concepts": [concept], "top_k": 1},
-                    reason="The question asks for a finance definition, formula or interpretation caveat.",
-                )
-            )
         for calculation in calculations:
             requirements.append(
                 ResearchRequirement(
@@ -474,11 +462,11 @@ class FinancialQueryAnalyzer:
                     parameters={"gap_code": "unsupported_research_scope"},
                     reason=(
                         "The question requires an evidence provider outside the currently supported "
-                        "market, filing, macro, document, knowledge, or calculation tools."
+                        "market, filing, macro, document, or calculation tools."
                     ),
                 )
             )
-        elif not has_supported_requirement:
+        elif not has_supported_requirement and not needs_knowledge:
             intents.add(FinancialIntent.GENERAL_RESEARCH)
             requirements.append(
                 ResearchRequirement(
@@ -497,6 +485,44 @@ class FinancialQueryAnalyzer:
                 "using deterministic bilingual finance rules."
             ),
         )
+
+
+# 仅用于意图/字段路由，不是可引用的金融词条正文。
+_CONCEPT_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "interest_rate_transmission",
+        ("interest rate impact", "interest rates", "rate hike", "rate hikes", "利率上升", "利率变化", "加息"),
+    ),
+    ("pe_ratio", ("p/e", "pe ratio", "price to earnings", "市盈率")),
+    ("pb_ratio", ("p/b", "pb ratio", "price to book", "市净率")),
+    ("ps_ratio", ("p/s", "ps ratio", "price to sales", "市销率")),
+    ("ev_ebitda", ("ev/ebitda", "enterprise value", "企业价值倍数")),
+    ("net_margin", ("net margin", "profit margin", "净利率", "净利润率")),
+    ("gross_margin", ("gross margin", "gross profit margin", "毛利率")),
+    ("operating_margin", ("operating margin", "operating profit margin", "营业利润率", "经营利润率")),
+    ("roe", ("roe", "return on equity", "净资产收益率")),
+    ("roa", ("roa", "return on assets", "总资产收益率", "资产回报率")),
+    ("current_ratio", ("current ratio", "流动比率")),
+    ("quick_ratio", ("quick ratio", "acid-test ratio", "速动比率")),
+    ("debt_to_equity", ("debt to equity", "debt-to-equity", "d/e", "产权比率", "债务权益比")),
+    ("cagr", ("cagr", "compound annual growth", "复合增长率", "年复合增长率")),
+    ("volatility", ("volatility", "annualized volatility", "波动率", "年化波动率")),
+    ("sharpe_ratio", ("sharpe", "sharpe ratio", "夏普比率")),
+    ("max_drawdown", ("maximum drawdown", "max drawdown", "最大回撤", "回撤")),
+    ("dcf", ("dcf", "discounted cash flow", "现金流折现", "折现现金流")),
+    ("npv", ("npv", "net present value", "净现值")),
+    ("irr", ("irr", "internal rate of return", "内部收益率")),
+    ("bond_duration", ("duration", "modified duration", "bond duration", "久期", "修正久期")),
+)
+
+
+def detect_finance_concepts(query: str) -> tuple[str, ...]:
+    normalized = query.casefold()
+    return tuple(
+        concept_id
+        for concept_id, aliases in _CONCEPT_ALIASES
+        if any(alias.casefold() in normalized for alias in aliases)
+    )
 
 
 def _market_fields(intents: set[FinancialIntent], concepts: Sequence[str]) -> tuple[str, ...]:

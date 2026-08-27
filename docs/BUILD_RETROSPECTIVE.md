@@ -255,7 +255,7 @@ NIST 的生成式 AI 风险框架指出，模型可能生成错误内容以及�
 3. Request corpus：本次授权上传，不默认跨请求保存；
 4. Session documents：显式 opt-in 的解析页文本，进程内短 TTL，不是永久知识；
 5. Persistent domain corpus：独立 ingestion/ACL/索引控制面，通过 `RetrievalSource` 只读接入；
-6. Versioned finance knowledge：代码管理的领域定义，不是用户记忆。
+6. 概念解释：由模型判断，不是代码内词条，也不是用户记忆。
 
 任何 EvidenceBundle、PDF 原文、system/model prompt、隐藏推理、API key 都不得进入 conversation memory。用户问题、最终报告和脱敏 Harness 工具状态属于用户可见对话历史，可以进入事件账本，但不能支持事实 claim。
 
@@ -385,8 +385,8 @@ Gateway 负责 provider API、版权许可、索引 ACL 和 lexical/vector/hybri
 
 ### 5.5 纯计算与知识解释
 
-确定性公式和版本化金融知识无需外部数据。ModelPlanner 能从动态目录选择 `finance.calculate` 或
-`finance.knowledge`；validation 不要求为了“多 Agent 感”追加市场、SEC 或 RAG。无模型时规则基线保持同样的最小路线。
+确定性公式无需外部数据。概念解释由模型直接作答，不再走 `finance.knowledge` 词库。
+validation 不要求为了“多 Agent 感”追加市场、SEC 或 RAG。当前研究链路要求 LLM，不再提供无模型规则基线。
 
 ## 6. 为什么当前设计不算过度复杂
 

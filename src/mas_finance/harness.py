@@ -609,7 +609,9 @@ class ToolHarness:
             return "capability_denied", f"capability is not allowed: {spec.capability}"
         if spec.side_effect not in policy.allowed_side_effects:
             return "side_effect_denied", f"side effect is not allowed: {spec.side_effect.value}"
-        if spec.network_access and not policy.allow_network:
+        # 模型调用是研究链路的部署依赖，由 API key / 模型预算约束；
+        # allow_network 只约束行情、检索、监管、宏观等数据 provider。
+        if spec.network_access and spec.capability != "model.generate" and not policy.allow_network:
             return "network_denied", "network access is not allowed for this run"
         return None
 

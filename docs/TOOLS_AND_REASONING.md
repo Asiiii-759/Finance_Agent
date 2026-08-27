@@ -1,7 +1,7 @@
 # MAS Finance 工具、金融场景与自适应调用逻辑
 
 状态：与当前实现同步
-日期：2026-08-12
+日期：2026-08-27
 定位：说明 Agent 会在什么场景调用什么工具、如何形成可审计的研究策略，以及每类工具的输入、输出与安全边界。
 
 ## 1. 核心原则
@@ -9,9 +9,9 @@
 MAS Finance 不为每种问题维护固定 workflow，也不允许 LLM 绕过工具边界。它采用“模型自主选择 + 确定性校验”模式：
 
 ```text
-问题与显式参数
-  → FinancialQueryAnalyzer
-  → ResearchScope(intents + requirements + calculations)
+问题、会话摘要、最近事件与实体回放
+  → LLM TaskFrame（LLM 未配置时快速失败）
+  → ResearchScope(requirements + success criteria)
   → ModelPlanner 读取动态 ToolSpec 目录（MCP 仅短索引 + 发现元工具）
   → 每轮最多选择四个已注册工具或 finish
   → ToolHarness 配套校验并执行这些动作
@@ -36,7 +36,6 @@ MAS Finance 不为每种问题维护固定 workflow，也不允许 LLM 绕过工
 
 | 工具 | Capability | 网络 | 何时注册/可用 | 主要作用 |
 |---|---|---:|---|---|
-| `finance.knowledge` | `knowledge.read` | 否 | 始终 | 金融概念、公式与解释 caveat |
 | `finance.calculate` | `calculation` | 否 | 始终 | 白名单确定性金融计算 |
 | `corpus.search` | `document.search` | 否 | 当前上传或显式会话 PDF | request/session 文档检索 |
 | `<deployment>.search` | `document.search` | 由来源声明 | 部署注入时 | 内部 RAG、licensed news 或外部搜索 gateway |
@@ -51,8 +50,9 @@ MAS Finance 不为每种问题维护固定 workflow，也不允许 LLM 绕过工
 | deployment evidence tool | 既有只读能力 | 由工具声明 | 部署注入 | 手工注入的企业 RAG；必须返回 canonical EvidenceBundle |
 | MCP Host 接入工具 | 既有只读能力 | 由 server 声明 | `MAS_MCP_SERVERS` 或 AllTick/必盈自动挂载 | 外部 MCP；模型通过渐进发现调用，不进 LLM `tools` 字段 |
 | `mcp.search_tools` / `mcp.describe_tool` / `mcp.call_tool` | `mcp.discover` / `mcp.invoke` | 视被调工具 | 已连接至少一个 MCP 工具时 | Host 侧渐进发现：短索引 → 契约 → 受控执行 |
-| `llm.plan` | `model.generate` | 是 | 配置模型密钥时 | 从动态目录选择最多四个下一动作或 finish |
-| `llm.synthesize` | `model.generate` | 是 | 配置模型密钥时 | 从证据生成受约束 claims；未配置时直接使用本地确定性合成器 |
+| `llm.task_frame` | `model.generate` | 是 | LLM 必需 | 根据当前请求与会话记忆生成 TaskFrame |
+| `llm.plan` | `model.generate` | 是 | LLM 必需 | 从动态目录选择最多四个下一动作或 finish |
+| `llm.synthesize` | `model.generate` | 是 | LLM 必需 | 从证据生成受约束 claims；输出非法则快速失败 |
 
 运行中的实际工具列表取决于配置和请求。API 可以查询：
 
@@ -69,11 +69,11 @@ GET /api/v1/tools
 
 ## 3. 问题场景如何映射到需求
 
-`FinancialQueryAnalyzer` 使用中英文金融词汇、显式请求参数、entity 数量和上传文档状态形成 `ResearchScope`。
+TaskFrame 模型使用当前请求、会话摘要、最近事件和实体回放形成 `ResearchScope`；它可以声明历史实体来源或要求澄清，不能由规则静默指定指代。LLM 是研究链路必需依赖。
 
 | 用户场景 | Intent | Requirement | 首选工具 |
 |---|---|---|---|
-| “什么是市盈率？” | `financial_education`、`valuation` | `knowledge:pe_ratio` | `finance.knowledge` |
+| “什么是市盈率？” | `financial_education` | 无检索 requirement | 模型直接合成；引用了才做 quote 校验 |
 | “100 到 150 的三年 CAGR” | `calculation` | `calculation:<request_id>` | `finance.calculate` |
 | “Apple 当前价格与 PE” | `market_snapshot`、`valuation` | `market:Apple`，必要时 `regulatory:Apple` | market + SEC |
 | “Apple 过去五年波动率和最大回撤” | `market_performance` | `market_history:Apple` | `market.history` |
@@ -133,75 +133,74 @@ GET /api/v1/tools
 ```
 
 Microsoft 会形成同构 requirement。ModelPlanner 每个 graph step 最多选择四个动作并在本轮规划节点内执行；
-provider 失败、空结果或 coverage 不足时，validation 把状态送回 planning。无模型时 AdaptivePlanner 仍按 requirement
-一次列出多个候选，也会在同一 planning 访问中执行完。
+provider 失败、空结果或 coverage 不足时，validation 把状态送回 planning。
 
 ## 4. ModelPlanner 的自主选择
 
-ModelPlanner 读取用户请求、intent hints、coverage、历史动作、gaps、有界 evidence 摘要和当前 ToolSpec 目录，
-返回严格 JSON `call_tool`、`call_tools` 或 `finish`。配置了 LLM 时由模型挑选工具；没有密钥或计划非法时才由
-AdaptivePlanner 用规则降级。MCP 具体工具默认不把完整 schema 塞进 `available_tools`，只提供短索引和
-`mcp.search_tools` / `mcp.describe_tool` / `mcp.call_tool`。模型重复相同 tool+arguments 时稳定 task ID 去重；
-模型过早 finish 时 validation 拒绝并继续规划。
+ModelPlanner 读取用户请求、intent hints、coverage、`prior_actions`、gaps、有界 evidence 摘要、当前 ToolSpec
+目录、MCP 短索引、发现结果和 `verified_tool_usage`，返回严格 JSON `call_tool`、`call_tools` 或 `finish`。
+模型挑选工具；LLM 未配置或其结构化响应非法时快速失败，不走规则降级。DeepSeek 请求不带 native `tools` 字段。模型重复相同 tool+arguments 时稳定 task ID 去重；模型过早 finish 时 validation 拒绝并继续规划。
 
-### 4.1 AdaptivePlanner 降级规则
+### 4.1 MCP 渐进发现
 
-没有模型或模型计划违反契约时，AdaptivePlanner 才读取：
+具体 MCP 工具名不进入 `available_tools`，只以短 `mcp_tool_index`（name、capability、200 字描述、
+planner_category）出现。模型必须：
 
-- 已持久化的 `ResearchScope`；
-- 当前 `CoverageDecision.missing`；
-- 已完成 ToolTask 的稳定 ID；
-- 当前 Harness 的 ToolSpec 注册表。
+1. 需要时用 `mcp.search_tools` 按关键词缩小候选；
+2. 执行前用 `mcp.describe_tool` 拉取完整 JSON Schema（含服务端提供的字段描述、enum、default、examples）；
+3. 用 `mcp.call_tool` 执行，`name` 必须是 index 中的本地名（例如 `extmarket.snapshot`）。
 
-决策顺序：
+`mcp.describe_tool` / `mcp.search_tools` 的结果不写入 EvidenceBundle；Graph 对 `mcp.discover` 只把结果留给下一轮
+`discovery_results`。计算、内部研报 RAG、request/session/personal corpus 不经 MCP。
 
-1. 只处理尚未覆盖的 requirement；
-2. 为该 category 查询有序 provider 列表；
-3. 跳过未注册工具；
-4. 跳过相同参数下已尝试的任务；
-5. 生成带 requirement key 的 ToolTask；
-6. Graph 再次检查工具名和 capability allowlist；
-7. Harness 绑定 run identity 与预算上限，检查副作用、网络、输入契约和分账预算；
-8. Harness 校验输出契约；Agent 再计算 coverage，而不是无条件进入下一节点。
+成功的 MCP 调用参数不会写入 personal memory，而是按工具名 + input-schema fingerprint + arguments 写入用户隔离的
+`tool_usage_memory`。召回时 schema 必须一致，最多五条以 `verified_tool_usage` 进入规划上下文，仍须服从当前契约。
 
-若不存在可满足缺口的工具，系统生成 `requirement_provider_unavailable` gap 并停止，不会让模型伪造数据。
+### 4.2 报错之后的策略
 
-当前 provider 顺序：
+“工具失败”分四层，不要当成同一种重试：
+
+| 层 | 何时发生 | 系统做什么 | 规划侧下一步 |
+|---|---|---|---|
+| Harness 自动重试 | 只读工具抛出 `ToolSpec.retry` 声明的异常（默认 `TimeoutError`/`ConnectionError`） | 同一 call 内再尝试；web/RAG/FRED/SEC 多为 2 次；每个网络 attempt 占数据预算 | 仍失败才进入 observation |
+| MCP 结构化错误 | server `isError=true` → `ToolExecutionError` | **不**自动重试（MCP 绑定工具默认 `max_attempts=1`）。`ok=false`，`error_details` 可含 `retryable`、`suggested_action`、`received_arguments`，以及 server 提供的 `field`/`candidates` | 写入 `prior_actions` 与 resolvable gap；模型应改参后再 `mcp.call_tool` |
+| 契约/发现错误 | 缺字段、未知 MCP 名、非法 JSON-RPC | 普通 `ValueError` / 契约错误码；发现失败不是 `isError` 契约 | 下一轮换工具名或先 `describe_tool` |
+| 空结果但仍 `ok=true` | adapter 返回空/不完整 bundle + `gaps`（例如行情查到但序列不够） | 合并已有 Evidence，coverage 仍缺 | 换参数或换 provider；**不会**自动把 `AAPL` 改成 `AAPL.US` |
+
+完全相同的 tool+arguments 形成相同 task ID：Graph 记 `repeated_planner_action`，不再执行。改一个参数就是新任务。
+`retryable=false`（例如缺供应商凭据）提示停止改参并报告配置问题。限流等待超时表现为一次 `TimeoutError`，不是盲打。
+
+内置 `extmarket` 将超时/连接映射为 `provider_transient_error`，缺凭据映射为 `provider_configuration_error`，
+其余参数问题映射为 `invalid_or_unresolved_arguments`。Host 会转发结构化字段，但 `extmarket` 本身不保证每次都返回枚举 `candidates`。
+
+### 4.3 不再提供规则规划降级
+
+LLM 未配置、`llm.plan` 失败或模型 JSON 非法时，研究请求快速失败。系统不再用 AdaptivePlanner
+按 category 枚举 provider。MCP 行情补充（如 `extmarket`）只通过 §4.1 渐进发现进入规划目录。
+相同 tool+arguments 仍由稳定 task ID 去重；没有可满足缺口的工具时记 `requirement_provider_unavailable`。
+
+内置工具与 MCP 的职责划分：
 
 ```text
-document       corpus.search → 按部署顺序注入的 RetrievalSource
-market         market.snapshot
-market_history market.history
-regulatory     sec.company_facts
-filings        sec.recent_filings
-macro          macro.fred_series
+document       corpus.search / hybrid → 部署注入的 RetrievalSource → MCP document 工具
+market         market.snapshot → planner_category=market 的 MCP 工具
+market_history market.history → planner_category=market_history 的 MCP 工具
+regulatory     sec.company_facts → planner_category=regulatory 的 MCP 工具
+filings        sec.recent_filings → planner_category=filings 的 MCP 工具
+macro          macro.fred_series → planner_category=macro 的 MCP 工具
 calculation    finance.calculate
-knowledge      finance.knowledge
-web            web.search
+web            web.search → planner_category=web 的 MCP 工具
 ```
 
 ## 5. 工具详细说明
 
-### 5.1 finance.knowledge
+### 5.1 概念解释（无内置词库）
 
-用于定义、公式与解释，不使用模型常识填空。当前版本包含：
+教育类、定义类、机制类问题**不再**调用代码内金融词条。TaskFrame 可以给出空的 requirements，规划器应 `finish`，由 `llm.synthesize` 直接作答。这类 claim 标为 `inferred`，并注明未经检索核验。
 
-- P/E、P/B、EV/EBITDA
-- 净利率、ROE、ROA
-- 流动比率、债务权益比
-- CAGR、波动率、Sharpe、最大回撤
-- DCF、NPV、IRR、债券久期
-- 利率向企业与银行股传导的双向机制
+证据校验仍然约束真正的引用：一旦 `evidence_ids` 非空，`evidence_quote` 必须是对应 evidence 正文中的逐字子串，且 ID 必须在本次 manifest 内。文档、行情、监管、宏观、网页和计算事实不能靠模型常识补造。
 
-每条内容带 `knowledge://finance/<concept>/v1` locator 和 `MAS Finance curated knowledge` provider。它是版本化内部知识，不冒充监管机构或实时市场事实。
-
-输入：
-
-```json
-{"query": "什么是 ROE？", "concepts": ["roe"], "top_k": 1}
-```
-
-输出：document EvidenceBundle；未匹配产生 `finance_knowledge_not_found`。
+个人知识库（`personal.search`）与代码词库不是一回事；用户上传的 PDF 仍走检索。
 
 ### 5.2 finance.calculate
 
@@ -326,7 +325,7 @@ open-web requirement or model decision
 
 标准化后的完整观察序列会登记为 calculation-input Evidence；派生指标引用该序列、起点和终点证据，并保存公式版本与 input evidence IDs。若 provider 只有 raw close，指标仍可用但生成 `unadjusted_price_history` gap，明确不包含现金分红。
 
-默认 provider 是 `offline`。AlphaVantage 与 Yahoo 必须显式选择，配置失败时不会跨 provider 静默 fallback。当前 Yahoo endpoint 没有本项目可依赖的正式契约，工具目录标记为 `experimental_non_contractual`；AlphaVantage 当前历史实现使用 raw `TIME_SERIES_DAILY`。生产应使用有许可、SLA、时效和 corporate-action 口径的供应商。
+默认 provider 是 `offline`。AlphaVantage 与 Yahoo 必须显式选择，配置失败时不会跨 provider 静默 fallback。当前 Yahoo endpoint 没有本项目可依赖的正式契约，工具目录标记为 `experimental_non_contractual`；AlphaVantage 当前历史实现使用 raw `TIME_SERIES_DAILY`。生产应使用有许可、SLA、时效和 corporate-action 口径的供应商。配置 `ALLTICK_TOKEN` 或 `BIYING_LICENCE` 时，进程额外挂载 MCP `extmarket`；模型经 §4.1 渐进发现调用。空行情通常是 `ok=true` + gaps，不是 `isError`。
 
 ### 5.6 sec.company_facts
 
@@ -391,7 +390,7 @@ output JSON contract
 
 Evidence cards按 `entity × source_type` 分组后轮询选择，避免第一家公司或第一类来源独占上下文；同时按 query overlap、结构化程度和来源类型排序。每张卡包含 provider、locator、source type、period、as-of 和 published-at。
 
-`ContextManifest` 明确记录真正进入 Prompt 的 evidence ID；模型不能引用被预算裁掉的证据。逐字 quote 只保留确实包含该 quote 的 citation，不能借一个有效 quote 附带无关来源；不合规则确定性降级。未配置模型密钥不是故障：系统不注册模型工具，直接使用 `DeterministicSynthesizer`，因此不会产生虚假的 LLM fallback gap。
+`ContextManifest` 明确记录真正进入 Prompt 的 evidence ID；模型不能引用被预算裁掉的证据。逐字 quote 只保留确实包含该 quote 的 citation，不能借一个有效 quote 附带无关来源。合成 JSON 非法时快速失败，不回退到确定性复述。缺少 LLM 配置同样使研究请求失败。
 
 ## 6. Coverage 如何判断工具是否真的完成任务
 
@@ -417,7 +416,6 @@ Evidence cards按 `entity × source_type` 分组后轮询选择，避免第一�
   "entity_state": {"Apple": {"mention_count": 1, "symbol": "AAPL", "last_sequence": 1}},
   "focus_history": [{"sequence": 1, "entities": ["Apple"]}],
   "focus_entities": ["Apple"],
-  "reference_resolution": {"current_entities": [], "previous_focus": ["Apple"], "resolved_entities": ["Apple"], "history_reference_used": true},
   "run_state": [{"run_id": "run-1", "status": "completed", "tools": []}],
   "manifest": {"max_context_tokens": 300000, "max_recent_context_tokens": 20000, "full_history_persisted": true, "memory_is_evidence": false}
 }
@@ -426,8 +424,7 @@ Evidence cards按 `entity × source_type` 分组后轮询选择，避免第一�
 用途：
 
 - “那它的最大回撤呢？”可以继承 Apple/AAPL；
-- 只有明确指代才继承历史实体；当前问题显式或检测到的新实体优先；
-- 前者/后者/复数按最近有序实体组解析，歧义单数不猜；
+- TaskFrame 依据摘要、最近事件和原子实体回放解析历史实体；歧义时返回澄清问题；
 - 旧请求、结果、工具状态和 gap 可帮助多轮理解，但不能作为事实 evidence。
 
 不会保存到对话账本：
@@ -463,6 +460,13 @@ MAS_ALLOW_NETWORK=true AND request.allow_network=true
 - DeepSeek 需要 `DEEPSEEK_API_KEY`。
 
 配置缺失时，相关工具不注册；Scope 若仍要求该数据，最终产生 `requirement_provider_unavailable`。网络未授权时，Harness 返回 `network_denied`。二者都不会被模型静默掩盖。
+
+研究循环里的失败分层见 §4.2。补充边界：
+
+- 只有 read-only 工具允许 Harness 自动重试；契约错误、`ToolExecutionError`、HTTP 4xx/429（未映射为 retryable 异常时）和无结果不会盲重试。
+- 网络 transport 超时/连接失败时，web/RAG/FRED/SEC 通常再试一次，两次 attempt 分别计入数据预算。
+- MCP `tools/call`、FRED、Bocha、Brave 与内置行情另有每分钟滑动窗口限流；限流等待超时记为一次失败。
+- `mcp.discover` 失败或未知工具名不会伪造 Evidence。
 
 ## 9. CLI 示例
 
@@ -510,8 +514,7 @@ mas-finance \
 
 增加这些能力时仍应遵循：provider client → Evidence adapter → ToolSpec → 动态目录 → 必要的 Coverage rule → tests。
 外部 API 也可先做成 MCP server，再由 Host 过滤后进入同一条 Harness 目录。配置 `ALLTICK_TOKEN` 或
-`BIYING_LICENCE` 时，进程会自动挂载本地 `extmarket` stdio server（snapshot/history），内置
-`market.snapshot` / `market.history` 仍保留作为 AdaptivePlanner 的 fallback。FRED、Bocha、Brave、行情与
+`BIYING_LICENCE` 时，进程会自动挂载本地 `extmarket` stdio server（snapshot/history），并经渐进发现调用。FRED、Bocha、Brave、行情与
 MCP `tools/call` 都有每分钟滑动窗口限流；不要用免费档密钥做压测。官方 SEC EDGAR 仍只用
 `MAS_SEC_USER_AGENT`，第三方 SEC token 尚未接入。
-只有无模型基线也必须使用时，才补 AdaptivePlanner category routing；只注册一个函数而不补证据契约，不算完成接入。
+只注册一个函数而不补证据契约，不算完成接入。

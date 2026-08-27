@@ -257,7 +257,7 @@ def finance_knowledge_harness_tool(knowledge: FinancialKnowledgeBase | None = No
     return function_tool(
         ToolSpec(
             name="finance.knowledge",
-            description="Retrieve versioned definitions, formulas and interpretation caveats for finance concepts.",
+            description="检索带版本的金融概念定义、公式和解读注意事项。",
             capability="knowledge.read",
             network_access=False,
             timeout_seconds=5,

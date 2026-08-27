@@ -18,6 +18,7 @@ from .harness import (
     ToolSpec,
     function_tool,
 )
+from .rate_limit import RateLimit, RateLimiter
 
 
 class WebSearchProvider(Protocol):
@@ -36,6 +37,8 @@ class BraveWebSearchClient:
         *,
         timeout_seconds: float = 20,
         transport: httpx.BaseTransport | None = None,
+        rate_limiter: RateLimiter | None = None,
+        rate_limit: RateLimit | None = None,
     ) -> None:
         if not api_key or len(api_key) > 4_096 or any(ord(item) < 32 or ord(item) == 127 for item in api_key):
             raise ValueError("Brave Search API key is invalid")
@@ -44,8 +47,12 @@ class BraveWebSearchClient:
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
         self.transport = transport
+        self.rate_limiter = rate_limiter
+        self.rate_limit = rate_limit or RateLimit(6)
 
     def search_json(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        if self.rate_limiter is not None:
+            self.rate_limiter.acquire("brave", self.rate_limit, timeout_seconds=self.timeout_seconds)
         query, count, freshness, domains = _search_arguments(payload)
         effective_query = query
         if domains:
@@ -112,6 +119,8 @@ class BochaWebSearchClient:
         *,
         timeout_seconds: float = 20,
         transport: httpx.BaseTransport | None = None,
+        rate_limiter: RateLimiter | None = None,
+        rate_limit: RateLimit | None = None,
     ) -> None:
         if not api_key or len(api_key) > 4_096 or any(ord(item) < 32 or ord(item) == 127 for item in api_key):
             raise ValueError("Bocha Search API key is invalid")
@@ -120,8 +129,12 @@ class BochaWebSearchClient:
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
         self.transport = transport
+        self.rate_limiter = rate_limiter
+        self.rate_limit = rate_limit or RateLimit(6)
 
     def search_json(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        if self.rate_limiter is not None:
+            self.rate_limiter.acquire("bocha", self.rate_limit, timeout_seconds=self.timeout_seconds)
         query, count, freshness, domains = _search_arguments(payload)
         effective_query = query
         if domains:
@@ -258,8 +271,8 @@ def web_search_harness_tool(
         ToolSpec(
             name=name,
             description=(
-                "Search the open web for current financial information. Choose the query, optional freshness "
-                "window (pd/pw/pm/py), optional domain allowlist, and up to 10 results. Returns cited snippets."
+                "在公开网络搜索当前金融信息。设置 query、可选 freshness 窗口（pd/pw/pm/py）、可选域名白名单，"
+                "最多返回 10 个结果及可引用摘要。"
             ),
             capability="web.search",
             network_access=True,

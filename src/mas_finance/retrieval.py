@@ -108,7 +108,7 @@ class RetrievalSource:
     client: RAGClient
     provider: str
     network_access: bool = False
-    description: str = "Search an authorized financial research corpus."
+    description: str = "搜索已授权的金融研究语料库。"
     fixed_filters: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
@@ -133,8 +133,7 @@ class RetrievalSource:
             name=self.name,
             network_access=self.network_access,
             description=(
-                f"{self.description} Set diversify_documents=true only when the user asks to compare or synthesize "
-                "across multiple documents."
+                f"{self.description} 只有当用户要求跨多个文档比较或综合时，才设置 diversify_documents=true。"
             ),
         )
 
@@ -289,8 +288,8 @@ def retrieval_harness_tool(
     network_access: bool = False,
     fixed_search_mode: str | None = None,
     description: str = (
-        "Search the authorized financial research corpus and return cited evidence. Set diversify_documents=true "
-        "only when the user asks to compare or synthesize across multiple documents."
+        "搜索已授权的金融研究语料库并返回可引用证据。只有当用户要求跨多个文档比较或综合时，"
+        "才设置 diversify_documents=true。"
     ),
 ) -> Tool:
     if fixed_search_mode is not None and fixed_search_mode not in {"lexical", "vector", "hybrid", "rrf"}:

@@ -7,7 +7,7 @@
 
 - `Multi-Agent-project` 是唯一主项目；旧固定角色图、样例数据和兼容入口已删除。
 - LangGraph 唯一业务图：intent → planning ↔ validation → final_generation → validation；无 Harness/act 业务节点。
-- `ModelPlanner` 从动态工具目录自主选择单个下一动作或 finish；校验可拒绝过早 finish；规则 planner 仅作可见降级。
+- `ModelPlanner` 从动态工具目录自主选择最多四个下一动作或 finish；MCP 走渐进发现；校验可拒绝过早 finish；规则 planner 仅作可见降级。
 - 中英金融意图、字段级 requirement、显式 unsupported requirement 和稳定停止原因。
 - `SourceRef / Evidence / Claim / EvidenceBundle`：content-addressed ID、引用完整性、冲突检测、数量/字符上限和严格 JSON。
 - Tool Harness：run identity/预算上限绑定、capability、side effect、双重网络授权、严格输入/输出契约、只读 retry、观测 timeout、错误/参数脱敏和审计。
@@ -35,7 +35,9 @@
 - 显式会话文档：原 PDF 请求后删除，仅在 opt-in 时将解析页文本按 tenant/user/thread 保留于进程内存；默认 1 小时 TTL，支持列举、召回和删除。
 - 显式个人长期记忆：profile/preference/experience/skill 仅通过 CRUD 写入；同类同标题覆盖，相关性召回且绝不充当 Evidence。
 - 持久个人 PDF 知识库：只保存解析页文本和元数据，tenant/user 精确隔离，支持上传、列表、检索和删除；临时文档不自动入库。
-- 部署级 `evidence_tools` 注入边界：只接受 read-only canonical `EvidenceBundle` 工具，可承接 MCP gateway/企业数据源；副作用或 raw 工具启动即拒绝。
+- 部署级 `evidence_tools` 注入边界：只接受 read-only canonical `EvidenceBundle` 工具。
+- MCP Host/Client：`MAS_MCP_SERVERS` allowlist 连接 stdio 或固定 HTTPS JSON-RPC；只读+Evidence 过滤后进入 Harness；规划侧用 `mcp.search_tools` / `mcp.describe_tool` / `mcp.call_tool` 渐进发现。AllTick/必盈可自动挂载 `extmarket` server。FRED/Bocha/行情/MCP call 有每分钟滑动窗口限流。计算与内部 RAG 仍为内置工具。
+- 长期记忆：用户可维护独立 Markdown 指令；完成 run 后中文 LLM 最多提取两个候选，显式偏好可晋升、推断偏好需跨两个 run，冲突不覆盖。实体使用原子事件回放；MCP 成功参数进入 schema 版本化的独立工具经验库。
 - 删除自建 checkpoint；Agent 只注入 LangGraph InMemorySaver/SqliteSaver。主服务和 job 使用 SQLite graph checkpoint，job_id 稳定恢复。
 - `/api/v1/tools` 输出工具 input/result contract、availability、visibility 和行情 support tier。
 - `/api/v1/config` 不再返回可能含密码的 DSN 或内部文件路径。
@@ -47,10 +49,10 @@
 
 ```text
 11/11 enterprise black-box scenarios passed
-145 tests passed under pytest; no skips
+161 tests passed under pytest; no skips
 84.18% total source coverage; 80% gate passed
 Ruff passed for src/tests
-mypy passed for all 42 source files
+mypy passed for all 46 source files
 compileall passed
 Real DeepSeek planner selected finance.knowledge from the dynamic catalog in one model call; no gaps
 Real DeepSeek selected corpus.hybrid_search first for a semantic-only PDF query; cross-checked lexical, deduplicated one Evidence, succeeded in 5 model calls
@@ -70,13 +72,14 @@ PEP 517 sdist/wheel built with installed build requirements; 2.2.0 wheel importe
 - 上传 corpus 默认 request-local；会话页文本只在单进程短 TTL 可见。内建 hybrid 已实现，但当前个人库只持久化
   SQLite 页文本、查询期重算向量；尚无大规模持久向量索引、principal-to-ACL 映射和删除传播。
 - SEC recent filings 只返回元数据与 primary locator，没有自动 ingest filing HTML 全文。
-- Yahoo endpoint 非契约化；AlphaVantage 历史使用 raw close；生产必须配置正式许可行情源。
+- Yahoo endpoint 非契约化；AlphaVantage 历史使用 raw close；AllTick/必盈为免费档 MCP 行情补充，受每分钟限流。
+- 官方 SEC EDGAR 仍只用 `MAS_SEC_USER_AGENT`；第三方 SEC API token 尚未接入。
 - 字符预算不是 tokenizer；literal quote 不等于完整语义蕴含。
 - 尚无真实 provider 录制响应、跨实例 SEC 全局限速、并发压测、长时间 soak 和灾难恢复演练。
 - 尚无新闻、earnings call、商业行情、内部 SQL/warehouse adapter。
 - `web.search` 的 Bocha API 与项目 EvidenceBundle 路径已完成小规模真实验证；Brave 仅完成 fixture 验证。
   尚无安全的通用 web.fetch。
-- 当前只提供 MCP-shaped 工具注入边界，没有在缺少真实 server/授权模型时猜测实现通用 MCP transport。
+- 尚未实现 SSE Streamable HTTP、OAuth；akshare/yfinance 仅作显式 env 开关的 fallback，默认不调用。
 
 ## 生产优先级
 

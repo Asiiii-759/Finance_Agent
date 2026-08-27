@@ -42,7 +42,12 @@ class SummaryFixture:
         return {
             "conversation_summary": f"Summarized through event {events[-1].sequence}.",
             "user_goals": ["Compare Apple and Microsoft."],
+            "requirements": ["Use a consistent valuation basis."],
             "decisions": [],
+            "completed_work": [],
+            "successful_tools": [],
+            "failed_tools": [],
+            "unfinished_work": [],
             "open_questions": ["Which valuation basis should be used?"],
         }
 
@@ -273,20 +278,44 @@ class MemoryTests(unittest.TestCase):
                         else None
                     ),
                 )
+            store.append_conversation_event(
+                namespace,
+                event_id="event-16",
+                kind=ConversationEventKind.USER_MESSAGE,
+                content="continue the comparison " + "x" * 1_200,
+                occurred_at="2026-08-26T12:16:00+08:00",
+                run_id="run-pending",
+                entities=("Apple",),
+                payload={"entity_symbols": {"Apple": "AAPL"}},
+            )
+            store.append_conversation_event(
+                namespace,
+                event_id="event-17",
+                kind=ConversationEventKind.TOOL_EVENT,
+                content="market.history: failed",
+                occurred_at="2026-08-26T12:17:00+08:00",
+                run_id="run-pending",
+                payload={
+                    "tool_name": "market.history",
+                    "result_status": "failed",
+                    "error_code": "provider_timeout",
+                    "attempts": 2,
+                },
+            )
 
             with self.assertRaisesRegex(RuntimeError, "requires an LLM summarizer"):
                 build_conversation_window(
                     store,
                     namespace,
                     max_tokens=16_000,
-                    recent_event_count=4,
+                    recent_tokens=4_000,
                     token_counter=CharacterTokenCounter(),
                 )
             context = build_conversation_window(
                 store,
                 namespace,
                 max_tokens=16_000,
-                recent_event_count=4,
+                recent_tokens=4_000,
                 summarizer=summarizer,
                 token_counter=CharacterTokenCounter(),
             )
@@ -294,15 +323,22 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(context["manifest"]["token_count_method"], "character-test-counter")
             self.assertEqual(summarizer.calls, 1)
             self.assertIn("Summarized through event", context["summary"]["conversation_summary"])
-            self.assertEqual(context["focus_entities"], ["Apple", "Microsoft"])
-            self.assertEqual(context["focus_history"][-1]["entities"], ["Apple", "Microsoft"])
-            self.assertEqual(context["entity_state"]["Apple"]["mention_count"], 8)
+            self.assertEqual(context["focus_entities"], ["Apple"])
+            self.assertEqual(context["focus_history"][-1]["entities"], ["Apple"])
+            self.assertEqual(context["entity_state"]["Apple"]["mention_count"], 9)
             self.assertEqual(context["entity_state"]["Apple"]["symbol"], "AAPL")
+            self.assertEqual(context["entity_events"][-1]["entities"], ["Apple"])
+            self.assertEqual(context["entity_events"][-1]["action"], "mentioned")
+            self.assertLessEqual(context["manifest"]["recent_context_tokens"], 4_000)
+            self.assertEqual(context["manifest"]["max_recent_context_tokens"], 4_000)
+            self.assertEqual({event["run_id"] for event in context["recent_events"]}, {"run-pending"})
+            self.assertEqual(context["run_state"][-1]["status"], "unfinished")
+            self.assertEqual(context["run_state"][-1]["tools"][0]["error_code"], "provider_timeout")
             self.assertGreater(context["manifest"]["covered_through_sequence"], 0)
-            self.assertEqual(len(store.list_conversation_events(namespace)), 16)
+            self.assertEqual(len(store.list_conversation_events(namespace)), 18)
 
             reopened = SQLiteMemoryStore(path)
-            self.assertEqual(len(reopened.list_conversation_events(namespace)), 16)
+            self.assertEqual(len(reopened.list_conversation_events(namespace)), 18)
             self.assertIsNotNone(reopened.get_conversation_summary(namespace))
             self.assertEqual(
                 reopened.list_conversation_events(namespace)[0],
@@ -325,7 +361,7 @@ class MemoryTests(unittest.TestCase):
                     content="different content",
                     run_id="run-0",
                 )
-            self.assertEqual(reopened.delete_conversation(namespace), {"events": 16, "summaries": 1})
+            self.assertEqual(reopened.delete_conversation(namespace), {"events": 18, "summaries": 1})
             self.assertEqual(reopened.list_conversation_events(namespace), [])
 
 

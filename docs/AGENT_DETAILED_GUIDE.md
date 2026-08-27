@@ -126,7 +126,7 @@ Multi-Agent-project/
 │   ├── research.py        # 金融 intents、ResearchScope 和字段级 requirements
 │   ├── contracts.py       # SourceRef、Evidence、Claim、EvidenceBundle
 │   ├── harness.py         # 工具注册、权限、预算、重试、超时、脱敏审计
-│   ├── memory_store.py    # 持久对话事件、动态压缩、实体关系与 namespace 隔离
+│   ├── memory_store.py    # 持久对话事件、动态压缩、实体/焦点状态与 namespace 隔离
 │   ├── embeddings.py      # embedding provider 与受限 HTTP API
 │   ├── corpus.py          # request/session/personal BM25、向量与 RRF
 │   ├── retrieval.py       # 检索结果 → EvidenceBundle
@@ -783,7 +783,7 @@ MAS_EMBEDDING_API_KEY=
 MAS_EMBEDDING_TIMEOUT_SECONDS=30
 MAS_CONVERSATION_MEMORY_ENABLED=true
 MAS_CONVERSATION_CONTEXT_TOKENS=300000
-MAS_CONVERSATION_RECENT_EVENTS=24
+MAS_CONVERSATION_RECENT_TOKENS=20000
 MAS_SESSION_DOCUMENT_TTL_SECONDS=3600
 MAS_MAX_SESSION_DOCUMENT_SESSIONS=100
 
@@ -883,7 +883,7 @@ def fred_tool(adapter):
     return function_tool(
         ToolSpec(
             name="fred.series",
-            description="Read a fixed FRED series as time-stamped evidence.",
+            description="将固定 FRED 序列读取为带时间戳的证据。",
             capability="macro.read",
             side_effect=SideEffect.READ_ONLY,
             network_access=True,

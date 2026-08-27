@@ -26,9 +26,11 @@ class ScriptedLLM(BaseLLMClient):
 
     def __init__(self, responses: list[dict]) -> None:
         self.responses = list(responses)
+        self.system_prompts: list[str] = []
         self.user_prompts: list[str] = []
 
     def chat(self, system_prompt, user_prompt, temperature=0.2, max_tokens=600):
+        self.system_prompts.append(system_prompt)
         self.user_prompts.append(user_prompt)
         return json.dumps(self.responses.pop(0), ensure_ascii=False)
 
@@ -67,20 +69,21 @@ class GraphAutonomyTests(unittest.TestCase):
 
     def test_model_selects_tool_from_runtime_catalog(self) -> None:
         harness = ToolHarness()
+        llm = ScriptedLLM(
+            [
+                {
+                    "action": "call_tool",
+                    "tool_name": "finance.knowledge",
+                    "arguments": {"query": "什么是市盈率？", "concepts": ["pe_ratio"], "top_k": 1},
+                    "reason": "使用受控知识库中的定义和注意事项。",
+                },
+                {"action": "finish", "reason": "该定义已有证据支持。"},
+            ]
+        )
         harness.register(finance_knowledge_harness_tool())
         harness.register(
             llm_planning_harness_tool(
-                ScriptedLLM(
-                    [
-                        {
-                            "action": "call_tool",
-                            "tool_name": "finance.knowledge",
-                            "arguments": {"query": "什么是市盈率？", "concepts": ["pe_ratio"], "top_k": 1},
-                            "reason": "Use the curated definition and caveats.",
-                        },
-                        {"action": "finish", "reason": "The requested definition is now evidenced."},
-                    ]
-                ),
+                llm,
                 network_access=False,
             )
         )
@@ -101,6 +104,7 @@ class GraphAutonomyTests(unittest.TestCase):
             ["llm.plan", "finance.knowledge", "llm.plan"],
         )
         self.assertEqual(outcome.state.context_manifests[0]["phase"], "planning")
+        self.assertIn("金融研究 Agent", llm.system_prompts[0])
         self.assertLessEqual(
             outcome.state.context_manifests[0]["evidence_characters"],
             outcome.state.context_manifests[0]["max_evidence_characters"],
@@ -407,6 +411,50 @@ class GraphAutonomyTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "result URL is invalid"):
             WebSearchEvidenceAdapter(PrivateResultSearch()).search({"query": "ACME"})
+
+    def test_model_can_select_multiple_tools_in_one_plan(self) -> None:
+        harness = ToolHarness()
+        llm = ScriptedLLM(
+            [
+                {
+                    "action": "call_tools",
+                    "reason": "同时取两个受控定义。",
+                    "tools": [
+                        {
+                            "tool_name": "finance.knowledge",
+                            "arguments": {"query": "什么是市盈率？", "concepts": ["pe_ratio"], "top_k": 1},
+                            "reason": "需要市盈率定义。",
+                        },
+                        {
+                            "tool_name": "finance.knowledge",
+                            "arguments": {"query": "什么是 ROE？", "concepts": ["roe"], "top_k": 1},
+                            "reason": "需要 ROE 定义。",
+                        },
+                    ],
+                },
+                {"action": "finish", "reason": "两个定义都已有证据。"},
+            ]
+        )
+        harness.register(finance_knowledge_harness_tool())
+        harness.register(llm_planning_harness_tool(llm, network_access=False))
+        outcome = FinancialResearchAgent(harness, planner=ModelPlanner(harness)).run(
+            ResearchRequest(
+                query="解释市盈率和 ROE",
+                require_documents=False,
+                require_market_data=False,
+                require_regulatory_data=False,
+                run_id="multi-tool-plan",
+                max_model_calls=2,
+                max_parallel_tool_calls=2,
+            )
+        )
+        self.assertEqual(outcome.status, "succeeded")
+        self.assertEqual(len(outcome.state.observations), 2)
+        self.assertEqual({item.task.tool_name for item in outcome.state.observations}, {"finance.knowledge"})
+        self.assertEqual(
+            [item["tool_name"] for item in outcome.audit_events],
+            ["llm.plan", "finance.knowledge", "finance.knowledge", "llm.plan"],
+        )
 
 
 if __name__ == "__main__":

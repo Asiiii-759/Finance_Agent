@@ -58,13 +58,13 @@ Harness 是每次工具调用配套的执行 middleware；工具 adapter 是能�
 
 ### 3.2 `planning`
 
-每次进入只完成一个可观察动作：
+每次进入可完成本轮计划中尚未观察的全部任务（默认最多 4 个并行）：
 
 1. 组装规划上下文；
-2. `ModelPlanner` 返回一个 `call_tool` 或 `finish`；
+2. `ModelPlanner` 返回 `call_tool`、`call_tools` 或 `finish`；
 3. 校验工具是否在本次运行目录中；
 4. 用 `ToolArgumentContract` 校验参数；
-5. 通过同一个 Harness 执行这一个工具；
+5. 通过同一个 Harness 执行这些工具；
 6. 把结果归一成 observation、EvidenceBundle、gap 和 audit；
 7. 返回节点更新，让 LangGraph checkpoint 落盘。
 
@@ -245,7 +245,7 @@ adapter 是一个有意保留的例外：它让离线请求得到明确的 `mark
 | 平面 | 用途 | 是否是事实来源 |
 |---|---|---|
 | LangGraph checkpoint | run 恢复、历史、下一节点 | 保存既有证据，但不跨 run 自动召回 |
-| Conversation memory | 有界旧摘要、最近 user/tool/assistant 事件、实体关系 | 否，只作多轮理解与消歧提示 |
+| Conversation memory | 有界 LLM 摘要、最近 20K token 完整 run、实体/焦点状态 | 否，只作多轮理解与消歧提示 |
 | Session documents | 显式短期保留的 PDF 页文本 | 是，需本次显式召回 |
 | Long-term RAG | 经过 ACL/retention 管理的持久知识 | 是，经 retrieval adapter 引用 |
 

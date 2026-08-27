@@ -36,10 +36,22 @@ class ToolResultKind(StrEnum):
     ANY = "any"
     EVIDENCE_BUNDLE = "evidence_bundle"
     MODEL_RESPONSE = "model_response"
+    CATALOG = "catalog"
 
 
 class ToolContractError(ValueError):
     pass
+
+
+class ToolExecutionError(RuntimeError):
+    """工具向规划模型返回的结构化、可采取行动的执行错误。"""
+
+    def __init__(self, code: str, message: str, *, details: Mapping[str, Any] | None = None) -> None:
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
+            raise ValueError("tool execution error code is invalid")
+        super().__init__(message)
+        self.code = code
+        self.details = dict(details or {})
 
 
 @dataclass(frozen=True)
@@ -197,6 +209,7 @@ class ToolResult:
     data: Any = None
     error_code: str | None = None
     error_message: str | None = None
+    error_details: Mapping[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -477,6 +490,20 @@ class ToolHarness:
                     error_code="invalid_tool_result",
                     error_message=str(exc),
                 )
+            except ToolExecutionError as exc:
+                return self._finish(
+                    call_id=call_id,
+                    tool=tool,
+                    context=context,
+                    arguments=arguments,
+                    status=ToolStatus.ERROR,
+                    started_at=started_at,
+                    start=start,
+                    attempts=attempts,
+                    error_code=exc.code,
+                    error_message=str(exc),
+                    error_details=exc.details,
+                )
             except tool.spec.retry.retryable_exceptions as exc:
                 if attempts >= tool.spec.retry.max_attempts:
                     return self._finish(
@@ -628,6 +655,7 @@ class ToolHarness:
         data: Any = None,
         error_code: str | None = None,
         error_message: str | None = None,
+        error_details: Mapping[str, Any] | None = None,
     ) -> ToolResult:
         duration_ms = round((self._clock() - start) * 1000, 3)
         result = ToolResult(
@@ -640,6 +668,7 @@ class ToolHarness:
             data=data,
             error_code=error_code,
             error_message=_redact_error(error_message),
+            error_details=_redact(error_details) if error_details is not None else None,
         )
         event = ToolAuditEvent(
             call_id=call_id,
@@ -765,3 +794,8 @@ def _validate_tool_output(spec: ToolSpec, data: Any) -> None:
         content = data.get("content")
         if not isinstance(content, str) or not content.strip() or len(content) > 200_000:
             raise ToolContractError(f"{spec.name} returned invalid model content")
+        return
+    if spec.result_kind == ToolResultKind.CATALOG:
+        if len(serialized) > 100_000:
+            raise ToolContractError(f"{spec.name} catalog result exceeds the size limit")
+        return

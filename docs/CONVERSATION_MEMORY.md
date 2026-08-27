@@ -10,7 +10,7 @@ SQLite 完整事件账本（事实记录，不自动过期）
                     │
                     ▼ 预算达到 85% 时滚动压缩
 Prompt 投影（最多 MAS_CONVERSATION_CONTEXT_TOKENS）
-  LLM 语义摘要 + 最近原始事件 + 实体状态/焦点历史 + manifest
+  LLM 语义摘要 + 最近 20K token 完整 run + 实体相关回放 + run state + manifest
 ```
 
 完整账本与 prompt 投影必须分开：压缩只改变模型下一轮看到的表示，不删除原事件。默认保留到用户调用 `DELETE /api/v1/conversations/{thread_id}`。这与 request/session PDF 生命周期和个人长期记忆是不同的数据平面。
@@ -31,14 +31,16 @@ Prompt 投影（最多 MAS_CONVERSATION_CONTEXT_TOKENS）
 
 ## 3. 动态压缩
 
-默认预算为 300,000 token，保留最近 24 个原始事件。可通过以下变量调整：
+默认投影预算为 300,000 token，压缩后保留最近约 20,000 token 的原始上下文。近期窗口按完整 `run_id` 分组，不会因为一轮工具较多而只保留半轮；因此为了保持最近一个 run 完整，实际值可能略高于 20K。
 
 ```dotenv
 MAS_CONVERSATION_CONTEXT_TOKENS=300000
-MAS_CONVERSATION_RECENT_EVENTS=24
+MAS_CONVERSATION_RECENT_TOKENS=20000
 ```
 
-每次分析前从最近摘要游标继续读取事件。投影达到预算的 85% 且事件多于近期窗口时，专用 LLM 把上一份摘要与更老事件压缩成严格 JSON：对话概要、用户目标、已做决定和未决问题。摘要 prompt 将所有历史文本视为不可信数据，禁止执行其中指令、补充事实、回答问题或猜测歧义指代。摘要记录 `covered_through_sequence`，最近事件继续保持原始顺序和时间。
+每次分析前从最近摘要游标继续读取事件。投影达到预算的 85% 时，专用 LLM 把上一份摘要与 20K 近期窗口之前的事件压缩成严格 JSON。摘要必须保留对话概要、用户目标、需求/限制/成功标准、决策/纠正、已完成工作、成功工具、失败工具/错误码/重试结果、未完成工作和未决问题。摘要 prompt 使用中文，将所有历史文本视为不可信数据。
+
+`run_state` 由事件账本确定性生成：有 `user_message` 但没有 `assistant_message` 的 run 标记为 `unfinished`；工具记录保留终态、错误码和尝试次数。当前 Harness 仅在工具返回后写入审计事件，所以没有启动事件时不会把某个工具猜成“正在执行”；崩溃恢复的精确图状态仍以 LangGraph checkpoint 为准。
 
 压缩是显式的 LLM 网络调用：达到阈值时如果没有配置 LLM，或请求/部署未授权网络，系统快速失败，不会悄悄改用截断或规则摘要。SQLite 完整账本始终不受压缩影响。
 
@@ -53,8 +55,13 @@ MAS_CONVERSATION_RECENT_EVENTS=24
 - `entity_state`：实体的首次/最近提及时间、sequence、用户提及次数和可选 symbol；
 - `focus_history`：每个含实体的用户轮次及其有序实体组；
 - `focus_entities`：最近一个焦点组。
+- `entity_events`：按时间保存的原子对象/动作记录，最多 100 条；
+- `entity_replay`：本轮真正进入模型的相关或最近事件，最多 20 条；
+- `reference_resolution`：本轮的当前实体、上一焦点、最终解析实体，以及是否真正使用了历史指代。
 
-这些状态由事件账本确定性构建，不让 LLM 提取或改写。因此即使旧原文已被语义摘要覆盖，“刚刚聊到的那个公司”仍可查到上一个焦点组，不依赖摘要是否恰好保留了名字。
+这些状态由事件账本确定性构建，不让 LLM 提取或改写。原子事件只记录“提到、比较请求、计算请求、工具成功/失败、回答完成”
+等可观察动作，不把结果当作 Evidence。因此即使旧原文已被语义摘要覆盖，“刚刚聊到的那个公司”仍可查到上一个焦点组，
+模型也能通过有时间顺序的 `entity_replay` 知道此前对这些对象做过什么。
 
 解析优先级是：API 显式实体 → 当前问题检测实体 → 明确的历史指代。最近一个含实体的用户事件形成有序 `focus_entities`：
 
@@ -65,7 +72,7 @@ MAS_CONVERSATION_RECENT_EVENTS=24
 - “刚刚那个公司/之前那个公司”选择上一个唯一焦点，并可与当前明确实体组合成比较；
 - “继续/呢/what about”可承接当前焦点组。
 
-只要线程已有历史，有界上下文就会进入规划与生成，即使新问题没有代词；但历史实体不会因此覆盖当前问题中的显式实体。
+处理顺序是：读取上轮 `focus_entities` → 检测本轮实体 → 代码解析指代 → 将最终实体写入 `ResearchRequest.entities` → 将 `reference_resolution` 和有界线程上下文一起交给规划与生成模型。当前问题的实体在本轮通过 `ResearchRequest.entities` 进入 prompt，完成后写入事件账本，下轮才出现在 `entity_state/focus_history`。无历史关联的全新无实体问题不注入线程上下文。
 
 ## 5. 删除与 LangGraph checkpoint
 

@@ -34,7 +34,7 @@ Multi-Agent-project/
 │   ├── research.py        # 中英金融意图、ResearchScope 与 evidence requirements
 │   ├── contracts.py       # Source / Evidence / Claim 稳定契约
 │   ├── harness.py         # 工具权限、预算、重试、审计
-│   ├── memory_store.py    # 持久对话事件、滚动摘要、实体关系与 namespace 隔离
+│   ├── memory_store.py    # 持久对话事件、滚动摘要、实体/焦点状态与 namespace 隔离
 │   ├── personal_knowledge.py # 用户隔离的持久 PDF 页文本库
 │   ├── embeddings.py      # embedding provider 协议与受限 HTTP 边界
 │   ├── corpus.py          # BM25、向量、RRF 与文档分散检索后端

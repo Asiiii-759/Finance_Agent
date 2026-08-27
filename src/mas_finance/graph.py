@@ -8,6 +8,7 @@ harness is infrastructure, not a graph node.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Literal, cast
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -68,8 +69,11 @@ class FinancialResearchAgent:
                 "calculation",
                 "knowledge.read",
                 "web.search",
+                "mcp.discover",
+                "mcp.invoke",
             }
         ),
+        planner_hidden_tool_names: frozenset[str] = frozenset(),
     ) -> None:
         self.harness = harness
         self.planner = planner or AdaptivePlanner()
@@ -77,6 +81,7 @@ class FinancialResearchAgent:
         self.assessor = assessor or CoverageAssessor()
         self.scope_analyzer = scope_analyzer or FinancialQueryAnalyzer()
         self.allowed_capabilities = allowed_capabilities
+        self.planner_hidden_tool_names = planner_hidden_tool_names
         self.checkpointer = checkpointer or InMemorySaver()
         self.available_tools = {
             spec.name: spec for spec in self.harness.tool_specs() if spec.capability in self.allowed_capabilities
@@ -160,7 +165,7 @@ class FinancialResearchAgent:
             if state.iteration >= state.request.max_iterations:
                 state.stop_reason = StopReason.MAX_ITERATIONS
                 return self._update(state)
-            plan = self._validated_plan(self.planner.plan(state, self.available_tools), state)
+            plan = self._validated_plan(self.planner.plan(state, self._planner_catalog()), state)
             context_manifest = getattr(self.planner, "context_manifest", lambda: None)()
             if context_manifest:
                 state.context_manifests.append(
@@ -179,28 +184,58 @@ class FinancialResearchAgent:
                 return self._update(state)
             state.plans.append(plan)
             state.iteration = plan.iteration
+            observed = {item.task.task_id for item in state.observations}
 
-        task = next(item for item in plan.tasks if item.task_id not in observed)
-        result = self.harness.invoke(
-            task.tool_name,
-            task.arguments,
-            self._tool_context(state.request, self.available_tools),
-        )
-        observation = ToolObservation(
-            task=task,
-            iteration=state.iteration,
-            result=result.to_dict(),
-            network_access=self.available_tools[task.tool_name].network_access,
-        )
-        state.observations.append(observation)
-        self._consume(observation, state)
+        pending = [item for item in plan.tasks if item.task_id not in observed]
+        budget_left = state.request.max_tool_calls - len(state.observations)
+        if budget_left <= 0 or not pending:
+            self._mark_tool_budget_exhausted(state)
+            return self._update(state)
+        self._execute_tasks(state, pending[:budget_left])
+        remaining = {item.task_id for item in plan.tasks} - {item.task.task_id for item in state.observations}
+        if remaining and len(state.observations) >= state.request.max_tool_calls:
+            self._mark_tool_budget_exhausted(state)
+        return self._update(state)
+
+    def _planner_catalog(self) -> Mapping[str, ToolSpec]:
+        if not self.planner_hidden_tool_names or not getattr(self.planner, "requires_explicit_finish", False):
+            return self.available_tools
+        return {
+            name: spec
+            for name, spec in self.available_tools.items()
+            if name not in self.planner_hidden_tool_names
+        }
+
+    def _execute_tasks(self, state: ResearchState, tasks: Sequence[ToolTask]) -> None:
+        context = self._tool_context(state.request, self.available_tools)
+        workers = max(1, min(state.request.max_parallel_tool_calls, len(tasks)))
+
+        def run(task: ToolTask) -> tuple[ToolTask, Any]:
+            return task, self.harness.invoke(task.tool_name, task.arguments, context)
+
+        if workers == 1 or len(tasks) == 1:
+            pairs = [run(task) for task in tasks]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                pairs = list(pool.map(run, tasks))
+        exhausted = False
+        for task, result in pairs:
+            observation = ToolObservation(
+                task=task,
+                iteration=state.iteration,
+                result=result.to_dict(),
+                network_access=self.available_tools[task.tool_name].network_access,
+            )
+            state.observations.append(observation)
+            self._consume(observation, state)
+            if result.status.value == "budget_exhausted":
+                exhausted = True
         state.audit_events = _merge_audit_events(
             state.audit_events,
             self.harness.audit_events(state.request.run_id),
         )
-        if result.status.value == "budget_exhausted":
+        if exhausted:
             self._mark_tool_budget_exhausted(state)
-        return self._update(state)
 
     def _validation_node(self, graph_state: FinancialGraphState) -> dict[str, Any]:
         state = self._state(graph_state)
@@ -424,8 +459,7 @@ class FinancialResearchAgent:
             )
         state.stop_reason = StopReason.TOOL_BUDGET_EXHAUSTED
 
-    @staticmethod
-    def _consume(observation: ToolObservation, state: ResearchState) -> None:
+    def _consume(self, observation: ToolObservation, state: ResearchState) -> None:
         result = observation.result
         if not result.get("ok"):
             state.gaps.append(
@@ -441,7 +475,23 @@ class FinancialResearchAgent:
             )
             return
         data = result.get("data")
-        if not isinstance(data, Mapping) or not isinstance(data.get("bundle"), Mapping):
+        if not isinstance(data, Mapping):
+            state.gaps.append(
+                ResearchGap(
+                    code="invalid_tool_contract",
+                    message="Tool did not return an object result.",
+                    entity=observation.task.entity,
+                    requirement_key=observation.task.requirement_key,
+                    tool_name=observation.task.tool_name,
+                    task_id=observation.task.task_id,
+                    resolvable=True,
+                )
+            )
+            return
+        spec = self.available_tools.get(observation.task.tool_name)
+        if spec is not None and spec.capability == "mcp.discover":
+            return
+        if not isinstance(data.get("bundle"), Mapping):
             state.gaps.append(
                 ResearchGap(
                     code="invalid_tool_contract",

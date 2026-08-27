@@ -492,6 +492,15 @@ class ContextAndMemoryTests(unittest.TestCase):
             request = second["result"]["request"]
             self.assertEqual(request["entities"], ["Apple"])
             self.assertEqual(request["thread_context"]["focus_entities"], ["Apple"])
+            self.assertEqual(
+                request["thread_context"]["reference_resolution"],
+                {
+                    "current_entities": [],
+                    "previous_focus": ["Apple"],
+                    "resolved_entities": ["Apple"],
+                    "history_reference_used": True,
+                },
+            )
             self.assertEqual(request["thread_context"]["recent_events"][0]["content"], "解释 Apple 的市盈率")
             self.assertFalse(request["thread_context"]["manifest"]["memory_is_evidence"])
 

@@ -22,6 +22,7 @@ from .harness import (
     ToolSpec,
     function_tool,
 )
+from .rate_limit import RateLimit, RateLimiter
 
 
 class MacroSeriesClient(Protocol):
@@ -44,12 +45,16 @@ class FREDClient:
         *,
         base_url: str = "https://api.stlouisfed.org",
         timeout_seconds: float = 30.0,
+        rate_limiter: RateLimiter | None = None,
+        rate_limit: RateLimit | None = None,
     ) -> None:
         if not api_key.strip():
             raise ValueError("FRED API key is required")
         self.api_key = api_key.strip()
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.rate_limiter = rate_limiter
+        self.rate_limit = rate_limit or RateLimit(8)
 
     def fetch_series(
         self,
@@ -62,6 +67,8 @@ class FREDClient:
         normalized = _validate_series_id(series_id)
         if not 1 <= limit <= 10_000:
             raise ValueError("FRED observation limit must be between 1 and 10000")
+        if self.rate_limiter is not None:
+            self.rate_limiter.acquire("fred", self.rate_limit, timeout_seconds=self.timeout_seconds)
         common = {"series_id": normalized, "api_key": self.api_key, "file_type": "json"}
         observation_params: dict[str, Any] = {
             **common,
@@ -269,7 +276,7 @@ def fred_series_harness_tool(adapter: FREDEvidenceAdapter) -> Tool:
     return function_tool(
         ToolSpec(
             name="macro.fred_series",
-            description="Read an allowlisted FRED series with metadata and time-stamped observations.",
+            description="读取白名单 FRED 序列及其元数据和带时间戳观测值。",
             capability="macro.read",
             network_access=True,
             timeout_seconds=45,

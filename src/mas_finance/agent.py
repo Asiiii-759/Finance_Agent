@@ -47,6 +47,7 @@ class ResearchRequest:
     max_tool_calls: int = 12
     max_network_calls: int = 8
     max_model_calls: int = 1
+    max_parallel_tool_calls: int = 4
     require_documents: bool = True
     require_market_data: bool | None = None
     require_market_history: bool | None = None
@@ -102,6 +103,8 @@ class ResearchRequest:
             raise ValueError("max_network_calls must be between zero and max_tool_calls")
         if not 0 <= self.max_model_calls <= 20:
             raise ValueError("max_model_calls must be between zero and twenty")
+        if not 1 <= self.max_parallel_tool_calls <= 8:
+            raise ValueError("max_parallel_tool_calls must be between 1 and 8")
         object.__setattr__(self, "macro_series", validate_macro_series(self.macro_series))
         if len(self.calculations) > 20 or any(not isinstance(item, Mapping) for item in self.calculations):
             raise ValueError("calculations must contain at most 20 objects")
@@ -166,6 +169,7 @@ class ResearchRequest:
             max_tool_calls=int(value.get("max_tool_calls", 12)),
             max_network_calls=int(value.get("max_network_calls", 8)),
             max_model_calls=int(value.get("max_model_calls", 1)),
+            max_parallel_tool_calls=int(value.get("max_parallel_tool_calls", 4)),
             require_documents=bool(value.get("require_documents", True)),
             require_market_data=value.get("require_market_data"),
             require_market_history=value.get("require_market_history"),
@@ -821,6 +825,7 @@ def render_report(state: ResearchState) -> str:
     lines.append(f"- Research tool calls: {research_tool_calls}/{request.max_tool_calls}")
     lines.append(f"- Data-network attempts: {network_attempts}/{request.max_network_calls}")
     lines.append(f"- Model calls: {model_calls}/{request.max_model_calls}")
+    lines.append(f"- Parallel tool calls per plan: {request.max_parallel_tool_calls}")
     lines.append(f"- Harness audit events: {len(state.audit_events)}")
     lines.append(f"- Stop reason: {(state.stop_reason or StopReason.NO_AVAILABLE_ACTION).value}")
 

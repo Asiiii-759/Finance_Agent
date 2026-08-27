@@ -8,8 +8,8 @@
 intent → planning ↔ validation → final_generation → validation → END
 ```
 
-`planning` 由模型优先选择一个下一步工具动作并在同一节点内经 Harness 执行；Harness
-是执行 middleware，不是图节点。校验节点可以拒绝模型过早结束并送回规划。未配置模型或模型计划违反契约时，
+`planning` 由模型优先选择最多四个下一步工具动作并在同一节点内经 Harness 执行；Harness
+是执行 middleware，不是图节点。MCP 工具走渐进发现。校验节点可以拒绝模型过早结束并送回规划。未配置模型或模型计划违反契约时，
 规则规划器作为可见降级基线接管。
 
 没有证据时系统会失败关闭，不使用演示数据或模型常识填空。项目不包含交易/下单能力。
@@ -18,6 +18,7 @@ intent → planning ↔ validation → final_generation → validation → END
 
 - PDF 上传、PaddleOCR-VL-1.6 或部署注入的成熟 PDF 解析 MCP、页级引用，以及 request/session/personal BM25 + embedding/RRF 双路检索
 - 可注入内部/外部 RAG 源，以及固定 HTTPS canonical JSON 搜索网关
+- 部署期 MCP Host/Client：按 allowlist 连接本地 stdio 或固定 HTTPS MCP server，只把只读 Evidence 工具送进 Harness
 - 中英金融场景识别、结构化 ResearchScope、模型自主逐步规划与确定性规划降级
 - 受控开放网页搜索：模型生成检索式、时效窗口和域名范围；URL/内容去重、来源分散度校验，snippet 只能形成带复核提示的推断
 - 显式 provider 行情快照、adjusted/raw 历史收益、波动率和最大回撤（默认 offline）
@@ -30,7 +31,7 @@ intent → planning ↔ validation → final_generation → validation → END
 - 工具输入/输出契约、run identity、capability、网络、副作用、分账预算、重试、超时和审计控制
 - 主/备数据源重规划、模型 `finish` 证据校验与明确停止原因
 - LangGraph SQLite checkpointer、状态历史和跨 Agent 实例恢复，以及 tenant/user/thread 隔离记忆
-- 持久对话事件账本、预算驱动的“旧摘要 + 最近原始事件”、带时间/关系的实体指代，以及显式写入的个人记忆和持久 PDF 知识库
+- 持久对话事件账本、“LLM 旧摘要 + 最近 20K token 完整 run”、确定性实体/焦点指代，以及显式写入的个人记忆和持久 PDF 知识库
 - 按 entity/source/domain 平衡、按研究意图可选 document 分散、保留 provenance 的 Prompt ContextAssembler；规划 24K、生成 48K evidence 字符预算可调，并输出逐阶段 manifest
 - 只读 canonical-evidence 工具注入边界，可接企业 RAG、MCP gateway 或 licensed feed；未注入时不启用
 - 带逐字 evidence quote 验证的 LLM 合成与确定性降级
@@ -140,13 +141,17 @@ curl -X POST http://127.0.0.1:8000/api/v1/analyze-upload \
 原 PDF 仍会在上传请求结束后删除，会话中只保留解析页文本并受短 TTL 控制。
 完整边界见 [PDF、RAG 与记忆生命周期设计](docs/DOCUMENT_LIFECYCLE.md)。
 
-明确保存个人偏好（普通问答不会自动写入）：
+用户仍可明确保存、覆盖或删除个人偏好：
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/v1/memories \
   -H 'Content-Type: application/json' \
   -d '{"kind":"preference","title":"回答风格","content":"使用中文，先给结论再解释风险。","tags":["中文"]}'
 ```
+
+配置 DeepSeek、允许本次 LLM 网络调用且启用 `MAS_AUTOMATIC_MEMORY_CONSOLIDATION_ENABLED` 时，完成的对话 run
+会由专用中文 Prompt 提取最多两条长期记忆候选。明确偏好可晋升；行为推断必须在两个不同 run 中重复出现，
+临时要求、助手内容、工具结果和金融事实不会作为个人偏好。也可通过 `MAS_USER_PROFILE_PATH` 加载用户主动维护的 Markdown 长期指令。
 
 明确持久上传个人知识文档：
 
@@ -202,7 +207,9 @@ MAS_EMBEDDING_API_KEY=
 MAS_EMBEDDING_TIMEOUT_SECONDS=30
 MAS_CONVERSATION_MEMORY_ENABLED=true
 MAS_CONVERSATION_CONTEXT_TOKENS=300000
-MAS_CONVERSATION_RECENT_EVENTS=24
+MAS_CONVERSATION_RECENT_TOKENS=20000
+MAS_AUTOMATIC_MEMORY_CONSOLIDATION_ENABLED=true
+MAS_USER_PROFILE_PATH=
 MAS_PERSONAL_MEMORY_ENABLED=true
 MAS_PERSONAL_KNOWLEDGE_ENABLED=true
 MAS_MAX_PERSONAL_KNOWLEDGE_DOCUMENTS=100

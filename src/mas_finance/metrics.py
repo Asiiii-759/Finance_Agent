@@ -398,8 +398,8 @@ def financial_calculation_harness_tool(adapter: MetricEvidenceAdapter | None = N
         ToolSpec(
             name="finance.calculate",
             description=(
-                "Evaluate allowlisted financial formulas such as CAGR, percentage change, present/future value, "
-                "loan payment, annualized return/volatility, Sharpe ratio and max drawdown."
+                "计算白名单金融公式，包括 CAGR、百分比变化、现值/终值、贷款还款额、年化收益/波动率、"
+                "夏普比率和最大回撤。"
             ),
             capability="calculation",
             network_access=False,

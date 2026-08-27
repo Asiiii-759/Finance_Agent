@@ -10,6 +10,8 @@ __all__ = [
     "FinancialResearchAgent",
     "HTTPEmbeddingClient",
     "HTTPJSONRAGClient",
+    "MCPHost",
+    "McpServerConfig",
     "PDFDocumentParser",
     "PaddleOCRClient",
     "ResearchRequest",
@@ -35,6 +37,10 @@ def __getattr__(name: str) -> Any:
             "HTTPJSONRAGClient": HTTPJSONRAGClient,
             "RetrievalSource": RetrievalSource,
         }[name]
+    if name in {"MCPHost", "McpServerConfig"}:
+        from .mcp import MCPHost, McpServerConfig
+
+        return {"MCPHost": MCPHost, "McpServerConfig": McpServerConfig}[name]
     if name == "PaddleOCRClient":
         from .ocr import PaddleOCRClient
 

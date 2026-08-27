@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import Text, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+from sqlalchemy.pool import NullPool
 
 
 def utc_now() -> str:
@@ -36,7 +37,8 @@ class JobRepository:
     def __init__(self, database_url: str, db_path: Path | None = None) -> None:
         if database_url.startswith("sqlite:///") and db_path is not None:
             db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.engine = create_engine(database_url, future=True)
+        engine_options = {"poolclass": NullPool} if database_url.startswith("sqlite:///") else {}
+        self.engine = create_engine(database_url, future=True, **engine_options)
         Base.metadata.create_all(self.engine)
 
     def create_job(self, job_id: str, thread_id: str, query: str) -> None:

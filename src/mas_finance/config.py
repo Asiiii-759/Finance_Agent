@@ -5,7 +5,34 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .llm import LLMSettings
+from .mcp import McpServerConfig, parse_mcp_servers_json
 
+
+def _load_dotenv() -> None:
+    """仅填充尚未出现在进程环境中的键；pytest 下跳过，避免测试吃到本机密钥。"""
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return
+    if os.getenv("MAS_SKIP_DOTENV", "").strip().lower() in {"1", "true", "yes"}:
+        return
+    path = Path(__file__).resolve().parents[2] / ".env"
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -31,7 +58,7 @@ class AppConfig:
     fred_base_url: str = "https://api.stlouisfed.org"
     conversation_memory_enabled: bool = True
     conversation_context_tokens: int = 300_000
-    conversation_recent_events: int = 24
+    conversation_recent_tokens: int = 20_000
     session_document_ttl_seconds: int = 60 * 60
     max_session_document_sessions: int = 100
     paddleocr_access_token: str | None = field(default=None, repr=False)
@@ -44,11 +71,22 @@ class AppConfig:
     embedding_api_key: str | None = field(default=None, repr=False)
     embedding_timeout_seconds: float = 30.0
     personal_memory_enabled: bool = True
+    automatic_memory_consolidation_enabled: bool = True
+    user_profile_path: Path | None = None
     personal_knowledge_enabled: bool = True
     max_personal_knowledge_documents: int = 100
     planning_evidence_characters: int = 24_000
     synthesis_evidence_characters: int = 48_000
     synthesis_output_tokens: int = 4_096
+    mcp_servers: tuple[McpServerConfig, ...] = ()
+    alltick_token: str | None = field(default=None, repr=False)
+    biying_licence: str | None = field(default=None, repr=False)
+    enable_yfinance_fallback: bool = False
+    enable_akshare_fallback: bool = False
+    fred_max_calls_per_minute: int = 8
+    bocha_max_calls_per_minute: int = 6
+    brave_max_calls_per_minute: int = 6
+    market_max_calls_per_minute: int = 6
 
     def __post_init__(self) -> None:
         if self.market_data_provider not in {"yahoo", "alphavantage", "offline", "disabled", "none"}:
@@ -67,8 +105,8 @@ class AppConfig:
             raise ValueError("upload and PDF limits must be positive")
         if not 16_000 <= self.conversation_context_tokens <= 300_000:
             raise ValueError("conversation context budget must be between 16000 and 300000 tokens")
-        if not 4 <= self.conversation_recent_events <= 50:
-            raise ValueError("recent conversation event count must be between 4 and 50")
+        if not 4_000 <= self.conversation_recent_tokens <= 100_000:
+            raise ValueError("recent conversation budget must be between 4000 and 100000 tokens")
         if self.session_document_ttl_seconds < 60:
             raise ValueError("session document TTL must be at least 60 seconds")
         if self.max_session_document_sessions < 1:
@@ -81,15 +119,28 @@ class AppConfig:
             raise ValueError("synthesis evidence budget must be between 4000 and 200000 characters")
         if not 256 <= self.synthesis_output_tokens <= 4_096:
             raise ValueError("synthesis output tokens must be between 256 and 4096")
+        if len(self.mcp_servers) > 4:
+            raise ValueError("at most four MCP servers are supported")
+        if len({item.name for item in self.mcp_servers}) != len(self.mcp_servers):
+            raise ValueError("MCP server names must be unique")
         if bool(self.embedding_endpoint) != bool(self.embedding_model):
             raise ValueError("embedding endpoint and model must be configured together")
         if self.embedding_api_key and not self.embedding_endpoint:
             raise ValueError("embedding API key requires an embedding endpoint")
         if not 0.1 <= self.embedding_timeout_seconds <= 120:
             raise ValueError("embedding timeout must be between 0.1 and 120 seconds")
+        for name, value in (
+            ("fred_max_calls_per_minute", self.fred_max_calls_per_minute),
+            ("bocha_max_calls_per_minute", self.bocha_max_calls_per_minute),
+            ("brave_max_calls_per_minute", self.brave_max_calls_per_minute),
+            ("market_max_calls_per_minute", self.market_max_calls_per_minute),
+        ):
+            if not 1 <= value <= 60:
+                raise ValueError(f"{name} must be between 1 and 60")
 
     @classmethod
     def from_env(cls) -> AppConfig:
+        _load_dotenv()
         raw_output_dir = os.getenv("MAS_OUTPUT_DIR", "outputs")
         raw_db_path = os.getenv("MAS_DB_PATH", "data/mas_finance.db")
         return cls(
@@ -118,7 +169,7 @@ class AppConfig:
             conversation_memory_enabled=os.getenv("MAS_CONVERSATION_MEMORY_ENABLED", "true").strip().lower()
             in {"1", "true", "yes"},
             conversation_context_tokens=int(os.getenv("MAS_CONVERSATION_CONTEXT_TOKENS", "300000")),
-            conversation_recent_events=int(os.getenv("MAS_CONVERSATION_RECENT_EVENTS", "24")),
+            conversation_recent_tokens=int(os.getenv("MAS_CONVERSATION_RECENT_TOKENS", "20000")),
             session_document_ttl_seconds=int(os.getenv("MAS_SESSION_DOCUMENT_TTL_SECONDS", str(60 * 60))),
             max_session_document_sessions=int(os.getenv("MAS_MAX_SESSION_DOCUMENT_SESSIONS", "100")),
             paddleocr_access_token=os.getenv("PADDLEOCR_ACCESS_TOKEN") or None,
@@ -135,10 +186,26 @@ class AppConfig:
             embedding_timeout_seconds=float(os.getenv("MAS_EMBEDDING_TIMEOUT_SECONDS", "30")),
             personal_memory_enabled=os.getenv("MAS_PERSONAL_MEMORY_ENABLED", "true").strip().lower()
             in {"1", "true", "yes"},
+            automatic_memory_consolidation_enabled=os.getenv(
+                "MAS_AUTOMATIC_MEMORY_CONSOLIDATION_ENABLED", "true"
+            ).strip().lower()
+            in {"1", "true", "yes"},
+            user_profile_path=(Path(value) if (value := os.getenv("MAS_USER_PROFILE_PATH")) else None),
             personal_knowledge_enabled=os.getenv("MAS_PERSONAL_KNOWLEDGE_ENABLED", "true").strip().lower()
             in {"1", "true", "yes"},
             max_personal_knowledge_documents=int(os.getenv("MAS_MAX_PERSONAL_KNOWLEDGE_DOCUMENTS", "100")),
             planning_evidence_characters=int(os.getenv("MAS_PLANNING_EVIDENCE_CHARACTERS", "24000")),
             synthesis_evidence_characters=int(os.getenv("MAS_SYNTHESIS_EVIDENCE_CHARACTERS", "48000")),
             synthesis_output_tokens=int(os.getenv("MAS_SYNTHESIS_OUTPUT_TOKENS", "4096")),
+            mcp_servers=parse_mcp_servers_json(os.getenv("MAS_MCP_SERVERS")),
+            alltick_token=os.getenv("ALLTICK_TOKEN") or None,
+            biying_licence=os.getenv("BIYING_LICENCE") or None,
+            enable_yfinance_fallback=os.getenv("MAS_ENABLE_YFINANCE", "false").strip().lower()
+            in {"1", "true", "yes"},
+            enable_akshare_fallback=os.getenv("MAS_ENABLE_AKSHARE", "false").strip().lower()
+            in {"1", "true", "yes"},
+            fred_max_calls_per_minute=int(os.getenv("FRED_MAX_CALLS_PER_MINUTE", "8")),
+            bocha_max_calls_per_minute=int(os.getenv("BOCHA_MAX_CALLS_PER_MINUTE", "6")),
+            brave_max_calls_per_minute=int(os.getenv("BRAVE_MAX_CALLS_PER_MINUTE", "6")),
+            market_max_calls_per_minute=int(os.getenv("MAS_MARKET_MAX_CALLS_PER_MINUTE", "6")),
         )

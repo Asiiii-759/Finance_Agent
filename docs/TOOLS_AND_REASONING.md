@@ -12,9 +12,9 @@ MAS Finance 不为每种问题维护固定 workflow，也不允许 LLM 绕过工
 问题与显式参数
   → FinancialQueryAnalyzer
   → ResearchScope(intents + requirements + calculations)
-  → ModelPlanner 读取动态 ToolSpec 目录
-  → 每次选择一个已注册工具或 finish
-  → ToolHarness 配套校验并执行该动作
+  → ModelPlanner 读取动态 ToolSpec 目录（MCP 仅短索引 + 发现元工具）
+  → 每轮最多选择四个已注册工具或 finish
+  → ToolHarness 配套校验并执行这些动作
   → EvidenceBundle
   → CoverageAssessor
   → 缺口驱动的重规划
@@ -48,8 +48,10 @@ MAS Finance 不为每种问题维护固定 workflow，也不允许 LLM 绕过工
 | `web.search` | `web.search` | 是 | 配置 Bocha 或 Brave key | 模型自主开放检索，返回可引用网页 snippets |
 | `finance.formula` | `calculation` | 否 | 始终 | 安全执行模型/用户给出的声明式公式；不执行代码，语义结果标为 inferred |
 | `personal.search` | `document.search` | 否 | 当前用户已有个人文档 | 检索明确持久上传的个人 PDF 页文本 |
-| deployment evidence tool | 既有只读能力 | 由工具声明 | 部署注入 | 企业 RAG/MCP gateway；必须返回 canonical EvidenceBundle |
-| `llm.plan` | `model.generate` | 是 | 配置模型密钥时 | 从动态目录选择一个下一动作或 finish |
+| deployment evidence tool | 既有只读能力 | 由工具声明 | 部署注入 | 手工注入的企业 RAG；必须返回 canonical EvidenceBundle |
+| MCP Host 接入工具 | 既有只读能力 | 由 server 声明 | `MAS_MCP_SERVERS` 或 AllTick/必盈自动挂载 | 外部 MCP；模型通过渐进发现调用，不进 LLM `tools` 字段 |
+| `mcp.search_tools` / `mcp.describe_tool` / `mcp.call_tool` | `mcp.discover` / `mcp.invoke` | 视被调工具 | 已连接至少一个 MCP 工具时 | Host 侧渐进发现：短索引 → 契约 → 受控执行 |
+| `llm.plan` | `model.generate` | 是 | 配置模型密钥时 | 从动态目录选择最多四个下一动作或 finish |
 | `llm.synthesize` | `model.generate` | 是 | 配置模型密钥时 | 从证据生成受约束 claims；未配置时直接使用本地确定性合成器 |
 
 运行中的实际工具列表取决于配置和请求。API 可以查询：
@@ -130,15 +132,17 @@ GET /api/v1/tools
 }
 ```
 
-Microsoft 会形成同构 requirement。ModelPlanner 每个 graph step 选择一个动作；provider 失败、空结果或 coverage
-不足时，validation 把状态送回 planning，由模型结合历史结果重新选择，不按预设节点链执行。
+Microsoft 会形成同构 requirement。ModelPlanner 每个 graph step 最多选择四个动作并在本轮规划节点内执行；
+provider 失败、空结果或 coverage 不足时，validation 把状态送回 planning。无模型时 AdaptivePlanner 仍按 requirement
+一次列出多个候选，也会在同一 planning 访问中执行完。
 
 ## 4. ModelPlanner 的自主选择
 
 ModelPlanner 读取用户请求、intent hints、coverage、历史动作、gaps、有界 evidence 摘要和当前 ToolSpec 目录，
-返回严格 JSON `call_tool` 或 `finish`。模型决定工具、参数、检索式、时效和先后顺序；ToolSpec/Harness 决定动作
-是否合法。模型重复相同 tool+arguments 时稳定 task ID 去重；模型过早 finish 时 validation 拒绝并继续规划；
-工具返回后最低 coverage 即使已满足，模型仍会基于新 Evidence 明确决定继续检索还是 finish。
+返回严格 JSON `call_tool`、`call_tools` 或 `finish`。配置了 LLM 时由模型挑选工具；没有密钥或计划非法时才由
+AdaptivePlanner 用规则降级。MCP 具体工具默认不把完整 schema 塞进 `available_tools`，只提供短索引和
+`mcp.search_tools` / `mcp.describe_tool` / `mcp.call_tool`。模型重复相同 tool+arguments 时稳定 task ID 去重；
+模型过早 finish 时 validation 拒绝并继续规划。
 
 ### 4.1 AdaptivePlanner 降级规则
 
@@ -408,12 +412,14 @@ Evidence cards按 `entity × source_type` 分组后轮询选择，避免第一�
 
 ```json
 {
-  "summary": {"conversation_summary": "", "user_goals": [], "decisions": [], "open_questions": []},
+  "summary": {"conversation_summary": "", "user_goals": [], "requirements": [], "decisions": [], "completed_work": [], "successful_tools": [], "failed_tools": [], "unfinished_work": [], "open_questions": []},
   "recent_events": [{"kind": "user_message", "content": "分析 Apple 的估值", "occurred_at": "..."}],
   "entity_state": {"Apple": {"mention_count": 1, "symbol": "AAPL", "last_sequence": 1}},
   "focus_history": [{"sequence": 1, "entities": ["Apple"]}],
   "focus_entities": ["Apple"],
-  "manifest": {"max_context_tokens": 300000, "full_history_persisted": true, "memory_is_evidence": false}
+  "reference_resolution": {"current_entities": [], "previous_focus": ["Apple"], "resolved_entities": ["Apple"], "history_reference_used": true},
+  "run_state": [{"run_id": "run-1", "status": "completed", "tools": []}],
+  "manifest": {"max_context_tokens": 300000, "max_recent_context_tokens": 20000, "full_history_persisted": true, "memory_is_evidence": false}
 }
 ```
 
@@ -503,4 +509,9 @@ mas-finance \
 - 安全通用 web.fetch 与原始网页正文证据链。
 
 增加这些能力时仍应遵循：provider client → Evidence adapter → ToolSpec → 动态目录 → 必要的 Coverage rule → tests。
+外部 API 也可先做成 MCP server，再由 Host 过滤后进入同一条 Harness 目录。配置 `ALLTICK_TOKEN` 或
+`BIYING_LICENCE` 时，进程会自动挂载本地 `extmarket` stdio server（snapshot/history），内置
+`market.snapshot` / `market.history` 仍保留作为 AdaptivePlanner 的 fallback。FRED、Bocha、Brave、行情与
+MCP `tools/call` 都有每分钟滑动窗口限流；不要用免费档密钥做压测。官方 SEC EDGAR 仍只用
+`MAS_SEC_USER_AGENT`，第三方 SEC token 尚未接入。
 只有无模型基线也必须使用时，才补 AdaptivePlanner category routing；只注册一个函数而不补证据契约，不算完成接入。

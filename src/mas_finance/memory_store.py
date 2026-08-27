@@ -8,6 +8,8 @@ import math
 import re
 import sqlite3
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -214,15 +216,15 @@ def build_conversation_window(
     namespace: MemoryNamespace,
     *,
     max_tokens: int = 300_000,
-    recent_event_count: int = 24,
+    recent_tokens: int = 20_000,
     summarizer: ConversationSummarizer | None = None,
     token_counter: TokenCounter | None = None,
 ) -> dict[str, Any]:
     """Build the bounded prompt projection without deleting the durable event ledger."""
     if not 16_000 <= max_tokens <= 300_000:
         raise ValueError("conversation context budget must be between 16000 and 300000 tokens")
-    if not 4 <= recent_event_count <= 50:
-        raise ValueError("recent conversation event count must be between 4 and 50")
+    if not 4_000 <= recent_tokens <= 100_000:
+        raise ValueError("recent conversation budget must be between 4000 and 100000 tokens")
     _validate_conversation_namespace(namespace)
     counter = token_counter or DeepSeekV4TokenEstimator()
 
@@ -231,19 +233,21 @@ def build_conversation_window(
     summary = deepcopy(stored.summary) if stored is not None else {
         "semantic_summary": _empty_semantic_summary(),
         "entity_state": {},
+        "entity_events": [],
         "focus_history": [],
+        "run_state": {},
     }
     pending = store.list_conversation_events(namespace, after_sequence=covered)
 
     projection = _conversation_projection(summary, pending, covered)
     projection_tokens = _projection_tokens(projection, counter)
-    if projection_tokens >= int(max_tokens * 0.85) and len(pending) > recent_event_count:
+    compacted, recent = _split_recent_runs(pending, counter, recent_tokens)
+    if projection_tokens >= int(max_tokens * 0.85) and compacted:
         if summarizer is None:
             raise RuntimeError("conversation compaction requires an LLM summarizer")
-        compacted = pending[:-recent_event_count]
         summary = _merge_conversation_summary(summary, compacted, summarizer)
         covered = compacted[-1].sequence
-        pending = pending[-recent_event_count:]
+        pending = recent
         projection = _conversation_projection(summary, pending, covered)
         projection_tokens = _projection_tokens(projection, counter)
         store.put_conversation_summary(
@@ -252,15 +256,13 @@ def build_conversation_window(
             summary=summary,
         )
 
-    while projection_tokens > max_tokens and len(pending) > 4:
-        pending = pending[1:]
-        projection = _conversation_projection(summary, pending, covered)
-        projection_tokens = _projection_tokens(projection, counter)
     if projection_tokens > max_tokens:
         raise ValueError("conversation context cannot fit the configured budget")
     projection["manifest"]["estimated_token_count"] = projection_tokens
     projection["manifest"]["token_count_method"] = counter.name
     projection["manifest"]["max_context_tokens"] = max_tokens
+    projection["manifest"]["recent_context_tokens"] = _events_tokens(pending, counter)
+    projection["manifest"]["max_recent_context_tokens"] = recent_tokens
     return projection
 
 
@@ -339,7 +341,7 @@ class SQLiteMemoryStore:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS agent_memories (
@@ -398,6 +400,15 @@ class SQLiteMemoryStore:
         connection.execute("PRAGMA journal_mode=WAL")
         return connection
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def put(
         self,
         namespace: MemoryNamespace,
@@ -407,7 +418,7 @@ class SQLiteMemoryStore:
     ) -> None:
         _validate_record(key, value, metadata)
         now = _utc_now()
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO agent_memories (
@@ -433,7 +444,7 @@ class SQLiteMemoryStore:
             )
 
     def get(self, namespace: MemoryNamespace, key: str) -> MemoryRecord | None:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             row = connection.execute(
                 """
                 SELECT * FROM agent_memories WHERE tenant_id = ? AND user_id = ?
@@ -446,7 +457,7 @@ class SQLiteMemoryStore:
     def list(self, namespace: MemoryNamespace, limit: int = 100) -> list[MemoryRecord]:
         if limit < 1:
             raise ValueError("limit must be positive")
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM agent_memories WHERE tenant_id = ? AND user_id = ?
@@ -457,7 +468,7 @@ class SQLiteMemoryStore:
         return [_row_to_record(row) for row in rows]
 
     def delete_namespace(self, namespace: MemoryNamespace) -> int:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             cursor = connection.execute(
                 """
                 DELETE FROM agent_memories WHERE tenant_id = ? AND user_id = ?
@@ -469,7 +480,7 @@ class SQLiteMemoryStore:
 
     def delete(self, namespace: MemoryNamespace, key: str) -> bool:
         _validate_record_key(key)
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             cursor = connection.execute(
                 """
                 DELETE FROM agent_memories WHERE tenant_id = ? AND user_id = ?
@@ -507,7 +518,7 @@ class SQLiteMemoryStore:
             payload=dict(payload or {}),
         )
         values = _namespace_values(namespace)
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 """
@@ -581,7 +592,7 @@ class SQLiteMemoryStore:
             raise ValueError("conversation event cursor is invalid")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
             raise ValueError("conversation event limit must be between 1 and 10000")
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM conversation_events WHERE tenant_id = ? AND user_id = ?
@@ -593,7 +604,7 @@ class SQLiteMemoryStore:
 
     def get_conversation_summary(self, namespace: MemoryNamespace) -> ConversationSummaryRecord | None:
         _validate_conversation_namespace(namespace)
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             row = connection.execute(
                 """
                 SELECT * FROM conversation_summaries WHERE tenant_id = ? AND user_id = ?
@@ -636,7 +647,7 @@ class SQLiteMemoryStore:
             raise ValueError("conversation summary cursor is invalid")
         _validate_json_payload(summary, "conversation summary", 50_000)
         now = _utc_now()
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO conversation_summaries (
@@ -657,7 +668,7 @@ class SQLiteMemoryStore:
 
     def conversation_run_ids(self, namespace: MemoryNamespace) -> tuple[str, ...]:
         _validate_conversation_namespace(namespace)
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT DISTINCT run_id FROM conversation_events WHERE tenant_id = ? AND user_id = ?
@@ -669,7 +680,7 @@ class SQLiteMemoryStore:
 
     def delete_conversation(self, namespace: MemoryNamespace) -> dict[str, int]:
         _validate_conversation_namespace(namespace)
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             events = connection.execute(
                 """
                 DELETE FROM conversation_events WHERE tenant_id = ? AND user_id = ?
@@ -738,38 +749,67 @@ def _conversation_projection(
     covered_through_sequence: int,
 ) -> dict[str, Any]:
     entity_state = deepcopy(summary.get("entity_state") or {})
+    entity_events = [dict(item) for item in summary.get("entity_events") or []]
     focus_history = [dict(item) for item in summary.get("focus_history") or []]
+    run_state = deepcopy(summary.get("run_state") or {})
     for event in events:
-        if event.kind is not ConversationEventKind.USER_MESSAGE:
-            continue
-        for entity in event.entities:
-            state = entity_state.setdefault(
-                entity,
+        atom = _entity_event_atom(event)
+        if atom is not None:
+            entity_events.append(atom)
+        run = run_state.setdefault(
+            event.run_id,
+            {
+                "run_id": event.run_id,
+                "status": "unfinished",
+                "started_at": event.occurred_at,
+                "last_sequence": event.sequence,
+                "tools": [],
+            },
+        )
+        run["last_sequence"] = event.sequence
+        if event.kind is ConversationEventKind.USER_MESSAGE:
+            run["request"] = event.content[:500]
+            for entity in event.entities:
+                state = entity_state.setdefault(
+                    entity,
+                    {
+                        "first_seen_at": event.occurred_at,
+                        "last_seen_at": event.occurred_at,
+                        "last_sequence": event.sequence,
+                        "mention_count": 0,
+                    },
+                )
+                state["last_seen_at"] = event.occurred_at
+                state["last_sequence"] = event.sequence
+                state["mention_count"] = int(state["mention_count"]) + 1
+                symbols = event.payload.get("entity_symbols") or {}
+                if isinstance(symbols, dict) and isinstance(symbols.get(entity), str):
+                    state["symbol"] = symbols[entity]
+            for relation in event.relations:
+                if relation.predicate == "has_symbol" and relation.subject in entity_state:
+                    entity_state[relation.subject]["symbol"] = relation.object
+            if event.entities:
+                focus_history.append(
+                    {
+                        "sequence": event.sequence,
+                        "occurred_at": event.occurred_at,
+                        "entities": list(event.entities),
+                    }
+                )
+        elif event.kind is ConversationEventKind.TOOL_EVENT:
+            run["tools"].append(
                 {
-                    "first_seen_at": event.occurred_at,
-                    "last_seen_at": event.occurred_at,
-                    "last_sequence": event.sequence,
-                    "mention_count": 0,
-                },
-            )
-            state["last_seen_at"] = event.occurred_at
-            state["last_sequence"] = event.sequence
-            state["mention_count"] = int(state["mention_count"]) + 1
-            symbols = event.payload.get("entity_symbols") or {}
-            if isinstance(symbols, dict) and isinstance(symbols.get(entity), str):
-                state["symbol"] = symbols[entity]
-        for relation in event.relations:
-            if relation.predicate == "has_symbol" and relation.subject in entity_state:
-                entity_state[relation.subject]["symbol"] = relation.object
-        if event.entities:
-            focus_history.append(
-                {
-                    "sequence": event.sequence,
-                    "occurred_at": event.occurred_at,
-                    "entities": list(event.entities),
+                    "tool_name": event.payload.get("tool_name"),
+                    "result_status": event.payload.get("result_status"),
+                    "error_code": event.payload.get("error_code"),
+                    "attempts": event.payload.get("attempts"),
                 }
             )
+        else:
+            run["status"] = "completed"
+            run["outcome_status"] = event.payload.get("status")
     focus_history = focus_history[-50:]
+    entity_events = entity_events[-100:]
     if focus_history:
         focus_entities = list(focus_history[-1]["entities"])
     else:
@@ -780,32 +820,15 @@ def _conversation_projection(
         )
         focus_entities = [name for name, _ in ranked[:10]]
 
-    safe_payload_keys = {
-        "attempts",
-        "capability",
-        "claim_count",
-        "error_code",
-        "gap_codes",
-        "network_attempts",
-        "result_status",
-        "source_count",
-        "status",
-        "tool_name",
-    }
-    recent_events = []
-    for event in events:
-        value = event.to_dict()
-        value.pop("relations", None)
-        value["payload"] = {
-            key: item for key, item in value["payload"].items() if key in safe_payload_keys
-        }
-        recent_events.append(value)
+    ordered_runs = sorted(run_state.values(), key=lambda item: int(item["last_sequence"]))[-20:]
     return {
         "summary": dict(summary.get("semantic_summary") or _empty_semantic_summary()),
-        "recent_events": recent_events,
+        "recent_events": [_prompt_event(event) for event in events],
         "entity_state": entity_state,
+        "entity_events": entity_events,
         "focus_history": focus_history,
         "focus_entities": focus_entities,
+        "run_state": ordered_runs,
         "manifest": {
             "covered_through_sequence": covered_through_sequence,
             "recent_event_count": len(events),
@@ -841,26 +864,137 @@ def _merge_conversation_summary(
     return {
         "semantic_summary": semantic_summary,
         "entity_state": dict(list(projection["entity_state"].items())[-50:]),
+        "entity_events": projection["entity_events"][-100:],
         "focus_history": projection["focus_history"][-50:],
+        "run_state": {item["run_id"]: item for item in projection["run_state"][-20:]},
     }
+
+
+def _entity_event_atom(event: ConversationEvent) -> dict[str, Any] | None:
+    if not event.entities:
+        return None
+    if event.kind is ConversationEventKind.USER_MESSAGE:
+        if len(event.entities) > 1 and re.search(r"比较|对比|区别|孰优|versus|\bvs\.?\b|compare", event.content, re.I):
+            action = "comparison_requested"
+            fact = f"用户请求比较：{'、'.join(event.entities)}"
+        elif re.search(r"计算|测算|回撤|收益率|cagr|指标|估值", event.content, re.I):
+            action = "calculation_requested"
+            fact = f"用户请求计算或分析：{'、'.join(event.entities)}"
+        else:
+            action = "mentioned"
+            fact = f"用户提到：{'、'.join(event.entities)}"
+        status = "requested"
+    elif event.kind is ConversationEventKind.TOOL_EVENT:
+        action = f"tool:{event.payload.get('tool_name') or 'unknown'}"
+        status = str(event.payload.get("result_status") or "unknown")
+        fact = f"{action} {status}"
+    else:
+        action = "response_completed"
+        status = str(event.payload.get("status") or "completed")
+        fact = "已生成本轮回答"
+    return {
+        "event_id": event.event_id,
+        "sequence": event.sequence,
+        "occurred_at": event.occurred_at,
+        "run_id": event.run_id,
+        "action": action,
+        "entities": list(event.entities),
+        "status": status,
+        "fact": fact,
+        "confidence": "explicit" if event.kind is ConversationEventKind.USER_MESSAGE else "observed",
+    }
+
+
+def _prompt_event(event: ConversationEvent) -> dict[str, Any]:
+    safe_payload_keys = {
+        "attempts",
+        "capability",
+        "claim_count",
+        "error_code",
+        "gap_codes",
+        "network_attempts",
+        "result_status",
+        "source_count",
+        "status",
+        "tool_name",
+    }
+    value = event.to_dict()
+    value.pop("relations", None)
+    value["payload"] = {
+        key: item for key, item in value["payload"].items() if key in safe_payload_keys
+    }
+    return value
+
+
+def _events_tokens(events: list[ConversationEvent], counter: TokenCounter) -> int:
+    return counter.count(json.dumps([_prompt_event(event) for event in events], ensure_ascii=False, sort_keys=True))
+
+
+def _split_recent_runs(
+    events: list[ConversationEvent],
+    counter: TokenCounter,
+    recent_tokens: int,
+) -> tuple[list[ConversationEvent], list[ConversationEvent]]:
+    if not events:
+        return [], []
+    runs: list[list[ConversationEvent]] = []
+    for event in events:
+        if not runs or runs[-1][-1].run_id != event.run_id:
+            runs.append([])
+        runs[-1].append(event)
+    selected: list[list[ConversationEvent]] = []
+    used = 0
+    for run in reversed(runs):
+        run_tokens = _events_tokens(run, counter)
+        if selected and used + run_tokens > recent_tokens:
+            break
+        selected.append(run)
+        used += run_tokens
+    selected.reverse()
+    recent = [event for run in selected for event in run]
+    return events[: len(events) - len(recent)], recent
 
 
 def _empty_semantic_summary() -> dict[str, Any]:
     return {
         "conversation_summary": "",
         "user_goals": [],
+        "requirements": [],
         "decisions": [],
+        "completed_work": [],
+        "successful_tools": [],
+        "failed_tools": [],
+        "unfinished_work": [],
         "open_questions": [],
     }
 
 
 def _validate_semantic_summary(value: dict[str, Any]) -> None:
-    expected = {"conversation_summary", "user_goals", "decisions", "open_questions"}
+    expected = {
+        "conversation_summary",
+        "user_goals",
+        "requirements",
+        "decisions",
+        "completed_work",
+        "successful_tools",
+        "failed_tools",
+        "unfinished_work",
+        "open_questions",
+    }
     if not isinstance(value, dict) or set(value) != expected:
         raise ValueError("conversation summary must use the required schema")
     if not isinstance(value["conversation_summary"], str) or len(value["conversation_summary"]) > 20_000:
         raise ValueError("conversation summary text is invalid")
-    for name, limit in (("user_goals", 50), ("decisions", 50), ("open_questions", 30)):
+    for name, limit in (
+        ("user_goals", 50),
+        ("requirements", 50),
+        ("decisions", 50),
+        ("completed_work", 100),
+        ("successful_tools", 100),
+        ("failed_tools", 100),
+        ("unfinished_work", 50),
+        ("open_questions", 30),
+    ):
         items = value[name]
         if (
             not isinstance(items, list)

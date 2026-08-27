@@ -32,7 +32,14 @@ from .market import (
     market_history_harness_tool,
 )
 from .market_data import DEFAULT_TICKER_MAP, MarketDataClient
+from .mcp import MCPHost, builtin_extmarket_server_config, mcp_discovery_tools
+from .memory_consolidation import (
+    LLMLongTermMemoryExtractor,
+    LongTermMemoryCandidate,
+    LongTermMemoryExtractor,
+)
 from .memory_store import (
+    ConversationEvent,
     ConversationEventKind,
     ConversationSummarizer,
     MemoryNamespace,
@@ -46,6 +53,7 @@ from .metrics import describe_metric_operations, financial_calculation_harness_t
 from .ocr import PaddleOCRClient
 from .personal_knowledge import PersonalKnowledgeClient, SQLitePersonalKnowledgeBase
 from .planning import ModelPlanner, llm_planning_harness_tool
+from .rate_limit import RateLimit, RateLimiter
 from .reporting import export_run_artifacts
 from .retrieval import RetrievalEvidenceAdapter, RetrievalSource, retrieval_harness_tool
 from .sec import (
@@ -75,6 +83,8 @@ class FinanceAnalysisService:
         embedding_provider: EmbeddingProvider | None = None,
         conversation_summarizer: ConversationSummarizer | None = None,
         conversation_token_counter: TokenCounter | None = None,
+        long_term_memory_extractor: LongTermMemoryExtractor | None = None,
+        mcp_host: MCPHost | None = None,
     ) -> None:
         self.config = config
         self.retrieval_sources = tuple(retrieval_sources)
@@ -93,6 +103,7 @@ class FinanceAnalysisService:
         self.pdf_parser_network_access = pdf_parser_network_access
         self.conversation_summarizer = conversation_summarizer
         self.conversation_token_counter = conversation_token_counter
+        self.long_term_memory_extractor = long_term_memory_extractor
         if embedding_provider is not None and config.embedding_endpoint:
             raise ValueError("inject either an embedding provider or configured embedding endpoint, not both")
         self.embedding_provider = embedding_provider or (
@@ -135,6 +146,9 @@ class FinanceAnalysisService:
             "web.search",
             "llm.plan",
             "llm.synthesize",
+            "mcp.search_tools",
+            "mcp.describe_tool",
+            "mcp.call_tool",
         }
         if set(extension_names).intersection(reserved_names | set(retrieval_names)):
             raise ValueError("deployment evidence tool name collides with a built-in tool")
@@ -154,6 +168,38 @@ class FinanceAnalysisService:
             for tool in self.evidence_tools
         ):
             raise ValueError("deployment evidence tools must be read-only canonical evidence tools")
+        extra_mcp = builtin_extmarket_server_config(
+            alltick_token=config.alltick_token,
+            biying_licence=config.biying_licence,
+            existing_names=[item.name for item in config.mcp_servers],
+            existing_count=len(config.mcp_servers),
+            enable_yfinance=config.enable_yfinance_fallback,
+            enable_akshare=config.enable_akshare_fallback,
+            max_calls_per_minute=config.market_max_calls_per_minute,
+        )
+        mcp_servers = (*config.mcp_servers, extra_mcp) if extra_mcp is not None else config.mcp_servers
+        self.mcp_host = mcp_host or MCPHost(mcp_servers)
+        self._rate_limiter = RateLimiter()
+        try:
+            self.mcp_host.connect()
+            self.mcp_tools = self.mcp_host.tools()
+            if len(self.mcp_tools) > 20:
+                raise ValueError("at most twenty MCP tools are supported")
+            mcp_names = [tool.spec.name for tool in self.mcp_tools]
+            if len(mcp_names) != len(set(mcp_names)):
+                raise ValueError("MCP tool names must be unique")
+            if set(mcp_names).intersection(reserved_names | set(retrieval_names) | set(extension_names)):
+                raise ValueError("MCP tool name collides with a built-in or injected tool")
+            if any(
+                tool.spec.side_effect != SideEffect.READ_ONLY
+                or tool.spec.result_kind != ToolResultKind.EVIDENCE_BUNDLE
+                or tool.spec.capability not in allowed_extension_capabilities
+                for tool in self.mcp_tools
+            ):
+                raise ValueError("MCP tools must be read-only canonical evidence tools")
+        except Exception:
+            self.mcp_host.close()
+            raise
         self._repository: JobRepository | None = None
         self._memory_store: SQLiteMemoryStore | None = None
         self._personal_knowledge_store: SQLitePersonalKnowledgeBase | None = None
@@ -162,15 +208,30 @@ class FinanceAnalysisService:
         self._session_documents: dict[tuple[str, str, str], tuple[datetime, tuple[dict, ...]]] = {}
         self._session_documents_lock = RLock()
         self.config.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._graph_checkpoint_connection = sqlite3.connect(
-            self.config.db_path,
-            timeout=15,
-            check_same_thread=False,
-        )
-        self._graph_checkpointer = SqliteSaver(self._graph_checkpoint_connection)
+        self._graph_checkpoint_connection: sqlite3.Connection | None = None
+        self._graph_checkpointer: SqliteSaver | None = None
 
     def close(self) -> None:
-        self._graph_checkpoint_connection.close()
+        try:
+            self.mcp_host.close()
+        finally:
+            self._close_graph_checkpointer()
+
+    def _open_graph_checkpointer(self) -> SqliteSaver:
+        if self._graph_checkpointer is None:
+            self._graph_checkpoint_connection = sqlite3.connect(
+                self.config.db_path,
+                timeout=15,
+                check_same_thread=False,
+            )
+            self._graph_checkpointer = SqliteSaver(self._graph_checkpoint_connection)
+        return self._graph_checkpointer
+
+    def _close_graph_checkpointer(self) -> None:
+        if self._graph_checkpoint_connection is not None:
+            self._graph_checkpoint_connection.close()
+        self._graph_checkpoint_connection = None
+        self._graph_checkpointer = None
 
     @property
     def repository(self) -> JobRepository:
@@ -424,6 +485,34 @@ class FinanceAnalysisService:
             }
             for tool in self.evidence_tools
         )
+        tools.extend(
+            {
+                "name": tool.spec.name,
+                "capability": tool.spec.capability,
+                "description": tool.spec.description,
+                "network_access": tool.spec.network_access,
+                "availability": "mcp_connected",
+                "support_tier": "mcp_host_filtered",
+                "input_contract": tool.spec.arguments.to_dict(),
+                "result_contract": tool.spec.result_kind.value,
+                "visibility": "mcp_index",
+            }
+            for tool in self.mcp_tools
+        )
+        tools.extend(
+            {
+                "name": tool.spec.name,
+                "capability": tool.spec.capability,
+                "description": tool.spec.description,
+                "network_access": tool.spec.network_access,
+                "availability": "mcp_connected",
+                "support_tier": "mcp_progressive_discovery",
+                "input_contract": tool.spec.arguments.to_dict(),
+                "result_contract": tool.spec.result_kind.value,
+                "visibility": "planner_meta",
+            }
+            for tool in mcp_discovery_tools(self.mcp_host)
+        )
         return tools
 
     def analyze(
@@ -465,6 +554,13 @@ class FinanceAnalysisService:
         conversation_summarizer = self.conversation_summarizer or (
             LLMConversationSummarizer(llm_client) if llm_client is not None and network_allowed else None
         )
+        memory_extractor = self.long_term_memory_extractor or (
+            LLMLongTermMemoryExtractor(llm_client)
+            if llm_client is not None
+            and network_allowed
+            and self.config.automatic_memory_consolidation_enabled
+            else None
+        )
         thread_context = self._load_conversation_context(
             tenant_id,
             user_id,
@@ -472,15 +568,20 @@ class FinanceAnalysisService:
             summarizer=conversation_summarizer,
         )
         personal_context = (
-            self._recall_personal_memories(tenant_id, user_id, query)
+            (*self._user_profile_context(), *self._recall_personal_memories(tenant_id, user_id, query))
             if use_personal_memory and self.config.personal_memory_enabled
             else ()
         )
+        tool_usage_context = self._recall_tool_usage_memory(tenant_id, user_id, query)
         harness = ToolHarness()
         harness.register(financial_calculation_harness_tool())
         harness.register(formula_harness_tool())
         harness.register(finance_knowledge_harness_tool())
         for tool in self.evidence_tools:
+            harness.register(tool)
+        for tool in self.mcp_tools:
+            harness.register(tool)
+        for tool in mcp_discovery_tools(self.mcp_host):
             harness.register(tool)
         if llm_client is not None:
             harness.register(
@@ -498,13 +599,25 @@ class FinanceAnalysisService:
         if self.config.bocha_search_api_key:
             harness.register(
                 web_search_harness_tool(
-                    WebSearchEvidenceAdapter(BochaWebSearchClient(self.config.bocha_search_api_key))
+                    WebSearchEvidenceAdapter(
+                        BochaWebSearchClient(
+                            self.config.bocha_search_api_key,
+                            rate_limiter=self._rate_limiter,
+                            rate_limit=RateLimit(self.config.bocha_max_calls_per_minute),
+                        )
+                    )
                 )
             )
         elif self.config.brave_search_api_key:
             harness.register(
                 web_search_harness_tool(
-                    WebSearchEvidenceAdapter(BraveWebSearchClient(self.config.brave_search_api_key))
+                    WebSearchEvidenceAdapter(
+                        BraveWebSearchClient(
+                            self.config.brave_search_api_key,
+                            rate_limiter=self._rate_limiter,
+                            rate_limit=RateLimit(self.config.brave_max_calls_per_minute),
+                        )
+                    )
                 )
             )
 
@@ -554,6 +667,7 @@ class FinanceAnalysisService:
         document_tool_names.extend(
             tool.spec.name for tool in self.evidence_tools if tool.spec.capability == "document.search"
         )
+        document_tool_names.extend(self._mcp_planner_names("document"))
         if document_contexts:
             corpus = InMemoryCorpus(embedding_provider=self.embedding_provider)
             ingested_chunks = 0
@@ -594,8 +708,8 @@ class FinanceAnalysisService:
                     corpus_adapter,
                     fixed_search_mode="lexical",
                     description=(
-                        "Run deterministic BM25 search over current request/session PDFs. Use for exact terms, "
-                        "names, identifiers and when embedding search is unavailable."
+                        "对当前请求/会话 PDF 执行确定性 BM25 搜索。适用于精确词项、名称、标识符，以及 embedding "
+                        "搜索不可用时。"
                     ),
                 )
             )
@@ -607,8 +721,8 @@ class FinanceAnalysisService:
                         network_access=self.embedding_provider.network_access,
                         fixed_search_mode="hybrid",
                         description=(
-                            "Run BM25 and semantic embedding retrieval over current request/session PDFs and "
-                            "fuse both rankings with RRF. Prefer for paraphrases, synonyms and cross-language queries."
+                            "对当前请求/会话 PDF 执行 BM25 与语义 embedding 检索，并用 RRF 融合排名。优先用于改写、"
+                            "同义词和跨语言查询。"
                         ),
                     )
                 )
@@ -648,8 +762,8 @@ class FinanceAnalysisService:
                     name="personal.search",
                     fixed_search_mode="lexical",
                     description=(
-                        "Run deterministic BM25 search over the user's persistent financial documents. Set "
-                        "diversify_documents=true only for explicit cross-document comparison or synthesis."
+                        "对用户持久金融文档执行确定性 BM25 搜索。只有在明确跨文档比较或综合时，"
+                        "才设置 diversify_documents=true。"
                     ),
                 )
             )
@@ -661,8 +775,8 @@ class FinanceAnalysisService:
                         network_access=self.embedding_provider.network_access,
                         fixed_search_mode="hybrid",
                         description=(
-                            "Run BM25 and semantic embedding retrieval over the user's persistent documents and "
-                            "fuse both rankings with RRF. Prefer for paraphrases, synonyms and cross-language queries."
+                            "对用户持久文档执行 BM25 与语义 embedding 检索，并用 RRF 融合排名。优先用于改写、"
+                            "同义词和跨语言查询。"
                         ),
                     )
                 )
@@ -686,10 +800,27 @@ class FinanceAnalysisService:
             detected_entities=detected_entities,
             conversation_context=thread_context,
         )
+        request_thread_context = dict(thread_context) if use_thread_context else {}
+        if request_thread_context:
+            current_entities = _normalized_entities([*(entities or []), *detected_entities])
+            previous_focus = _normalized_entities(thread_context.get("focus_entities") or [])
+            request_thread_context["reference_resolution"] = {
+                "current_entities": list(current_entities),
+                "previous_focus": list(previous_focus),
+                "resolved_entities": list(requested_entities),
+                "history_reference_used": any(entity not in current_entities for entity in requested_entities),
+            }
+            request_thread_context["entity_replay"] = self._select_entity_replay(
+                thread_context.get("entity_events") or [],
+                query=query,
+                entities=requested_entities,
+            )
         if requested_entities:
             market_client = MarketDataClient(
                 provider=self.config.market_data_provider,
                 alphavantage_api_key=self.config.alphavantage_api_key,
+                rate_limiter=self._rate_limiter,
+                rate_limit=RateLimit(self.config.market_max_calls_per_minute),
             )
             harness.register(
                 market_data_harness_tool(
@@ -727,6 +858,8 @@ class FinanceAnalysisService:
                         FREDClient(
                             self.config.fred_api_key,
                             base_url=self.config.fred_base_url,
+                            rate_limiter=self._rate_limiter,
+                            rate_limit=RateLimit(self.config.fred_max_calls_per_minute),
                         )
                     )
                 )
@@ -751,7 +884,8 @@ class FinanceAnalysisService:
             run_id=actual_run_id,
             allow_network=network_allowed,
             max_iterations=6,
-            max_model_calls=7 if llm_client is not None else 1,
+            max_model_calls=8 if llm_client is not None else 1,
+            max_parallel_tool_calls=4,
             require_documents=document_research_required,
             require_market_data=require_market_data,
             require_market_history=require_market_history,
@@ -760,7 +894,7 @@ class FinanceAnalysisService:
             market_history_interval=market_history_interval,
             macro_series=tuple(macro_series or ()),
             calculations=tuple(dict(item) for item in (calculations or ())),
-            thread_context=thread_context if use_thread_context else {},
+            thread_context=request_thread_context,
             personal_context=personal_context,
             available_document_count=len(document_contexts) + len(personal_documents),
         )
@@ -780,11 +914,13 @@ class FinanceAnalysisService:
                 planner=(
                     ModelPlanner(
                         harness,
-                        fallback=AdaptivePlanner(document_tools=tuple(document_tool_names)),
+                        fallback=self._adaptive_planner(document_tool_names),
                         max_evidence_chars=self.config.planning_evidence_characters,
+                        mcp_tool_index=self._mcp_tool_index(),
+                        tool_usage_context=tool_usage_context,
                     )
                     if llm_client is not None
-                    else AdaptivePlanner(document_tools=tuple(document_tool_names))
+                    else self._adaptive_planner(document_tool_names)
                 ),
                 synthesizer=(
                     EvidenceBoundLLMSynthesizer(
@@ -796,9 +932,13 @@ class FinanceAnalysisService:
                     if llm_client is not None
                     else DeterministicSynthesizer()
                 ),
-                checkpointer=self._graph_checkpointer,
+                checkpointer=self._open_graph_checkpointer(),
+                planner_hidden_tool_names=(
+                    frozenset(tool.spec.name for tool in self.mcp_tools) if llm_client is not None else frozenset()
+                ),
             ).run(request, resume=resume)
         finally:
+            self._close_graph_checkpointer()
             if self.config.conversation_memory_enabled:
                 namespace = self._conversation_namespace(tenant_id, user_id, actual_thread_id)
                 for audit in harness.audit_events(actual_run_id):
@@ -809,6 +949,7 @@ class FinanceAnalysisService:
                         content=f"{audit['tool_name']}: {audit['result_status']}",
                         occurred_at=str(audit["timestamp"]),
                         run_id=actual_run_id,
+                        entities=requested_entities,
                         payload={
                             key: audit.get(key)
                             for key in (
@@ -830,6 +971,7 @@ class FinanceAnalysisService:
                 kind=ConversationEventKind.ASSISTANT_MESSAGE,
                 content=str(result["report"]),
                 run_id=actual_run_id,
+                entities=requested_entities,
                 payload={
                     "status": result["status"],
                     "claim_count": len(result.get("claims") or ()),
@@ -845,9 +987,28 @@ class FinanceAnalysisService:
                 self.memory_store,
                 namespace,
                 max_tokens=self.config.conversation_context_tokens,
-                recent_event_count=self.config.conversation_recent_events,
+                recent_tokens=self.config.conversation_recent_tokens,
                 summarizer=conversation_summarizer,
                 token_counter=self.conversation_token_counter,
+            )
+            if memory_extractor is not None and use_personal_memory and self.config.personal_memory_enabled:
+                run_events = tuple(
+                    event
+                    for event in self.memory_store.list_conversation_events(namespace)
+                    if event.run_id == actual_run_id and event.kind is ConversationEventKind.USER_MESSAGE
+                )
+                self._consolidate_long_term_memory(
+                    tenant_id,
+                    user_id,
+                    actual_thread_id,
+                    actual_run_id,
+                    run_events,
+                    memory_extractor,
+                )
+            self._record_tool_usage_memory(
+                tenant_id,
+                user_id,
+                harness.audit_events(actual_run_id),
             )
 
         artifacts: dict[str, str] = {}
@@ -991,6 +1152,36 @@ class FinanceAnalysisService:
             thread_id=stable_id("thread", {"value": thread_id}),
         )
 
+    def _mcp_tool_index(self) -> tuple[dict[str, object], ...]:
+        return tuple(
+            {
+                "name": tool.spec.name,
+                "capability": tool.spec.capability,
+                "network_access": tool.spec.network_access,
+                "description": tool.spec.description[:200],
+                "planner_category": self.mcp_host.planner_category_for(tool.spec.name),
+            }
+            for tool in self.mcp_tools
+        )
+
+    def _mcp_planner_names(self, category: str) -> tuple[str, ...]:
+        return tuple(
+            tool.spec.name
+            for tool in self.mcp_tools
+            if self.mcp_host.planner_category_for(tool.spec.name) == category
+        )
+
+    def _adaptive_planner(self, document_tool_names: Sequence[str]) -> AdaptivePlanner:
+        return AdaptivePlanner(
+            document_tools=tuple(document_tool_names),
+            market_tools=("market.snapshot", *self._mcp_planner_names("market")),
+            market_history_tools=("market.history", *self._mcp_planner_names("market_history")),
+            regulatory_tools=("sec.company_facts", *self._mcp_planner_names("regulatory")),
+            filing_tools=("sec.recent_filings", *self._mcp_planner_names("filings")),
+            macro_tools=("macro.fred_series", *self._mcp_planner_names("macro")),
+            web_tools=("web.search", *self._mcp_planner_names("web")),
+        )
+
     def _load_conversation_context(
         self,
         tenant_id: str,
@@ -1005,7 +1196,7 @@ class FinanceAnalysisService:
             self.memory_store,
             self._conversation_namespace(tenant_id, user_id, thread_id),
             max_tokens=self.config.conversation_context_tokens,
-            recent_event_count=self.config.conversation_recent_events,
+            recent_tokens=self.config.conversation_recent_tokens,
             summarizer=summarizer,
             token_counter=self.conversation_token_counter,
         )
@@ -1021,12 +1212,16 @@ class FinanceAnalysisService:
         namespace = self._conversation_namespace(tenant_id, user_id, thread_id)
         run_ids = self.memory_store.conversation_run_ids(namespace)
         deleted = self.memory_store.delete_conversation(namespace)
-        for stored_run_id in run_ids:
-            checkpoint_thread_id = stable_id(
-                "run",
-                {"tenant_id": tenant_id, "thread_id": thread_id, "run_id": stored_run_id},
-            )
-            self._graph_checkpointer.delete_thread(checkpoint_thread_id)
+        checkpointer = self._open_graph_checkpointer()
+        try:
+            for stored_run_id in run_ids:
+                checkpoint_thread_id = stable_id(
+                    "run",
+                    {"tenant_id": tenant_id, "thread_id": thread_id, "run_id": stored_run_id},
+                )
+                checkpointer.delete_thread(checkpoint_thread_id)
+        finally:
+            self._close_graph_checkpointer()
         return {**deleted, "checkpoints": len(run_ids)}
 
     def _personal_memory_namespace(self, tenant_id: str, user_id: str) -> MemoryNamespace:
@@ -1036,6 +1231,14 @@ class FinanceAnalysisService:
             user_id=user_key,
             kind="personal_memory",
         )
+
+    def _personal_memory_candidate_namespace(self, tenant_id: str, user_id: str) -> MemoryNamespace:
+        tenant_key, user_key = _personal_principal_ids(tenant_id, user_id)
+        return MemoryNamespace(tenant_id=tenant_key, user_id=user_key, kind="personal_memory_candidates")
+
+    def _tool_usage_memory_namespace(self, tenant_id: str, user_id: str) -> MemoryNamespace:
+        tenant_key, user_key = _personal_principal_ids(tenant_id, user_id)
+        return MemoryNamespace(tenant_id=tenant_key, user_id=user_key, kind="tool_usage_memory")
 
     def save_personal_memory(
         self,
@@ -1065,6 +1268,7 @@ class FinanceAnalysisService:
             metadata={
                 "schema_version": 1,
                 "write_policy": "explicit_user_action",
+                "source": "user",
                 "contains_financial_evidence": False,
             },
         )
@@ -1096,6 +1300,7 @@ class FinanceAnalysisService:
                         **memory.to_dict(),
                         "created_at": record.created_at,
                         "updated_at": record.updated_at,
+                        "metadata": dict(record.metadata),
                     }
                 )
         return result
@@ -1143,6 +1348,246 @@ class FinanceAnalysisService:
             if len(selected) == 8:
                 break
         return tuple(selected)
+
+    def _user_profile_context(self) -> tuple[dict, ...]:
+        path = self.config.user_profile_path
+        if path is None:
+            return ()
+        content = path.read_text(encoding="utf-8").strip()
+        if not content or len(content) > 8_000:
+            raise ValueError("用户长期指令文件必须包含 1 到 8000 个字符")
+        return (
+            {
+                "kind": "user_instructions",
+                "title": path.name,
+                "content": content,
+                "source": "user_managed_file",
+                "authority": "低于系统规则，高于系统推断记忆",
+            },
+        )
+
+    def _consolidate_long_term_memory(
+        self,
+        tenant_id: str,
+        user_id: str,
+        thread_id: str,
+        run_id: str,
+        events: Sequence[ConversationEvent],
+        extractor: LongTermMemoryExtractor,
+    ) -> None:
+        existing = self.list_personal_memories(tenant_id=tenant_id, user_id=user_id)
+        candidates = extractor.extract(events, existing)
+        for candidate in candidates:
+            if candidate.confidence < 0.75 or candidate.operation == "ignore":
+                continue
+            self._merge_long_term_memory_candidate(
+                tenant_id,
+                user_id,
+                thread_id,
+                run_id,
+                candidate,
+                existing,
+            )
+
+    def _merge_long_term_memory_candidate(
+        self,
+        tenant_id: str,
+        user_id: str,
+        thread_id: str,
+        run_id: str,
+        candidate: LongTermMemoryCandidate,
+        existing: list[dict],
+    ) -> None:
+        matched = _matching_memory(candidate, existing)
+        if matched is not None:
+            metadata = dict(matched.get("metadata") or {})
+            evidence_runs = list(dict.fromkeys([*(metadata.get("evidence_run_ids") or []), run_id]))
+            metadata.update(
+                {
+                    "schema_version": 2,
+                    "evidence_run_ids": evidence_runs,
+                    "last_evidence_thread_id": stable_id("thread", {"value": thread_id}),
+                    "confidence": max(float(metadata.get("confidence") or 0), candidate.confidence),
+                    "contains_financial_evidence": False,
+                }
+            )
+            value = PersonalMemory.from_dict(
+                {
+                    key: matched[key] for key in ("kind", "title", "content", "tags")
+                }
+            ).to_dict()
+            if candidate.operation == "conflict":
+                self.memory_store.put(
+                    self._personal_memory_candidate_namespace(tenant_id, user_id),
+                    stable_id("conflict", {"memory_id": matched["memory_id"], "run_id": run_id}),
+                    {
+                        "kind": candidate.kind.value,
+                        "title": candidate.title,
+                        "content": candidate.content,
+                        "scope": candidate.scope,
+                        "explicitness": candidate.explicitness,
+                        "confidence": candidate.confidence,
+                        "operation": candidate.operation,
+                        "tags": list(candidate.tags),
+                    },
+                    metadata={"schema_version": 1, "status": "conflict", "evidence_run_ids": [run_id]},
+                )
+                return
+            if (
+                metadata.get("write_policy") != "explicit_user_action"
+                and candidate.explicitness == "explicit"
+                and candidate.operation == "update"
+            ):
+                value = PersonalMemory(
+                    candidate.kind,
+                    candidate.title,
+                    candidate.content,
+                    candidate.tags,
+                ).to_dict()
+                metadata["write_policy"] = "automatic_llm_consolidation"
+                metadata["scope"] = candidate.scope
+            self.memory_store.put(
+                self._personal_memory_namespace(tenant_id, user_id),
+                matched["memory_id"],
+                value,
+                metadata=metadata,
+            )
+            return
+
+        candidate_key = stable_id(
+            "candidate",
+            {"kind": candidate.kind.value, "title": candidate.title.casefold()},
+        )
+        namespace = self._personal_memory_candidate_namespace(tenant_id, user_id)
+        stored = self.memory_store.get(namespace, candidate_key)
+        prior_runs = (stored.metadata.get("evidence_run_ids") or []) if stored else []
+        evidence_runs = list(dict.fromkeys([*prior_runs, run_id]))
+        value = {
+            "kind": candidate.kind.value,
+            "title": candidate.title,
+            "content": candidate.content,
+            "scope": candidate.scope,
+            "explicitness": candidate.explicitness,
+            "confidence": candidate.confidence,
+            "operation": candidate.operation,
+            "tags": list(candidate.tags),
+        }
+        metadata = {
+            "schema_version": 1,
+            "evidence_run_ids": evidence_runs,
+            "last_evidence_thread_id": stable_id("thread", {"value": thread_id}),
+        }
+        self.memory_store.put(namespace, candidate_key, value, metadata=metadata)
+        should_promote = candidate.explicitness == "explicit" or len(evidence_runs) >= 2
+        if not should_promote:
+            return
+        memory = PersonalMemory(candidate.kind, candidate.title, candidate.content, candidate.tags)
+        memory_id = stable_id(
+            "mem",
+            {"kind": candidate.kind.value, "title": candidate.title.casefold()},
+        )
+        self.memory_store.put(
+            self._personal_memory_namespace(tenant_id, user_id),
+            memory_id,
+            memory.to_dict(),
+            metadata={
+                "schema_version": 2,
+                "write_policy": "automatic_llm_consolidation",
+                "source": "conversation_inference",
+                "explicitness": candidate.explicitness,
+                "scope": candidate.scope,
+                "confidence": candidate.confidence,
+                "evidence_run_ids": evidence_runs,
+                "contains_financial_evidence": False,
+            },
+        )
+        self.memory_store.delete(namespace, candidate_key)
+        existing.append({"memory_id": memory_id, **memory.to_dict()})
+
+    @staticmethod
+    def _select_entity_replay(events: Sequence[dict], *, query: str, entities: Sequence[str]) -> list[dict]:
+        query_terms = _memory_terms(query)
+        entity_names = set(entities)
+        ranked = []
+        for position, event in enumerate(events):
+            event_entities = {str(item) for item in event.get("entities") or []}
+            overlap = len(query_terms.intersection(_memory_terms(" ".join(event_entities))))
+            direct = len(entity_names.intersection(event_entities))
+            ranked.append((direct, overlap, position, event))
+        ranked.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        selected = sorted(ranked[:20], key=lambda item: item[2])
+        return [dict(item[3]) for item in selected]
+
+    def _record_tool_usage_memory(
+        self,
+        tenant_id: str,
+        user_id: str,
+        audits: Sequence[dict],
+    ) -> None:
+        mcp_names = {tool.spec.name for tool in self.mcp_tools}
+        namespace = self._tool_usage_memory_namespace(tenant_id, user_id)
+        catalog = {str(item["name"]): item for item in self.mcp_host.catalog_index()}
+        for audit in audits:
+            if audit.get("result_status") != "success":
+                continue
+            invoked_name = str(audit.get("tool_name") or "")
+            arguments = dict(audit.get("arguments") or {})
+            if invoked_name == "mcp.call_tool":
+                local_name = str(arguments.get("name") or "")
+                successful_arguments = arguments.get("arguments")
+            elif invoked_name in mcp_names:
+                local_name = invoked_name
+                successful_arguments = arguments
+            else:
+                continue
+            if local_name not in catalog or not isinstance(successful_arguments, dict):
+                continue
+            schema = catalog[local_name].get("input_schema")
+            schema_fingerprint = stable_id("schema", {"value": schema})
+            key = stable_id(
+                "tooluse",
+                {"tool": local_name, "schema": schema_fingerprint, "arguments": successful_arguments},
+            )
+            stored = self.memory_store.get(namespace, key)
+            success_count = int(stored.value.get("success_count") or 0) + 1 if stored else 1
+            company = successful_arguments.get("company")
+            symbol = successful_arguments.get("symbol")
+            entity_alias = (
+                {"canonical_name": company, "provider_identifier": symbol}
+                if isinstance(company, str) and isinstance(symbol, str)
+                else None
+            )
+            self.memory_store.put(
+                namespace,
+                key,
+                {
+                    "tool_name": local_name,
+                    "server_id": local_name.partition(".")[0],
+                    "schema_fingerprint": schema_fingerprint,
+                    "arguments": successful_arguments,
+                    "entity_alias": entity_alias,
+                    "success_count": success_count,
+                    "last_verified_at": str(audit.get("timestamp") or ""),
+                },
+                metadata={"schema_version": 1, "source": "verified_success", "contains_credentials": False},
+            )
+
+    def _recall_tool_usage_memory(self, tenant_id: str, user_id: str, query: str) -> tuple[dict, ...]:
+        terms = _memory_terms(query)
+        current_schemas = {
+            str(item["name"]): stable_id("schema", {"value": item.get("input_schema")})
+            for item in self.mcp_host.catalog_index()
+        }
+        ranked = []
+        for record in self.memory_store.list(self._tool_usage_memory_namespace(tenant_id, user_id), limit=200):
+            value = dict(record.value)
+            if current_schemas.get(str(value.get("tool_name") or "")) != value.get("schema_fingerprint"):
+                continue
+            haystack = f"{value.get('tool_name', '')} {json.dumps(value.get('arguments') or {}, ensure_ascii=False)}"
+            overlap = len(terms.intersection(_memory_terms(haystack)))
+            ranked.append((overlap, value.get("success_count", 0), record.updated_at, value))
+        ranked.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        return tuple(item[3] for item in ranked[:5] if item[0] > 0)
 
     def ingest_personal_documents(
         self,
@@ -1445,6 +1890,23 @@ def _memory_terms(text: str) -> set[str]:
     latin = set(re.findall(r"[a-z0-9_]{2,}", normalized))
     cjk = re.findall(r"[\u4e00-\u9fff]+", normalized)
     return latin | {value[index : index + 2] for value in cjk for index in range(max(0, len(value) - 1))}
+
+
+def _matching_memory(candidate: LongTermMemoryCandidate, memories: Sequence[dict]) -> dict | None:
+    candidate_terms = _memory_terms(f"{candidate.title} {candidate.content}")
+    matches = []
+    for memory in memories:
+        if memory.get("kind") != candidate.kind.value:
+            continue
+        if str(memory.get("title") or "").strip().casefold() == candidate.title.casefold():
+            return memory
+        memory_terms = _memory_terms(f"{memory.get('title', '')} {memory.get('content', '')}")
+        union = candidate_terms.union(memory_terms)
+        similarity = len(candidate_terms.intersection(memory_terms)) / len(union) if union else 0.0
+        if similarity >= 0.6:
+            matches.append((similarity, str(memory.get("updated_at") or ""), memory))
+    matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return matches[0][2] if matches else None
 
 
 def _personal_principal_ids(tenant_id: str, user_id: str) -> tuple[str, str]:

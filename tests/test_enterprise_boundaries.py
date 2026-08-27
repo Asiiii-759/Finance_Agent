@@ -110,7 +110,12 @@ class EnterpriseBoundaryTests(unittest.TestCase):
             {
                 "conversation_summary": "用户比较了 Apple 与 Microsoft。",
                 "user_goals": ["比较两家公司"],
+                "requirements": ["使用统一估值口径"],
                 "decisions": [],
+                "completed_work": [],
+                "successful_tools": [],
+                "failed_tools": [],
+                "unfinished_work": [],
                 "open_questions": ["使用哪个估值口径"],
             }
         )
@@ -118,7 +123,12 @@ class EnterpriseBoundaryTests(unittest.TestCase):
             {
                 "conversation_summary": "",
                 "user_goals": [],
+                "requirements": [],
                 "decisions": [],
+                "completed_work": [],
+                "successful_tools": [],
+                "failed_tools": [],
+                "unfinished_work": [],
                 "open_questions": [],
             },
             (
@@ -133,7 +143,8 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 ),
             ),
         )
-        self.assertIn("untrusted data", SUMMARY_SYSTEM_PROMPT)
+        self.assertIn("不可信数据", SUMMARY_SYSTEM_PROMPT)
+        self.assertIn("未完成工作", SUMMARY_SYSTEM_PROMPT)
         self.assertEqual(summary["user_goals"], ["比较两家公司"])
 
     def test_natural_chinese_cagr_routes_to_calculation(self) -> None:

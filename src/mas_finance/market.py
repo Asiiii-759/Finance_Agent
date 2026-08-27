@@ -384,7 +384,7 @@ def market_data_harness_tool(
     return function_tool(
         ToolSpec(
             name="market.snapshot",
-            description="Read a point-in-time market snapshot with field-level provenance.",
+            description="读取指定时点的市场快照，并保留字段级来源。",
             capability="market.read",
             network_access=network_access,
             timeout_seconds=35,
@@ -416,8 +416,7 @@ def market_history_harness_tool(
         ToolSpec(
             name="market.history",
             description=(
-                "Read price history with an explicit adjusted/raw basis and calculate return, "
-                "volatility and max drawdown."
+                "读取价格历史，明确区分复权与原始价格口径，并计算收益率、波动率和最大回撤。"
             ),
             capability="market.read",
             network_access=network_access,

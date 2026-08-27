@@ -6,6 +6,8 @@ from typing import Any
 
 import httpx
 
+from .rate_limit import RateLimit, RateLimiter
+
 DEFAULT_TICKER_MAP = {
     "Apple": "AAPL",
     "Microsoft": "MSFT",
@@ -18,12 +20,23 @@ DEFAULT_TICKER_MAP = {
 
 
 class MarketDataClient:
-    def __init__(self, provider: str = "offline", alphavantage_api_key: str | None = None) -> None:
+    def __init__(
+        self,
+        provider: str = "offline",
+        alphavantage_api_key: str | None = None,
+        *,
+        rate_limiter: RateLimiter | None = None,
+        rate_limit: RateLimit | None = None,
+    ) -> None:
         self.provider = provider
         self.alphavantage_api_key = alphavantage_api_key
+        self.rate_limiter = rate_limiter
+        self.rate_limit = rate_limit or RateLimit(6)
 
     def fetch_company_snapshot(self, company: str, symbol: str | None = None) -> dict[str, Any]:
         ticker = _resolve_ticker(company, symbol)
+        if self.provider not in {"offline", "disabled", "none"} and self.rate_limiter is not None:
+            self.rate_limiter.acquire("market", self.rate_limit, timeout_seconds=30.0)
         if self.provider in {"offline", "disabled", "none"}:
             return self._unavailable_snapshot(company, ticker, ["provider_disabled"])
         if self.provider == "alphavantage":
@@ -53,6 +66,8 @@ class MarketDataClient:
             raise ValueError("unsupported market history range")
         if interval not in {"1d", "1wk", "1mo"}:
             raise ValueError("unsupported market history interval")
+        if self.provider not in {"offline", "disabled", "none"} and self.rate_limiter is not None:
+            self.rate_limiter.acquire("market", self.rate_limit, timeout_seconds=30.0)
         if self.provider in {"offline", "disabled", "none"}:
             return self._unavailable_history(company, ticker, range_name, interval, ["provider_disabled"])
         if self.provider == "alphavantage":

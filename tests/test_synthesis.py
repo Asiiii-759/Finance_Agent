@@ -59,9 +59,11 @@ class BadLLM:
 class CapturingLLM(GoodLLM):
     def __init__(self) -> None:
         self.max_tokens = 0
+        self.system_prompt = ""
 
     def chat(self, system_prompt, user_prompt, temperature=0.0, max_tokens=1400):
         self.max_tokens = max_tokens
+        self.system_prompt = system_prompt
         return super().chat(system_prompt, user_prompt, temperature, max_tokens)
 
 
@@ -71,6 +73,7 @@ class SynthesisTests(unittest.TestCase):
         synthesizer = EvidenceBoundLLMSynthesizer(client)
         self.assertTrue(synthesizer.synthesize(ResearchRequest(query="demand"), evidence_bundle()))
         self.assertEqual(client.max_tokens, 4096)
+        self.assertIn("中文金融研究撰稿人", client.system_prompt)
 
     def test_web_evidence_is_assembled_and_synthesized_without_crashing(self) -> None:
         source = SourceRef.create(

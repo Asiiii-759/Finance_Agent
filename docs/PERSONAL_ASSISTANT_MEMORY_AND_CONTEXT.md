@@ -43,8 +43,8 @@ LangGraph 是唯一状态机，只有 `intent / planning / validation / final_ge
 `ToolHarness` 是每次工具执行的配套 middleware，不是一个业务节点。这样既保留 checkpoint、状态历史和恢复，
 又不把工具执行误建模为固定 workflow。
 
-模型每轮只能提出一个 `call_tool` 或 `finish`。它自主选择工具、检索词、时间窗口和参数；Harness 决定该动作
-是否被允许，Validation 决定证据是否真的够。模型说 `finish` 不等于流程结束。
+模型每轮最多提出四个 `call_tool`（或一次 `call_tools`）或 `finish`。配置了 LLM 时由模型自主选择工具；
+没有密钥时才用 AdaptivePlanner 规则降级。MCP 工具走渐进发现，不把完整 schema 一次性塞进规划 prompt。
 反过来也一样：coverage 达到最低要求后，只要仍有迭代预算，模型会再看到新 Evidence，并明确选择继续检索或
 `finish`；Validation 不会因为“已经有一条文档证据”替模型抢先结束。无模型的规则规划器则在最低 requirement
 满足后直接结束，避免为了模拟自主性增加空调用。
@@ -178,14 +178,20 @@ provider 可用且已获网络授权时优先 hybrid。SQLite 仍只持久化页
 
 ## 6. 记忆模型
 
+进入模型的上下文按权限分层，而不是拼成一段可互相覆盖的“大 system prompt”：不可变中文系统规则位于最高层；
+用户维护的 Markdown 和召回长期记忆作为带来源标记的低权限数据；随后是对话摘要、最近原始 run、实体回放；
+当前请求、工具 schema、工具结果和 Evidence 最后按规划/生成阶段组装。摘要器只接收旧摘要与事件账本，永远不接收系统规则。
+
 ### 6.1 持久对话记忆
 
 SQLite 按 tenant/user/thread 持久保存 user、Harness tool 和 assistant 事件，直到用户显式调用
 `DELETE /api/v1/conversations/{thread_id}`。完整账本不直接进入模型：默认 300K token 投影预算达到 85% 后，专用 LLM
-将旧事件滚动总结为对话概要、用户目标、已做决定和未决问题；压缩不会删除账本记录。
+将 20K token 近期完整 run 之前的事件滚动总结为对话概要、用户目标/需求、已完成工作、工具成败状态、未完成工作和未决问题；压缩不会删除账本记录。
 
-实体身份不由 LLM 摘要决定。系统从用户事件确定性构建 `entity_state`、有序 `focus_history` 和当前焦点，保留 symbol 与提及次数，
-不再把泛化关系表交给模型。“前者/后者/它们/刚刚那个公司”按焦点历史解析；多个候选时的单数“它”不会猜。
+实体身份不由 LLM 摘要决定。系统从事件确定性构建 `entity_state`、有序 `focus_history`、当前焦点和
+`entity_events` 原子事件回放。原子事件记录时间、sequence、实体、动作、状态及来源 event/run；账本最多保留最近 100 条，
+每轮只把与当前 query/实体最相关或最近的 20 条作为 `entity_replay` 交给模型，不把完整历史实体表塞进 prompt。
+“前者/后者/它们/刚刚那个公司”仍按确定性焦点历史解析；多个候选时的单数“它”不会猜。
 历史实体仅在明确指代时继承。对话内容和工具历史仍是不可信上下文，绝不能替代 Evidence。完整数据模型和删除语义见
 [持久对话记忆与动态上下文](CONVERSATION_MEMORY.md)。
 
@@ -198,14 +204,26 @@ SQLite 按 tenant/user/thread 持久保存 user、Harness tool 和 assistant 事
 - `experience`：用户显式要求保留的使用经验；
 - `skill`：用户显式要求保留的分析步骤或方法。
 
-写入必须调用 `POST /api/v1/memories`；普通对话不会自动提取和写入。profile/preference 总是候选，
-experience/skill 只有与当前问题有词项重叠才召回。最多八条、12,000 字符；单条注入内容最多 2,000 字符。
+长期信息有两个不同来源。`MAS_USER_PROFILE_PATH` 可指向用户主动维护的 UTF-8 Markdown；它在每轮作为独立的
+`user_instructions` 数据层注入，低于系统规则、高于系统推断记忆，绝不拼接或改写不可变 system prompt。
+`POST /api/v1/memories` 仍支持用户显式写入。
+
+若启用 `MAS_AUTOMATIC_MEMORY_CONSOLIDATION_ENABLED`、配置 LLM 且本次请求获得网络授权，一个完成的 run 会作为静默窗口：
+专用中文 LLM prompt 只读取该 run 的用户消息和已有记忆，最多生成 0～2 个候选。它看不到 system/developer prompt、工具结果和
+助手回答，因此不能总结系统指令，也不能把助手建议或金融事实沉淀成用户偏好。自动候选只允许 profile/preference/experience，
+禁止自动生成可执行 skill；置信度低于 0.75 的候选直接忽略。
+
+LLM 必须声明 `add/reinforce/update/conflict/ignore`。显式且高置信的长期陈述可在一次 run 后晋升；仅推断出的倾向必须在两个
+不同 run 中以同一记忆槽位重复出现。候选按 kind/title 和词项相似度与现有记忆去重。用户显式写入的记忆不会被自动内容覆盖；
+冲突候选单独保存并带来源 run，不会静默替换。晋升记忆保存来源、scope、置信度和 evidence_run_ids，便于审计。
+
+召回规则是确定性的：`profile/preference` 始终进入候选；`experience/skill` 必须与本轮 query 在 title/content/tags 上有词项重叠。英文按长度至少 2 的字母数字词项，中文按连续文本二元组匹配。排序使用“重叠数 + profile/preference 候选加分”，同分按更新时间倒序。最多八条、12,000 字符；单条注入内容最多 2,000 字符。召回结果同时进入规划和最终生成 prompt，但只是低权限偏好/背景数据，不能作为 Evidence。
 
 同一 kind + 规范化 title 是同一槽位，后一次明确写入覆盖内容但保留创建时间。这是当前冲突策略：显式最新值
 胜出，而不是把相反偏好同时交给 LLM 猜。不同标题的语义冲突不会被模型偷偷合并；用户可以列表查看并删除。
 
-为什么不自动“沉淀经验/skill”：错误回答、提示注入和偶发措辞会形成自我强化污染。未来即使加入候选记忆，
-也应先显示 diff、来源和有效期，由用户确认后写入。
+自动提取仍不是金融事实学习机制：当前关注股票、一次性格式要求、工具输出、供应商返回值和敏感信息不得进入个人长期记忆。
+工具调用经验使用独立 `tool_usage_memory`，见下一节。
 
 ### 6.3 隔离边界
 
@@ -218,24 +236,26 @@ HTTP 多租户认证仍是明确的上线阻塞项。
 
 ## 7. MCP、企业数据和 skill 注入
 
-`FinanceAnalysisService(..., evidence_tools=(...))` 是部署级扩展入口。注入工具只有同时满足以下条件才注册：
+Agent 现在是 MCP Host：`MAS_MCP_SERVERS` 部署 allowlist 决定连接哪些本地 stdio 或固定 HTTPS server。每个 server 对应一个 MCP Client（JSON-RPC `initialize` / `tools/list` / `tools/call`）。Host 在进 Harness 前过滤：
 
-- 名称唯一且不碰撞内置工具；
-- capability 属于现有只读证据能力；
-- `SideEffect.READ_ONLY`；
-- `ToolResultKind.EVIDENCE_BUNDLE`；
-- 有显式 `ToolArgumentContract`。
+- 必须显式只读（`annotations.readOnlyHint=true` 或 `_meta.mas_finance.side_effect=read_only`）；
+- capability 必须属于现有只读证据能力，可由 server `default_capability` 或 `_meta.mas_finance.capability` 声明；
+- 副作用、未知 capability、非法参数名会被记录为 rejection，不会进入模型目录；
+- `tools/call` 结果必须是 canonical `EvidenceBundle`，原始 MCP JSON 不能当 Evidence。
 
-因此 MCP server、内部数据平台或 licensed feed 应在系统外层 adapter 中完成发现、认证和 schema 映射，再把
-单个只读工具注入。模型只看到经过筛选后的名称、描述和参数契约。原始 MCP tool/resource annotation 属于外部
-输入，不能直接提升权限。
+模型仍然只在 user prompt 的 `available_tools` 里看到 builtins 和发现元工具，DeepSeek 请求不带 `tools` 字段。
+已连接的 MCP 工具以 `mcp_tool_index` 短描述出现；完整 JSON Schema（包括服务端提供的字段描述、enum、default、examples）
+通过 `mcp.describe_tool` 拉取，执行走 `mcp.call_tool`。`isError=true` 的结构化错误会保留 error_code、字段、候选值、
+retryable 和 suggested_action 到 ToolResult；规划模型可在后续迭代中修改参数，完全相同的任务 ID 不会重复执行。
+计算工具、内部研报 `RetrievalSource`、request/session/personal corpus 继续留在进程内，不经 MCP。
 
-HTTP MCP/企业部署还必须在 gateway 层完成：OAuth audience 校验、tenant ACL、超时/响应字节限制、凭证隔离、
-审计 ID 和 provider-specific relevance policy。当前仓库没有假装实现一个“通用 MCP 客户端”，因为没有实际
-server、授权模型和 schema 时，这种抽象只会制造不可验证的兼容代码。已有测试用 MCP-shaped policy search 工具
-验证了注入、模型/规则规划、Evidence contract 和目录可见性；副作用工具与 raw `ANY` 返回会在启动时被拒绝。
+`FinanceAnalysisService(..., evidence_tools=(...))` 仍是手工注入入口，约束与 MCP 工具相同。原始 MCP annotation 不能提升权限。HTTP MCP 的 URL 必须是启动时固定的凭据无关 HTTPS；stdio command 由部署配置，不接受模型提供的路径。配置 AllTick 或必盈许可时会自动挂载本地 `extmarket` server。FRED/Bocha/行情/MCP call 有每分钟限流。
 
-个人 skill 记忆也不是可执行插件。它只是低权限文本上下文。真正可执行 skill/MCP 必须走上述部署注册路径。
+个人 skill 记忆也不是可执行插件。它只是低权限文本上下文。真正可执行 MCP 必须走 Host allowlist。
+
+成功的 MCP 调用参数不会写入 personal memory，而是按 `server + tool + input-schema fingerprint + arguments` 写入当前用户隔离的
+`tool_usage_memory`。记录只来自 Harness 验证成功的调用，包含成功次数和最后验证时间；召回时要求当前工具 schema 指纹一致，
+schema 变化后旧经验自动停止注入。相关的最多五条成功示例以 `verified_tool_usage` 进入规划上下文，仍必须服从当前工具契约。
 
 ## 8. 模型自拟函数与计算 Harness
 
@@ -282,11 +302,12 @@ Harness 能证明的是“没有执行任意代码、相同输入可复算、数
 - 个人记忆显式写入、同槽覆盖、相关召回、用户隔离和删除；
 - 个人知识库重启持久化、跨用户不可见和删除；
 - MCP-shaped 只读工具注入、raw/副作用工具拒绝；
+- MCP Host/Client allowlist、stdio/HTTP JSON-RPC、只读过滤与 EvidenceBundle 契约；
 - 自拟公式选择、血缘、恶意 AST、未知变量、除零、NaN 与超大幂；
 - 模型合成逐字 quote、citation laundering、坏 JSON 确定性回退；
 - SEC/FRED/行情/RAG 契约、网络预算、审计脱敏和报告校验。
 
-当前全量结果：142 tests passed，statement coverage 84.18%，ruff 与 mypy 通过。
+当前全量结果：161 tests passed，ruff 与 mypy 通过。
 
 ## 11. 明确限制与下一步条件
 
@@ -298,7 +319,7 @@ Harness 能证明的是“没有执行任意代码、相同输入可复算、数
    reranker，大规模生产应迁移到带 ACL、版本和删除传播的检索服务。
 3. SQLite 个人文本未做静态加密；生产需磁盘/数据库加密、备份删除和 retention policy。
 4. HTTP 层还没有多用户 OIDC；API key 只能代表一个部署。
-5. 企业 MCP transport 未在无 server 的情况下猜测实现；现有的是严格、可测试的注入接口。
+5. 企业 MCP：Host/Client 已按 allowlist 接入 stdio/HTTPS JSON-RPC，并强制只读 Evidence 契约；规划侧已启用渐进发现与每轮最多四工具。尚未实现 SSE Streamable HTTP 与 OAuth；内置计算/研报 RAG 仍留在进程内。
 6. LLM 的逐字引用验证保证 quote 存在，不能数学证明自然语言蕴含关系；高风险决策仍需人审。
 7. 系统是研究助手，不提供个性化投资指令、交易或保证收益。
 

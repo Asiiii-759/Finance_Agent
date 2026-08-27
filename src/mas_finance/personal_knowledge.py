@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,7 @@ class SQLitePersonalKnowledgeBase:
         self.max_documents_per_user = max_documents_per_user
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS personal_documents (
@@ -59,11 +60,20 @@ class SQLitePersonalKnowledgeBase:
         connection.execute("PRAGMA journal_mode=WAL")
         return connection
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def add_document(self, tenant_id: str, user_id: str, document: Mapping[str, Any]) -> dict[str, Any]:
         document_id, filename, pages = _validated_document(document)
         text_characters = sum(len(page["text"]) for page in pages)
         now = datetime.now(UTC).isoformat()
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             existing = connection.execute(
                 """
                 SELECT filename, page_count, text_characters, created_at FROM personal_documents
@@ -116,7 +126,7 @@ class SQLitePersonalKnowledgeBase:
         return result
 
     def list_documents(self, tenant_id: str, user_id: str) -> list[dict[str, Any]]:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT document_id, filename, page_count, text_characters, created_at
@@ -129,7 +139,7 @@ class SQLitePersonalKnowledgeBase:
 
     def delete_document(self, tenant_id: str, user_id: str, document_id: str) -> bool:
         _validate_identifier(document_id, "document_id")
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             cursor = connection.execute(
                 """
                 DELETE FROM personal_documents WHERE tenant_id = ? AND user_id = ? AND document_id = ?
@@ -145,7 +155,7 @@ class SQLitePersonalKnowledgeBase:
         *,
         embedding_provider: EmbeddingProvider | None = None,
     ) -> InMemoryCorpus:
-        with self._lock, self._connect() as connection:
+        with self._lock, self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT d.document_id, d.filename, p.page_number, p.text, p.extraction_method

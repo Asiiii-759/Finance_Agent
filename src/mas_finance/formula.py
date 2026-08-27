@@ -128,8 +128,8 @@ def formula_harness_tool() -> Tool:
         ToolSpec(
             name="finance.formula",
             description=(
-                "Evaluate a model-designed declarative numeric formula using named finite inputs. Supports only "
-                "+, -, *, /, bounded powers, parentheses, abs, sqrt, log, exp, min and max; never executes code."
+                "使用具名有限数值输入计算模型设计的声明式数值公式。仅支持 +、-、*、/、有界幂、括号、"
+                "abs、sqrt、log、exp、min 和 max；绝不执行代码。"
             ),
             capability="calculation",
             timeout_seconds=2,

@@ -296,7 +296,7 @@ def sec_company_facts_harness_tool(adapter: SECCompanyFactsAdapter) -> Tool:
     return function_tool(
         ToolSpec(
             name="sec.company_facts",
-            description="Read time-stamped company facts from the SEC EDGAR XBRL API.",
+            description="从 SEC EDGAR XBRL API 读取带时间戳的公司事实数据。",
             capability="regulatory.read",
             network_access=True,
             timeout_seconds=45,
@@ -335,7 +335,7 @@ def sec_recent_filings_harness_tool(adapter: SECRecentFilingsAdapter) -> Tool:
     return function_tool(
         ToolSpec(
             name="sec.recent_filings",
-            description="Read recent SEC filing metadata and primary-document locators for an issuer.",
+            description="读取发行人近期 SEC 申报元数据和主文档定位信息。",
             capability="regulatory.read",
             network_access=True,
             timeout_seconds=45,

@@ -30,8 +30,8 @@ class AppConfig:
     fred_api_key: str | None = field(default=None, repr=False)
     fred_base_url: str = "https://api.stlouisfed.org"
     conversation_memory_enabled: bool = True
-    conversation_context_characters: int = 16_000
-    conversation_recent_events: int = 12
+    conversation_context_tokens: int = 300_000
+    conversation_recent_events: int = 24
     session_document_ttl_seconds: int = 60 * 60
     max_session_document_sessions: int = 100
     paddleocr_access_token: str | None = field(default=None, repr=False)
@@ -65,8 +65,8 @@ class AppConfig:
             < 1
         ):
             raise ValueError("upload and PDF limits must be positive")
-        if not 4_000 <= self.conversation_context_characters <= 100_000:
-            raise ValueError("conversation context budget must be between 4000 and 100000 characters")
+        if not 16_000 <= self.conversation_context_tokens <= 300_000:
+            raise ValueError("conversation context budget must be between 16000 and 300000 tokens")
         if not 4 <= self.conversation_recent_events <= 50:
             raise ValueError("recent conversation event count must be between 4 and 50")
         if self.session_document_ttl_seconds < 60:
@@ -117,8 +117,8 @@ class AppConfig:
             fred_base_url=os.getenv("FRED_BASE_URL", "https://api.stlouisfed.org"),
             conversation_memory_enabled=os.getenv("MAS_CONVERSATION_MEMORY_ENABLED", "true").strip().lower()
             in {"1", "true", "yes"},
-            conversation_context_characters=int(os.getenv("MAS_CONVERSATION_CONTEXT_CHARACTERS", "16000")),
-            conversation_recent_events=int(os.getenv("MAS_CONVERSATION_RECENT_EVENTS", "12")),
+            conversation_context_tokens=int(os.getenv("MAS_CONVERSATION_CONTEXT_TOKENS", "300000")),
+            conversation_recent_events=int(os.getenv("MAS_CONVERSATION_RECENT_EVENTS", "24")),
             session_document_ttl_seconds=int(os.getenv("MAS_SESSION_DOCUMENT_TTL_SECONDS", str(60 * 60))),
             max_session_document_sessions=int(os.getenv("MAS_MAX_SESSION_DOCUMENT_SESSIONS", "100")),
             paddleocr_access_token=os.getenv("PADDLEOCR_ACCESS_TOKEN") or None,

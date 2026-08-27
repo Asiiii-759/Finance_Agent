@@ -118,8 +118,11 @@ class ModelPlanner:
             }
             for spec in available_tools.values()
         ]
+        user_request = state.request.to_dict()
+        user_request.pop("thread_context", None)
+        user_request.pop("personal_context", None)
         return {
-            "user_request": state.request.to_dict(),
+            "user_request": user_request,
             "intent_hints": state.scope.to_dict() if state.scope else None,
             "coverage": state.coverage.to_dict() if state.coverage else None,
             "prior_actions": [

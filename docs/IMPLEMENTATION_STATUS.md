@@ -31,7 +31,7 @@
 - LLM JSON/逐字 quote 校验；被裁掉证据不可引用；一个 quote 不能附带无关 citation；失败确定性降级。
 - DeepSeek 真实验证覆盖十种批量计算、知识、主备 RAG、间接提示注入、多源上下文和 checkpoint 恢复；生成输出上限提高到 4096，输入 evidence 预算独立扩到 48K 字符。
 - 报告 Markdown 注入转义、citation/footnote/gap/calculation lineage/risk notice 硬校验。
-- 持久 conversation event ledger：user/tool/assistant 全历史、tenant/user/thread namespace、16K 默认 prompt 预算、85% 阈值滚动压缩、最近原始事件、时间化实体关系、歧义代词拒绝猜测和显式删除关联 checkpoints。
+- 持久 conversation event ledger：user/tool/assistant 全历史、tenant/user/thread namespace、300K token 默认 prompt 预算、85% 阈值 LLM 滚动摘要、最近原始事件、确定性实体/焦点历史、歧义代词拒绝猜测和显式删除关联 checkpoints。
 - 显式会话文档：原 PDF 请求后删除，仅在 opt-in 时将解析页文本按 tenant/user/thread 保留于进程内存；默认 1 小时 TTL，支持列举、召回和删除。
 - 显式个人长期记忆：profile/preference/experience/skill 仅通过 CRUD 写入；同类同标题覆盖，相关性召回且绝不充当 Evidence。
 - 持久个人 PDF 知识库：只保存解析页文本和元数据，tenant/user 精确隔离，支持上传、列表、检索和删除；临时文档不自动入库。
@@ -47,10 +47,10 @@
 
 ```text
 11/11 enterprise black-box scenarios passed
-142 tests passed under pytest; no skips
+145 tests passed under pytest; no skips
 84.18% total source coverage; 80% gate passed
 Ruff passed for src/tests
-mypy passed for all 41 source files
+mypy passed for all 42 source files
 compileall passed
 Real DeepSeek planner selected finance.knowledge from the dynamic catalog in one model call; no gaps
 Real DeepSeek selected corpus.hybrid_search first for a semantic-only PDF query; cross-checked lexical, deduplicated one Evidence, succeeded in 5 model calls

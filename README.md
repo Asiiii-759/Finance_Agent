@@ -35,7 +35,7 @@ intent → planning ↔ validation → final_generation → validation → END
 - 只读 canonical-evidence 工具注入边界，可接企业 RAG、MCP gateway 或 licensed feed；未注入时不启用
 - 带逐字 evidence quote 验证的 LLM 合成与确定性降级
 - FastAPI、后台作业、CLI、报告与审计产物
-- 11 个可独立运行的黑盒验收场景和 143 项自动化测试
+- 11 个可独立运行的黑盒验收场景和 145 项自动化测试
 
 完整的运行机制、状态契约、数据源、记忆、安全边界和扩展方法见
 [Agent 详细说明](docs/AGENT_DETAILED_GUIDE.md)；架构决策摘要见
@@ -201,8 +201,8 @@ MAS_EMBEDDING_MODEL=
 MAS_EMBEDDING_API_KEY=
 MAS_EMBEDDING_TIMEOUT_SECONDS=30
 MAS_CONVERSATION_MEMORY_ENABLED=true
-MAS_CONVERSATION_CONTEXT_CHARACTERS=16000
-MAS_CONVERSATION_RECENT_EVENTS=12
+MAS_CONVERSATION_CONTEXT_TOKENS=300000
+MAS_CONVERSATION_RECENT_EVENTS=24
 MAS_PERSONAL_MEMORY_ENABLED=true
 MAS_PERSONAL_KNOWLEDGE_ENABLED=true
 MAS_MAX_PERSONAL_KNOWLEDGE_DOCUMENTS=100

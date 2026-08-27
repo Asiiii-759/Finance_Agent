@@ -244,8 +244,8 @@ NIST 的生成式 AI 风险框架指出，模型可能生成错误内容以及�
 | MEM-10 | 一次性 PDF 无法跨同线程追问 | 要么重复上传，要么误把临时文档永久入库 | 显式 session opt-in；只保留解析页文本、短 TTL、namespace 隔离和删除接口 | service/API follow-up tests | 已解决 |
 | MEM-11 | 临时上传与永久知识库语义混在一起 | 用户同意、ACL、删除传播无法成立 | 三层生命周期；临时绝不自动 promotion，永久文档仅走受控 RAG | lifecycle contract review | 已解决 |
 | MEM-12 | 只保存上一轮最小快照 | 多轮长对话和工具过程无法进入上下文 | user/tool/assistant append-only ledger；旧摘要 + 最近原始事件投影 | persistence/tool-event tests | 已解决 |
-| MEM-13 | 单实体字符串替换无法解析实体顺序和歧义 | “前者/后者/它们”错误，多个候选下的“它”会误猜 | 时间化 entity state、`has_symbol/co_mentioned` 关系和有序 focus；歧义单数不继承 | reference-resolution tests | 已解决 |
-| MEM-14 | 长对话完整注入 prompt | 上下文无界、成本和模型注意力恶化 | 预算达到 85% 滚动压缩；摘要游标 + 最近事件；原账本不删除 | compaction/ledger-retention tests | 已解决 |
+| MEM-13 | 单实体字符串替换无法解析实体顺序和歧义 | “前者/后者/它们”错误，多个候选下的“它”会误猜 | 确定性 `entity_state + focus_history`；symbol 随实体保存；歧义单数不继承 | reference-resolution tests | 已解决 |
+| MEM-14 | 长对话完整注入 prompt | 上下文无界、成本和模型注意力恶化 | 300K token 预算达到 85% 时用 LLM 滚动摘要；实体焦点独立保真；原账本不删除 | compaction/ledger-retention tests | 已解决 |
 | MEM-15 | 测试命令导入虚拟环境旧安装包 | 修改后的源码可能“假通过” | 质量门显式设置 `PYTHONPATH=src` | full-suite current-source run | 已解决 |
 
 当前四种“记忆”语义必须分开：

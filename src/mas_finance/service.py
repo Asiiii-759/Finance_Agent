@@ -15,6 +15,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from .agent import AdaptivePlanner, DeterministicSynthesizer, ResearchRequest
 from .config import AppConfig
 from .contracts import stable_id
+from .conversation import LLMConversationSummarizer
 from .corpus import CorpusDocument, InMemoryCorpus
 from .documents import PDFDocumentParser, detect_companies, parse_pdf_document
 from .embeddings import EmbeddingProvider, HTTPEmbeddingClient
@@ -33,11 +34,12 @@ from .market import (
 from .market_data import DEFAULT_TICKER_MAP, MarketDataClient
 from .memory_store import (
     ConversationEventKind,
-    EntityRelation,
+    ConversationSummarizer,
     MemoryNamespace,
     PersonalMemory,
     PersonalMemoryKind,
     SQLiteMemoryStore,
+    TokenCounter,
     build_conversation_window,
 )
 from .metrics import describe_metric_operations, financial_calculation_harness_tool
@@ -71,6 +73,8 @@ class FinanceAnalysisService:
         pdf_document_parser: PDFDocumentParser | None = None,
         pdf_parser_network_access: bool = True,
         embedding_provider: EmbeddingProvider | None = None,
+        conversation_summarizer: ConversationSummarizer | None = None,
+        conversation_token_counter: TokenCounter | None = None,
     ) -> None:
         self.config = config
         self.retrieval_sources = tuple(retrieval_sources)
@@ -87,6 +91,8 @@ class FinanceAnalysisService:
             else None
         )
         self.pdf_parser_network_access = pdf_parser_network_access
+        self.conversation_summarizer = conversation_summarizer
+        self.conversation_token_counter = conversation_token_counter
         if embedding_provider is not None and config.embedding_endpoint:
             raise ValueError("inject either an embedding provider or configured embedding endpoint, not both")
         self.embedding_provider = embedding_provider or (
@@ -455,13 +461,21 @@ class FinanceAnalysisService:
         # Network access requires both deployment authorization and explicit
         # per-request consent. None never means implicit consent.
         network_allowed = self.config.allow_network and allow_network is True
-        thread_context = self._load_conversation_context(tenant_id, user_id, actual_thread_id)
+        llm_client = build_llm_client(self.config.llm)
+        conversation_summarizer = self.conversation_summarizer or (
+            LLMConversationSummarizer(llm_client) if llm_client is not None and network_allowed else None
+        )
+        thread_context = self._load_conversation_context(
+            tenant_id,
+            user_id,
+            actual_thread_id,
+            summarizer=conversation_summarizer,
+        )
         personal_context = (
             self._recall_personal_memories(tenant_id, user_id, query)
             if use_personal_memory and self.config.personal_memory_enabled
             else ()
         )
-        llm_client = build_llm_client(self.config.llm)
         harness = ToolHarness()
         harness.register(financial_calculation_harness_tool())
         harness.register(formula_harness_tool())
@@ -691,9 +705,9 @@ class FinanceAnalysisService:
             )
 
         remembered_symbols = {
-            str(item["subject"]): str(item["object"])
-            for item in thread_context.get("relations") or []
-            if item.get("predicate") == "has_symbol"
+            str(entity): str(state["symbol"])
+            for entity, state in (thread_context.get("entity_state") or {}).items()
+            if isinstance(state, dict) and isinstance(state.get("symbol"), str)
         }
         resolved_symbols: dict[str, str] = {}
         for entity in requested_entities:
@@ -727,17 +741,6 @@ class FinanceAnalysisService:
                 and _requests_document_research(query)
             )
         )
-        relations = tuple(
-            [
-                EntityRelation(entity, "has_symbol", resolved_symbols[entity])
-                for entity in requested_entities
-                if entity in resolved_symbols
-            ]
-            + [
-                EntityRelation(requested_entities[index], "co_mentioned", requested_entities[index + 1])
-                for index in range(len(requested_entities) - 1)
-            ]
-        )
         request = ResearchRequest(
             query=query,
             entities=requested_entities,
@@ -769,7 +772,7 @@ class FinanceAnalysisService:
                 content=query,
                 run_id=actual_run_id,
                 entities=requested_entities,
-                relations=relations,
+                payload={"entity_symbols": resolved_symbols},
             )
         try:
             outcome = FinancialResearchAgent(
@@ -827,8 +830,6 @@ class FinanceAnalysisService:
                 kind=ConversationEventKind.ASSISTANT_MESSAGE,
                 content=str(result["report"]),
                 run_id=actual_run_id,
-                entities=requested_entities,
-                relations=relations,
                 payload={
                     "status": result["status"],
                     "claim_count": len(result.get("claims") or ()),
@@ -843,8 +844,10 @@ class FinanceAnalysisService:
             build_conversation_window(
                 self.memory_store,
                 namespace,
-                max_characters=self.config.conversation_context_characters,
+                max_tokens=self.config.conversation_context_tokens,
                 recent_event_count=self.config.conversation_recent_events,
+                summarizer=conversation_summarizer,
+                token_counter=self.conversation_token_counter,
             )
 
         artifacts: dict[str, str] = {}
@@ -988,14 +991,23 @@ class FinanceAnalysisService:
             thread_id=stable_id("thread", {"value": thread_id}),
         )
 
-    def _load_conversation_context(self, tenant_id: str, user_id: str, thread_id: str) -> dict:
+    def _load_conversation_context(
+        self,
+        tenant_id: str,
+        user_id: str,
+        thread_id: str,
+        *,
+        summarizer: ConversationSummarizer | None = None,
+    ) -> dict:
         if not self.config.conversation_memory_enabled:
             return {}
         return build_conversation_window(
             self.memory_store,
             self._conversation_namespace(tenant_id, user_id, thread_id),
-            max_characters=self.config.conversation_context_characters,
+            max_tokens=self.config.conversation_context_tokens,
             recent_event_count=self.config.conversation_recent_events,
+            summarizer=summarizer,
+            token_counter=self.conversation_token_counter,
         )
 
     def delete_conversation(
@@ -1305,11 +1317,17 @@ def _resolve_request_entities(
     remembered = _normalized_entities(conversation_context.get("focus_entities") or [])
     contextual = _is_contextual_followup(query)
     has_history = int(conversation_context.get("manifest", {}).get("latest_sequence") or 0) > 0
+    current = explicit or detected
+    if current and _references_prior_focus(query):
+        prior = tuple(entity for entity in remembered if entity not in current)
+        if _references_entity_group(query):
+            return tuple(dict.fromkeys((*prior, *current))), True
+        if len(prior) == 1:
+            return tuple(dict.fromkeys((*prior, *current))), True
+        return current, True
     if explicit:
         return explicit, has_history
     if detected:
-        if _references_previous_entity(query):
-            return tuple(dict.fromkeys((*detected, *remembered))), True
         return detected, has_history
     if _references_first_entity(query):
         return remembered[:1], True
@@ -1339,7 +1357,22 @@ def _references_previous_entity(query: str) -> bool:
     normalized = f" {query.casefold()} "
     return any(
         marker in normalized
-        for marker in (" 它", "其", "该公司", "这家公司", "上述公司", " it ", " its ", " that company ")
+        for marker in (
+            " 它",
+            "其",
+            "该公司",
+            "这家公司",
+            "上述公司",
+            "刚才那个公司",
+            "刚刚那个公司",
+            "刚刚聊到的那个公司",
+            "之前那个公司",
+            " it ",
+            " its ",
+            " that company ",
+            "the company we just discussed",
+            "the previous company",
+        )
     )
 
 
@@ -1365,6 +1398,15 @@ def _is_contextual_followup(query: str) -> bool:
     normalized = f" {query.casefold()} "
     return _references_previous_entity(query) or any(
         marker in normalized for marker in ("呢", "那么", "那 ", "继续", "what about", "how about", "and what")
+    )
+
+
+def _references_prior_focus(query: str) -> bool:
+    return (
+        _references_previous_entity(query)
+        or _references_first_entity(query)
+        or _references_last_entity(query)
+        or _references_entity_group(query)
     )
 
 

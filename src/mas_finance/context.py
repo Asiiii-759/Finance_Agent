@@ -195,7 +195,7 @@ class FinancialContextAssembler:
 
 
 def _safe_thread_context(value: Mapping[str, Any]) -> dict[str, Any]:
-    allowed = {"summary", "recent_events", "entity_state", "relations", "focus_entities", "manifest"}
+    allowed = {"summary", "recent_events", "entity_state", "focus_history", "focus_entities", "manifest"}
     return {str(key): item for key, item in value.items() if str(key) in allowed}
 
 

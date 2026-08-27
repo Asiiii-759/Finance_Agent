@@ -115,7 +115,7 @@ class ResearchRequest:
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("thread_context must be JSON serializable") from exc
-        if len(thread_payload) > 100_000:
+        if len(thread_payload) > 2_000_000:
             raise ValueError("thread_context exceeds length limit")
         if len(self.personal_context) > 20 or any(not isinstance(item, Mapping) for item in self.personal_context):
             raise ValueError("personal_context must contain at most 20 objects")

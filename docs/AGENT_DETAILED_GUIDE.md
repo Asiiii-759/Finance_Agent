@@ -581,7 +581,7 @@ LLM 做规划选择和自然语言合成，不做工具授权、来源登记、�
 
 `FinancialContextAssembler` 使用 `finance-evidence-synthesis-v3`，先按 task、research state、thread/personal context 和 evidence trust zone 组织上下文。Evidence 默认按 `entity × source type × domain/provider origin` 分组，并保持文档全局相关排序；只有模型或明确多文档综合意图设置 `diversify_documents` 时，文档才按 document ID 分散。随后按问题重合度、来源质量、结构化程度、置信度和 retrieval rank 排序。规划默认 24,000、生成默认 48,000 evidence 字符，均可调到 200,000；长文本取问题附近窗口。每张 card 包含 provider、locator、source type、period、as-of 和 published-at；逐阶段 `ContextManifest` 精确记录真正进入 prompt 的 evidence ID、遗漏数量、分组、来源类型和预算。
 
-Thread context 是预算内的结构化旧摘要、最近 user/tool/assistant 事件和实体关系，明确标记为非事实来源；文档内容同样标记为不可信数据。`EvidenceBoundLLMSynthesizer` 随后要求模型返回纯 JSON：
+Thread context 是预算内的 LLM 语义摘要、最近 user/tool/assistant 事件和确定性实体/焦点状态，明确标记为非事实来源；文档内容同样标记为不可信数据。`EvidenceBoundLLMSynthesizer` 随后要求模型返回纯 JSON：
 
 ```json
 {
@@ -652,7 +652,7 @@ Validator 会检查：
 
 检查点为了准确恢复，包含完整 EvidenceBundle 和部分文本证据，因此属于敏感运行数据。它不应该被自动用于未来用户画像，也不应该永久保存。生产环境必须补充：静态加密、KMS/密钥轮换、TTL、删除任务、访问审计与备份策略。
 
-Conversation memory 与 checkpoint 分离：前者持久记录 user/tool/assistant 事件，后者恢复单个 run 的图状态。模型只看到预算内的结构化旧摘要和最近原始事件；压缩不删除完整账本。它不保存 EvidenceBundle、原始 PDF 或隐藏推理，也不能作为事实来源。会话文档是另一平面：只在显式保留时保存解析页文本，原 PDF 仍删除；过期或 `DELETE /api/v1/session-documents/{thread_id}` 后释放。个人 memory/knowledge 也只能通过独立显式接口持久化，临时内容不会自动 promotion。完整语义见 [持久对话记忆](CONVERSATION_MEMORY.md)、[文档生命周期设计](DOCUMENT_LIFECYCLE.md) 与 [个人助手边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
+Conversation memory 与 checkpoint 分离：前者持久记录 user/tool/assistant 事件，后者恢复单个 run 的图状态。模型只看到 300K token 预算内的 LLM 语义摘要和最近原始事件；实体身份与焦点历史由代码独立保真，压缩不删除完整账本。它不保存 EvidenceBundle、原始 PDF 或隐藏推理，也不能作为事实来源。会话文档是另一平面：只在显式保留时保存解析页文本，原 PDF 仍删除；过期或 `DELETE /api/v1/session-documents/{thread_id}` 后释放。个人 memory/knowledge 也只能通过独立显式接口持久化，临时内容不会自动 promotion。完整语义见 [持久对话记忆](CONVERSATION_MEMORY.md)、[文档生命周期设计](DOCUMENT_LIFECYCLE.md) 与 [个人助手边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
 
 ### 14.2 实体继承规则
 
@@ -782,8 +782,8 @@ MAS_EMBEDDING_MODEL=
 MAS_EMBEDDING_API_KEY=
 MAS_EMBEDDING_TIMEOUT_SECONDS=30
 MAS_CONVERSATION_MEMORY_ENABLED=true
-MAS_CONVERSATION_CONTEXT_CHARACTERS=16000
-MAS_CONVERSATION_RECENT_EVENTS=12
+MAS_CONVERSATION_CONTEXT_TOKENS=300000
+MAS_CONVERSATION_RECENT_EVENTS=24
 MAS_SESSION_DOCUMENT_TTL_SECONDS=3600
 MAS_MAX_SESSION_DOCUMENT_SESSIONS=100
 

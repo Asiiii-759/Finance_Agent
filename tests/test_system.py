@@ -339,6 +339,7 @@ class FinanceSystemTestCase(unittest.TestCase):
         self.assertNotIn("output_dir", config_payload)
         self.assertFalse(config_payload["embedding_enabled"])
         self.assertIsNone(config_payload["embedding_model"])
+        self.assertEqual(config_payload["conversation_context_tokens"], 300_000)
         self.assertEqual(deleted.status_code, 200)
         self.assertGreaterEqual(deleted.json()["events"], 2)
         self.assertEqual(deleted.json()["summaries"], 0)

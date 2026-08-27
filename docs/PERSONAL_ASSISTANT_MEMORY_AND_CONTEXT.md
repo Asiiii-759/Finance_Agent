@@ -181,11 +181,11 @@ provider 可用且已获网络授权时优先 hybrid。SQLite 仍只持久化页
 ### 6.1 持久对话记忆
 
 SQLite 按 tenant/user/thread 持久保存 user、Harness tool 和 assistant 事件，直到用户显式调用
-`DELETE /api/v1/conversations/{thread_id}`。完整账本不直接进入模型：达到可配置字符预算的 85% 后，旧事件形成
-确定性结构化摘要，最近事件保持原始顺序和时间；压缩不会删除账本记录。
+`DELETE /api/v1/conversations/{thread_id}`。完整账本不直接进入模型：默认 300K token 投影预算达到 85% 后，专用 LLM
+将旧事件滚动总结为对话概要、用户目标、已做决定和未决问题；压缩不会删除账本记录。
 
-实体状态记录首次/最近出现时间、sequence、次数和 `has_symbol/co_mentioned` 关系。“前者/后者/它们”按最近有序
-实体组解析；多个候选时的单数“它”不会猜。无论是否出现代词，只要线程已有历史，有界投影都会进入 prompt；
+实体身份不由 LLM 摘要决定。系统从用户事件确定性构建 `entity_state`、有序 `focus_history` 和当前焦点，保留 symbol 与提及次数，
+不再把泛化关系表交给模型。“前者/后者/它们/刚刚那个公司”按焦点历史解析；多个候选时的单数“它”不会猜。
 历史实体仅在明确指代时继承。对话内容和工具历史仍是不可信上下文，绝不能替代 Evidence。完整数据模型和删除语义见
 [持久对话记忆与动态上下文](CONVERSATION_MEMORY.md)。
 

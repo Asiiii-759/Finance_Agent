@@ -11,7 +11,7 @@ from ..documents import PDFDocumentParser
 from ..embeddings import EmbeddingProvider
 from ..harness import Tool
 from ..logging_utils import configure_logging, request_logging_middleware
-from ..memory_store import PersonalMemoryKind
+from ..memory_store import ConversationSummarizer, PersonalMemoryKind, TokenCounter
 from ..retrieval import RetrievalSource
 from ..service import FinanceAnalysisService
 from .auth import build_api_key_dependency
@@ -35,6 +35,8 @@ def create_app(
     pdf_document_parser: PDFDocumentParser | None = None,
     pdf_parser_network_access: bool = True,
     embedding_provider: EmbeddingProvider | None = None,
+    conversation_summarizer: ConversationSummarizer | None = None,
+    conversation_token_counter: TokenCounter | None = None,
 ) -> FastAPI:
     configure_logging()
     app_config = config or AppConfig.from_env()
@@ -45,6 +47,8 @@ def create_app(
         pdf_document_parser=pdf_document_parser,
         pdf_parser_network_access=pdf_parser_network_access,
         embedding_provider=embedding_provider,
+        conversation_summarizer=conversation_summarizer,
+        conversation_token_counter=conversation_token_counter,
     )
     auth_dependency = build_api_key_dependency(app_config.api_key)
 
@@ -132,7 +136,7 @@ def create_app(
             "conversation_memory_enabled": app_config.conversation_memory_enabled,
             "personal_memory_enabled": app_config.personal_memory_enabled,
             "personal_knowledge_enabled": app_config.personal_knowledge_enabled,
-            "conversation_context_characters": app_config.conversation_context_characters,
+            "conversation_context_tokens": app_config.conversation_context_tokens,
             "conversation_recent_events": app_config.conversation_recent_events,
             "session_document_ttl_seconds": app_config.session_document_ttl_seconds,
             "max_session_document_sessions": app_config.max_session_document_sessions,

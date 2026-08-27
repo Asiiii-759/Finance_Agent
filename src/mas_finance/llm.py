@@ -73,10 +73,10 @@ class DeepSeekChatClient(BaseLLMClient):
     def chat(self, system_prompt: str, user_prompt: str, temperature: float = 0.2, max_tokens: int = 600) -> str:
         if not isinstance(system_prompt, str) or not isinstance(user_prompt, str):
             raise ValueError("LLM prompts must be strings")
-        if len(system_prompt) + len(user_prompt) > 250_000:
+        if len(system_prompt) + len(user_prompt) > 4_000_000:
             raise ValueError("LLM prompt exceeds the character limit")
-        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or not 1 <= max_tokens <= 4_096:
-            raise ValueError("LLM max_tokens must be an integer between 1 and 4096")
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or not 1 <= max_tokens <= 16_384:
+            raise ValueError("LLM max_tokens must be an integer between 1 and 16384")
         if (
             isinstance(temperature, bool)
             or not isinstance(temperature, (int, float))

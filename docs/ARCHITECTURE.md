@@ -148,7 +148,7 @@ run identity/预算上限绑定 → capability → side effect → network → �
 | Domain corpus | tenant/KB/version | 文档 chunk、metadata、索引 | retrieval backend |
 | Audit | tenant/thread/run/call | 脱敏参数、状态、耗时、错误码 | run state + artifact；生产待 append-only store |
 
-对话完整事件账本默认保留到用户显式删除；进入模型的是 16K 字符预算内的结构化旧摘要、最近原始事件、时间化实体状态与关系。达到预算 85% 才滚动压缩，原事件不删除。显式/当前检测实体优先；前者、后者和复数指代使用最近有序实体组，多个候选下的单数代词不会猜测。记忆不保存 EvidenceBundle，也不能作为事实来源。详见 [持久对话记忆与动态上下文](CONVERSATION_MEMORY.md)。
+对话完整事件账本默认保留到用户显式删除；进入模型的投影默认上限为 300K token。达到预算 85% 时，专用 LLM 滚动生成结构化语义摘要，最近原始事件继续保留，原账本不删除。实体身份不交给摘要模型：系统从用户事件确定性构建 `entity_state + focus_history`，用于前者、后者、复数及“刚刚那个公司”的指代解析；歧义单数不猜。记忆不保存 EvidenceBundle，也不能作为事实来源。详见 [持久对话记忆与动态上下文](CONVERSATION_MEMORY.md)。
 
 个人长期记忆只由显式 CRUD 创建，最多召回八条且作为低权限 personal context；个人 PDF 必须走独立持久上传接口，临时上传不会自动入库。完整边界见 [个人金融助手：记忆、上下文与扩展边界](PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
 

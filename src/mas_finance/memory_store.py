@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import json
+import math
 import re
 import sqlite3
 import threading
@@ -181,61 +182,85 @@ class ConversationSummaryRecord:
     updated_at: str
 
 
+class ConversationSummarizer(Protocol):
+    def summarize(
+        self,
+        previous_summary: dict[str, Any],
+        events: tuple[ConversationEvent, ...],
+    ) -> dict[str, Any]: ...
+
+
+class TokenCounter(Protocol):
+    name: str
+
+    def count(self, text: str) -> int: ...
+
+
+class DeepSeekV4TokenEstimator:
+    """Conservative preflight estimate; API usage remains authoritative."""
+
+    name = "deepseek_v4_estimate_v1"
+
+    def count(self, text: str) -> int:
+        cjk = sum("\u3400" <= character <= "\u9fff" for character in text)
+        non_cjk = len(text) - cjk
+        punctuation = sum(not character.isalnum() and not character.isspace() for character in text)
+        estimate = cjk * 0.7 + non_cjk * 0.35 + punctuation * 0.65
+        return max(1, math.ceil(estimate * 1.1))
+
+
 def build_conversation_window(
     store: SQLiteMemoryStore,
     namespace: MemoryNamespace,
     *,
-    max_characters: int = 16_000,
-    recent_event_count: int = 12,
+    max_tokens: int = 300_000,
+    recent_event_count: int = 24,
+    summarizer: ConversationSummarizer | None = None,
+    token_counter: TokenCounter | None = None,
 ) -> dict[str, Any]:
     """Build the bounded prompt projection without deleting the durable event ledger."""
-    if not 4_000 <= max_characters <= 100_000:
-        raise ValueError("conversation context budget must be between 4000 and 100000 characters")
+    if not 16_000 <= max_tokens <= 300_000:
+        raise ValueError("conversation context budget must be between 16000 and 300000 tokens")
     if not 4 <= recent_event_count <= 50:
         raise ValueError("recent conversation event count must be between 4 and 50")
     _validate_conversation_namespace(namespace)
+    counter = token_counter or DeepSeekV4TokenEstimator()
 
     stored = store.get_conversation_summary(namespace)
     covered = stored.covered_through_sequence if stored is not None else 0
     summary = deepcopy(stored.summary) if stored is not None else {
-        "user_requests": [],
-        "assistant_outcomes": [],
-        "tool_activity": [],
+        "semantic_summary": _empty_semantic_summary(),
         "entity_state": {},
-        "relations": [],
+        "focus_history": [],
     }
     pending = store.list_conversation_events(namespace, after_sequence=covered)
 
-    content_limit = max(200, max_characters // (recent_event_count * 2))
-    projection = _conversation_projection(summary, pending, covered, content_limit=content_limit)
-    if len(json.dumps(projection, ensure_ascii=False, sort_keys=True)) >= int(max_characters * 0.85) and len(
-        pending
-    ) > recent_event_count:
+    projection = _conversation_projection(summary, pending, covered)
+    projection_tokens = _projection_tokens(projection, counter)
+    if projection_tokens >= int(max_tokens * 0.85) and len(pending) > recent_event_count:
+        if summarizer is None:
+            raise RuntimeError("conversation compaction requires an LLM summarizer")
         compacted = pending[:-recent_event_count]
-        summary = _merge_conversation_summary(summary, compacted)
+        summary = _merge_conversation_summary(summary, compacted, summarizer)
         covered = compacted[-1].sequence
         pending = pending[-recent_event_count:]
-        projection = _conversation_projection(summary, pending, covered, content_limit=content_limit)
-        while len(json.dumps(projection, ensure_ascii=False, sort_keys=True)) > max_characters and any(
-            summary[name] for name in ("user_requests", "assistant_outcomes", "tool_activity")
-        ):
-            populated = [
-                name for name in ("user_requests", "assistant_outcomes", "tool_activity") if summary[name]
-            ]
-            oldest = min(populated, key=lambda name: int(summary[name][0]["sequence"]))
-            summary[oldest].pop(0)
-            projection = _conversation_projection(summary, pending, covered, content_limit=content_limit)
+        projection = _conversation_projection(summary, pending, covered)
+        projection_tokens = _projection_tokens(projection, counter)
         store.put_conversation_summary(
             namespace,
             covered_through_sequence=covered,
             summary=summary,
         )
 
-    while len(json.dumps(projection, ensure_ascii=False, sort_keys=True)) > max_characters and len(pending) > 4:
+    while projection_tokens > max_tokens and len(pending) > 4:
         pending = pending[1:]
-        projection = _conversation_projection(summary, pending, covered, content_limit=content_limit)
-    if len(json.dumps(projection, ensure_ascii=False, sort_keys=True)) > max_characters:
+        projection = _conversation_projection(summary, pending, covered)
+        projection_tokens = _projection_tokens(projection, counter)
+    if projection_tokens > max_tokens:
         raise ValueError("conversation context cannot fit the configured budget")
+    projection["manifest"]["estimated_token_count"] = projection_tokens
+    projection["manifest"]["token_count_method"] = counter.name
+    projection["manifest"]["max_context_tokens"] = max_tokens
     return projection
 
 
@@ -711,15 +736,12 @@ def _conversation_projection(
     summary: dict[str, Any],
     events: list[ConversationEvent],
     covered_through_sequence: int,
-    *,
-    content_limit: int = 1_200,
 ) -> dict[str, Any]:
     entity_state = deepcopy(summary.get("entity_state") or {})
-    relation_state: dict[tuple[str, str, str], dict[str, Any]] = {
-        (str(item["subject"]), str(item["predicate"]), str(item["object"])): dict(item)
-        for item in summary.get("relations") or []
-    }
+    focus_history = [dict(item) for item in summary.get("focus_history") or []]
     for event in events:
+        if event.kind is not ConversationEventKind.USER_MESSAGE:
+            continue
         for entity in event.entities:
             state = entity_state.setdefault(
                 entity,
@@ -733,26 +755,23 @@ def _conversation_projection(
             state["last_seen_at"] = event.occurred_at
             state["last_sequence"] = event.sequence
             state["mention_count"] = int(state["mention_count"]) + 1
+            symbols = event.payload.get("entity_symbols") or {}
+            if isinstance(symbols, dict) and isinstance(symbols.get(entity), str):
+                state["symbol"] = symbols[entity]
         for relation in event.relations:
-            key = (relation.subject, relation.predicate, relation.object)
-            state = relation_state.setdefault(
-                key,
+            if relation.predicate == "has_symbol" and relation.subject in entity_state:
+                entity_state[relation.subject]["symbol"] = relation.object
+        if event.entities:
+            focus_history.append(
                 {
-                    **relation.to_dict(),
-                    "first_seen_at": event.occurred_at,
-                    "last_seen_at": event.occurred_at,
-                    "mention_count": 0,
-                },
+                    "sequence": event.sequence,
+                    "occurred_at": event.occurred_at,
+                    "entities": list(event.entities),
+                }
             )
-            state["last_seen_at"] = event.occurred_at
-            state["mention_count"] = int(state["mention_count"]) + 1
-
-    latest_user = next(
-        (event for event in reversed(events) if event.kind is ConversationEventKind.USER_MESSAGE and event.entities),
-        None,
-    )
-    if latest_user is not None:
-        focus_entities = list(latest_user.entities)
+    focus_history = focus_history[-50:]
+    if focus_history:
+        focus_entities = list(focus_history[-1]["entities"])
     else:
         ranked = sorted(
             entity_state.items(),
@@ -775,20 +794,17 @@ def _conversation_projection(
     }
     recent_events = []
     for event in events:
-        value = event.to_dict(content_limit=content_limit)
+        value = event.to_dict()
+        value.pop("relations", None)
         value["payload"] = {
             key: item for key, item in value["payload"].items() if key in safe_payload_keys
         }
         recent_events.append(value)
     return {
-        "summary": {
-            "user_requests": list(summary.get("user_requests") or []),
-            "assistant_outcomes": list(summary.get("assistant_outcomes") or []),
-            "tool_activity": list(summary.get("tool_activity") or []),
-        },
+        "summary": dict(summary.get("semantic_summary") or _empty_semantic_summary()),
         "recent_events": recent_events,
         "entity_state": entity_state,
-        "relations": list(relation_state.values()),
+        "focus_history": focus_history,
         "focus_entities": focus_entities,
         "manifest": {
             "covered_through_sequence": covered_through_sequence,
@@ -803,33 +819,59 @@ def _conversation_projection(
 def _merge_conversation_summary(
     summary: dict[str, Any],
     events: list[ConversationEvent],
+    summarizer: ConversationSummarizer,
 ) -> dict[str, Any]:
     projection = _conversation_projection(summary, events, 0)
-    user_requests = list(summary.get("user_requests") or [])
-    assistant_outcomes = list(summary.get("assistant_outcomes") or [])
-    tool_activity = list(summary.get("tool_activity") or [])
-    for event in events:
-        item = {
-            "sequence": event.sequence,
-            "occurred_at": event.occurred_at,
-            "content": event.content[:600],
-            "entities": list(event.entities),
+    previous_summary = summary.get("semantic_summary")
+    if not isinstance(previous_summary, dict):
+        previous_summary = {
+            "conversation_summary": json.dumps(
+                {
+                    key: summary.get(key) or []
+                    for key in ("user_requests", "assistant_outcomes", "tool_activity")
+                },
+                ensure_ascii=False,
+            )[:12_000],
+            "user_goals": [],
+            "decisions": [],
+            "open_questions": [],
         }
-        if event.kind is ConversationEventKind.USER_MESSAGE:
-            user_requests.append(item)
-        elif event.kind is ConversationEventKind.ASSISTANT_MESSAGE:
-            assistant_outcomes.append(item)
-        else:
-            item["tool_name"] = event.payload.get("tool_name")
-            item["result_status"] = event.payload.get("result_status")
-            tool_activity.append(item)
+    semantic_summary = summarizer.summarize(previous_summary, tuple(events))
+    _validate_semantic_summary(semantic_summary)
     return {
-        "user_requests": user_requests[-20:],
-        "assistant_outcomes": assistant_outcomes[-12:],
-        "tool_activity": tool_activity[-30:],
+        "semantic_summary": semantic_summary,
         "entity_state": dict(list(projection["entity_state"].items())[-50:]),
-        "relations": projection["relations"][-100:],
+        "focus_history": projection["focus_history"][-50:],
     }
+
+
+def _empty_semantic_summary() -> dict[str, Any]:
+    return {
+        "conversation_summary": "",
+        "user_goals": [],
+        "decisions": [],
+        "open_questions": [],
+    }
+
+
+def _validate_semantic_summary(value: dict[str, Any]) -> None:
+    expected = {"conversation_summary", "user_goals", "decisions", "open_questions"}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("conversation summary must use the required schema")
+    if not isinstance(value["conversation_summary"], str) or len(value["conversation_summary"]) > 20_000:
+        raise ValueError("conversation summary text is invalid")
+    for name, limit in (("user_goals", 50), ("decisions", 50), ("open_questions", 30)):
+        items = value[name]
+        if (
+            not isinstance(items, list)
+            or len(items) > limit
+            or any(not isinstance(item, str) or not item.strip() or len(item) > 1_000 for item in items)
+        ):
+            raise ValueError(f"conversation summary {name} is invalid")
+
+
+def _projection_tokens(projection: dict[str, Any], counter: TokenCounter) -> int:
+    return counter.count(json.dumps(projection, ensure_ascii=False, sort_keys=True))
 
 
 def _validate_record(key: str, value: Any, metadata: dict[str, Any] | None) -> None:

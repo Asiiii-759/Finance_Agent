@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -25,6 +24,27 @@ from mas_finance.memory_store import (
     SQLiteMemoryStore,
     build_conversation_window,
 )
+
+
+class CharacterTokenCounter:
+    name = "character-test-counter"
+
+    def count(self, text: str) -> int:
+        return len(text)
+
+
+class SummaryFixture:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def summarize(self, previous_summary, events):
+        self.calls += 1
+        return {
+            "conversation_summary": f"Summarized through event {events[-1].sequence}.",
+            "user_goals": ["Compare Apple and Microsoft."],
+            "decisions": [],
+            "open_questions": ["Which valuation basis should be used?"],
+        }
 
 
 class ContractTests(unittest.TestCase):
@@ -236,22 +256,48 @@ class MemoryTests(unittest.TestCase):
             path = Path(directory) / "memory.db"
             namespace = MemoryNamespace("tenant-a", "alice", "conversation_history", "thread-1")
             store = SQLiteMemoryStore(path)
+            summarizer = SummaryFixture()
             for index in range(16):
                 kind = ConversationEventKind.USER_MESSAGE if index % 2 == 0 else ConversationEventKind.ASSISTANT_MESSAGE
                 store.append_conversation_event(
                     namespace,
                     event_id=f"event-{index}",
                     kind=kind,
-                    content=f"message {index} " + "x" * 700,
+                    content=f"message {index} " + "x" * 1_200,
                     occurred_at=f"2026-08-26T12:{index:02d}:00+08:00",
                     run_id=f"run-{index // 2}",
                     entities=("Apple", "Microsoft") if kind is ConversationEventKind.USER_MESSAGE else (),
-                    relations=(EntityRelation("Apple", "co_mentioned", "Microsoft"),) if index == 0 else (),
+                    payload=(
+                        {"entity_symbols": {"Apple": "AAPL", "Microsoft": "MSFT"}}
+                        if kind is ConversationEventKind.USER_MESSAGE
+                        else None
+                    ),
                 )
 
-            context = build_conversation_window(store, namespace, max_characters=6_000, recent_event_count=4)
-            self.assertLessEqual(len(json.dumps(context, ensure_ascii=False, sort_keys=True)), 6_000)
+            with self.assertRaisesRegex(RuntimeError, "requires an LLM summarizer"):
+                build_conversation_window(
+                    store,
+                    namespace,
+                    max_tokens=16_000,
+                    recent_event_count=4,
+                    token_counter=CharacterTokenCounter(),
+                )
+            context = build_conversation_window(
+                store,
+                namespace,
+                max_tokens=16_000,
+                recent_event_count=4,
+                summarizer=summarizer,
+                token_counter=CharacterTokenCounter(),
+            )
+            self.assertLessEqual(context["manifest"]["estimated_token_count"], 16_000)
+            self.assertEqual(context["manifest"]["token_count_method"], "character-test-counter")
+            self.assertEqual(summarizer.calls, 1)
+            self.assertIn("Summarized through event", context["summary"]["conversation_summary"])
             self.assertEqual(context["focus_entities"], ["Apple", "Microsoft"])
+            self.assertEqual(context["focus_history"][-1]["entities"], ["Apple", "Microsoft"])
+            self.assertEqual(context["entity_state"]["Apple"]["mention_count"], 8)
+            self.assertEqual(context["entity_state"]["Apple"]["symbol"], "AAPL")
             self.assertGreater(context["manifest"]["covered_through_sequence"], 0)
             self.assertEqual(len(store.list_conversation_events(namespace)), 16)
 
@@ -264,11 +310,11 @@ class MemoryTests(unittest.TestCase):
                     namespace,
                     event_id="event-0",
                     kind=ConversationEventKind.USER_MESSAGE,
-                    content="message 0 " + "x" * 700,
+                    content="message 0 " + "x" * 1_200,
                     occurred_at="2026-08-26T12:00:00+08:00",
                     run_id="run-0",
                     entities=("Apple", "Microsoft"),
-                    relations=(EntityRelation("Apple", "co_mentioned", "Microsoft"),),
+                    payload={"entity_symbols": {"Apple": "AAPL", "Microsoft": "MSFT"}},
                 ),
             )
             with self.assertRaisesRegex(ValueError, "conflicts"):

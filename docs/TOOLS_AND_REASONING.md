@@ -408,11 +408,12 @@ Evidence cards按 `entity × source_type` 分组后轮询选择，避免第一�
 
 ```json
 {
-  "summary": {"user_requests": [], "assistant_outcomes": [], "tool_activity": []},
+  "summary": {"conversation_summary": "", "user_goals": [], "decisions": [], "open_questions": []},
   "recent_events": [{"kind": "user_message", "content": "分析 Apple 的估值", "occurred_at": "..."}],
+  "entity_state": {"Apple": {"mention_count": 1, "symbol": "AAPL", "last_sequence": 1}},
+  "focus_history": [{"sequence": 1, "entities": ["Apple"]}],
   "focus_entities": ["Apple"],
-  "relations": [{"subject": "Apple", "predicate": "has_symbol", "object": "AAPL"}],
-  "manifest": {"full_history_persisted": true, "memory_is_evidence": false}
+  "manifest": {"max_context_tokens": 300000, "full_history_persisted": true, "memory_is_evidence": false}
 }
 ```
 

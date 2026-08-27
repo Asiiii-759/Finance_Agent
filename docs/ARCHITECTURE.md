@@ -159,7 +159,7 @@ run identity/预算上限绑定 → capability → side effect → network → �
 Agent 只理解“返回 EvidenceBundle 的工具”，不理解某个供应商 SDK。
 
 - 内部/外部文档：部署期 `RetrievalSource` → `RAGClient.search_json(payload)` → `RetrievalEvidenceAdapter`；固定 filters 不能被 Agent 覆盖。
-- 上传 PDF：视觉顺序原生文本 → 必要时受双重网络授权的 PaddleOCR-VL-1.6 → request/session `InMemoryCorpus`；默认不跨请求，显式 session 仅短 TTL 保存解析页文本，citation 保留提取方式、page/span。
+- 上传 PDF：PaddleOCR-VL-1.6 或部署注入的成熟 PDF 解析 MCP → request/session `InMemoryCorpus`；远程解析受双重网络授权，默认不跨请求，显式 session 仅短 TTL 保存解析页文本，citation 保留解析器、page/span。
 - 开放搜索：`web.search` 是 provider-neutral 工具；模型自主生成 query、`pd/pw/pm/py` 时效窗口和可选域名范围。
   当前内置 Bocha 与 Brave adapters 使用各自固定认证 API origin；两者同时配置时优先 Bocha。结果 URL
   可以来自公开网络并登记为 `SourceType.WEB`。

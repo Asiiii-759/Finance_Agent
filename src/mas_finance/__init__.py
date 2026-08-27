@@ -10,6 +10,7 @@ __all__ = [
     "FinancialResearchAgent",
     "HTTPEmbeddingClient",
     "HTTPJSONRAGClient",
+    "PDFDocumentParser",
     "PaddleOCRClient",
     "ResearchRequest",
     "RetrievalSource",
@@ -38,6 +39,10 @@ def __getattr__(name: str) -> Any:
         from .ocr import PaddleOCRClient
 
         return PaddleOCRClient
+    if name == "PDFDocumentParser":
+        from .documents import PDFDocumentParser
+
+        return PDFDocumentParser
     if name in {"EmbeddingProvider", "HTTPEmbeddingClient"}:
         from .embeddings import EmbeddingProvider, HTTPEmbeddingClient
 

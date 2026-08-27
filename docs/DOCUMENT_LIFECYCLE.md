@@ -32,7 +32,7 @@
 多个 PDF
   → 数量/字节/后缀/PDF magic 校验
   → 临时随机文件名
-  → 原生页文本提取，必要时受控 OCR
+  → PaddleOCR 或部署注入的成熟 PDF 解析 MCP 返回页级文本
   → 所有非空页面合并进同一个 request corpus
   → corpus.search 或 corpus.hybrid_search 返回相关 PDF 证据
   → EvidenceBundle / claim / report

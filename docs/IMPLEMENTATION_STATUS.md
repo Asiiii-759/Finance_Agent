@@ -1,6 +1,6 @@
 # 实施状态
 
-最后更新：2026-08-26
+最后更新：2026-08-27
 版本：2.2
 
 ## 已完成
@@ -14,7 +14,7 @@
 - 研究工具、数据 provider attempts、模型调用独立预算；恢复时 denied 调用不误计预算。
 - 页级 request/session/personal BM25 corpus、可配置 embedding/cosine/RRF 双路召回、PDF 字节/页数/抽取文本上限、provider-neutral retrieval adapter。
 - lexical 与 hybrid 拆为独立 ToolSpec：模型自主选择，网络属性在调用前可判定，未配置 embedding/reranker 时不伪装能力；提供受限 OpenAI-compatible HTTPS embedding client。
-- PDF 视觉顺序提取、扫描页诊断及可选 PaddleOCR-VL-1.6；整文档单次提交、有限轮询、结果字节上限且不下载图片。
+- PDF 解析收敛到 PaddleOCR-VL-1.6 或部署注入的成熟 PDF 解析 MCP；无本地 PyMuPDF fallback。PaddleOCR 整文档单次提交、有限轮询、结果字节上限且不下载图片。
 - 部署期可注入多个内部/外部 `RetrievalSource`；固定 ACL filters、主备规划和受控 HTTPS JSON gateway。
 - provider-neutral `web.search` 与 Bocha/Brave adapters：模型控制 query、freshness 和域名范围；域名
   allowlist 在响应边界强制执行；canonical URL/内容去重、公开域名校验、来源分散度和 snippet 推断降级。

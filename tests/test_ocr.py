@@ -5,8 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import fitz
 import httpx
+from pdf_fixtures import write_stub_pdf
 
 from mas_finance import PaddleOCRClient as PublicPaddleOCRClient
 from mas_finance.ocr import PaddleOCRClient
@@ -50,10 +50,7 @@ class PaddleOCRClientTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "scan.pdf"
-            pdf = fitz.open()
-            pdf.new_page()
-            pdf.save(path)
-            pdf.close()
+            write_stub_pdf(path)
             client = PaddleOCRClient(
                 "secret",
                 poll_interval_seconds=0,
@@ -62,7 +59,7 @@ class PaddleOCRClientTests(unittest.TestCase):
             )
             self.assertNotIn("secret", repr(client))
             self.assertEqual(
-                client.extract_document(path, 1),
+                client.extract_document(path),
                 {1: "# ACME\nCovenant headroom narrowed."},
             )
 
@@ -74,10 +71,7 @@ class PaddleOCRClientTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "scan.pdf"
-            pdf = fitz.open()
-            pdf.new_page()
-            pdf.save(path)
-            pdf.close()
+            write_stub_pdf(path)
             client = PaddleOCRClient(
                 "secret",
                 poll_interval_seconds=0,
@@ -85,7 +79,7 @@ class PaddleOCRClientTests(unittest.TestCase):
                 transport=httpx.MockTransport(pending),
             )
             with self.assertRaisesRegex(TimeoutError, "polling limit"):
-                client.extract_document(path, 1)
+                client.extract_document(path)
 
 
 if __name__ == "__main__":

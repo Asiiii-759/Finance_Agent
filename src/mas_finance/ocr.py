@@ -11,7 +11,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -19,6 +19,7 @@ import httpx
 
 @dataclass(frozen=True)
 class PaddleOCRClient:
+    parser_kind: Literal["paddleocr"] = field(default="paddleocr", init=False)
     access_token: str = field(repr=False)
     job_url: str = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
     model: str = "PaddleOCR-VL-1.6"

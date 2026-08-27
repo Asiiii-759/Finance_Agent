@@ -225,7 +225,7 @@ def _validated_document(document: Mapping[str, Any]) -> tuple[str, str, tuple[di
             raise ValueError("personal knowledge page number is invalid")
         if not isinstance(text, str) or not text.strip() or len(text) > 500_000:
             raise ValueError("personal knowledge page text is invalid")
-        if not isinstance(extraction_method, str) or extraction_method not in {"native", "ocr"}:
+        if extraction_method not in {"paddleocr", "mcp"}:
             raise ValueError("personal knowledge extraction method is invalid")
         pages.append(
             {

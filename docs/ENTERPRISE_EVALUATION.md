@@ -116,7 +116,7 @@ python -m mas_finance.evaluation
 | RAG payload 使用 `str/int/bool` 强转 | 畸形输入被伪装成有效检索 | query/top-k/filter/chunk/trace 严格类型与大小契约 |
 | 远端 RAG 没有统一接入与 ACL 边界 | provider schema 污染 Agent 或跨租户检索 | 部署注入 `RetrievalSource`、固定 filters、canonical HTTPS gateway |
 | 压缩 PDF 的抽取文本无上限 | 小上传仍可造成内存放大 | 每 PDF 5M 抽取字符硬上限 |
-| 扫描 PDF 原生提取为空 | Agent 无法看见图片中的财务内容 | 扫描页诊断与可选 PaddleOCR-VL-1.6；双重授权、有限轮询且只取 Markdown |
+| 本地 PDF 提取对复杂版面不稳定 | 表格、多栏与扫描内容可能丢失 | 解析链路收敛到 PaddleOCR-VL-1.6 或成熟 PDF 解析 MCP；无本地 fallback，远程调用双重授权 |
 | 网页检索 evidence 没有原始 URL | 搜索结论无法回到网页复核 | canonical metadata 保留 title/source URL/publisher/publish date |
 | 计算参数允许多余字段或错误单位 | LLM/调用方可制造语义错误的精确数字 | operation schema、严格类型、单位兼容、数值域与溢出校验 |
 | DeepSeek 旧模型名与 V4 默认 thinking | 部署失效或短预算只有 reasoning 无正文 | 默认 V4 Flash、关闭 thinking、严格 response contract |

@@ -5,7 +5,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-import fitz
+from pdf_fixtures import MCPPDFParserFixture, write_stub_pdf
 
 from mas_finance.config import AppConfig
 from mas_finance.contracts import Evidence, EvidenceBundle, SourceRef, SourceType
@@ -95,15 +95,21 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pdf_path = root / "treasury-policy.pdf"
-            pdf = fitz.open()
-            pdf.new_page().insert_text(
-                (72, 72),
-                "Treasury policy requires ample cash reserves and diversified short-term funding capacity.",
+            write_stub_pdf(pdf_path)
+            parser = MCPPDFParserFixture(
+                {
+                    pdf_path.name: {
+                        1: "Treasury policy requires ample cash reserves and diversified short-term funding capacity."
+                    }
+                }
             )
-            pdf.save(pdf_path)
-            pdf.close()
             embedding = SemanticEmbedding()
-            service = FinanceAnalysisService(make_config(root), embedding_provider=embedding)
+            service = FinanceAnalysisService(
+                make_config(root),
+                embedding_provider=embedding,
+                pdf_document_parser=parser,
+                pdf_parser_network_access=False,
+            )
 
             response = service.analyze(
                 "Assess liquidity resilience using this PDF.",
@@ -134,15 +140,17 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pdf_path = root / "personal-treasury.pdf"
-            pdf = fitz.open()
-            pdf.new_page().insert_text(
-                (72, 72),
-                "My treasury rule requires ample cash reserves before any private investment.",
+            write_stub_pdf(pdf_path)
+            parser = MCPPDFParserFixture(
+                {pdf_path.name: {1: "My treasury rule requires ample cash reserves before any private investment."}}
             )
-            pdf.save(pdf_path)
-            pdf.close()
             embedding = SemanticEmbedding()
-            service = FinanceAnalysisService(make_config(root), embedding_provider=embedding)
+            service = FinanceAnalysisService(
+                make_config(root),
+                embedding_provider=embedding,
+                pdf_document_parser=parser,
+                pdf_parser_network_access=False,
+            )
 
             service.ingest_personal_documents([str(pdf_path)], user_id="alice")
             self.assertEqual(embedding.calls, 0)
@@ -224,15 +232,18 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pdf_path = root / "my-bond-notes.pdf"
-            pdf = fitz.open()
-            pdf.new_page().insert_text(
-                (72, 72),
-                "My bond policy requires checking duration, convexity, and credit spread before purchase.",
+            write_stub_pdf(pdf_path)
+            parser = MCPPDFParserFixture(
+                {
+                    pdf_path.name: {
+                        1: "My bond policy requires checking duration, convexity, and credit spread before purchase."
+                    }
+                }
             )
-            pdf.save(pdf_path)
-            pdf.close()
 
-            first = FinanceAnalysisService(make_config(root))
+            first = FinanceAnalysisService(
+                make_config(root), pdf_document_parser=parser, pdf_parser_network_access=False
+            )
             stored = first.ingest_personal_documents([str(pdf_path)], user_id="alice")
             first.close()
 
@@ -268,11 +279,13 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pdf_path = root / "bounded.pdf"
-            pdf = fitz.open()
-            pdf.new_page().insert_text((72, 72), "Bounded session document text.")
-            pdf.save(pdf_path)
-            pdf.close()
-            service = FinanceAnalysisService(replace(make_config(root), max_session_document_sessions=1))
+            write_stub_pdf(pdf_path)
+            parser = MCPPDFParserFixture({pdf_path.name: {1: "Bounded session document text."}})
+            service = FinanceAnalysisService(
+                replace(make_config(root), max_session_document_sessions=1),
+                pdf_document_parser=parser,
+                pdf_parser_network_access=False,
+            )
             service.analyze(
                 "分析 bounded document",
                 thread_id="first-session",
@@ -293,15 +306,13 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pdf_path = root / "acme-covenant.pdf"
-            pdf = fitz.open()
-            page = pdf.new_page()
-            page.insert_text(
-                (72, 72),
-                "ACME covenant headroom narrowed to 18 million in the second quarter.",
+            write_stub_pdf(pdf_path)
+            parser = MCPPDFParserFixture(
+                {pdf_path.name: {1: "ACME covenant headroom narrowed to 18 million in the second quarter."}}
             )
-            pdf.save(pdf_path)
-            pdf.close()
-            service = FinanceAnalysisService(make_config(root))
+            service = FinanceAnalysisService(
+                make_config(root), pdf_document_parser=parser, pdf_parser_network_access=False
+            )
 
             first = service.analyze(
                 "分析 ACME covenant headroom",
@@ -341,11 +352,14 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
                 )
 
             pdf_path = root / "private.pdf"
-            pdf = fitz.open()
-            page = pdf.new_page()
-            page.insert_text((72, 72), "Tenant A private liquidity forecast.")
-            pdf.save(pdf_path)
-            pdf.close()
+            write_stub_pdf(pdf_path)
+            service = FinanceAnalysisService(
+                make_config(root),
+                pdf_document_parser=MCPPDFParserFixture(
+                    {pdf_path.name: {1: "Tenant A private liquidity forecast."}}
+                ),
+                pdf_parser_network_access=False,
+            )
             service.analyze(
                 "分析 liquidity forecast",
                 thread_id="shared-name",
@@ -368,15 +382,9 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pdf_path = root / "scan.pdf"
-            pdf = fitz.open()
-            page = pdf.new_page()
-            pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10), 0)
-            pixmap.clear_with(255)
-            page.insert_image(fitz.Rect(72, 72, 172, 172), pixmap=pixmap)
-            pdf.save(pdf_path)
-            pdf.close()
+            write_stub_pdf(pdf_path)
 
-            with self.assertRaisesRegex(ValueError, "trusted OCR provider"):
+            with self.assertRaisesRegex(ValueError, "PaddleOCR or MCP"):
                 FinanceAnalysisService(make_config(root)).analyze(
                     "分析扫描件中的风险",
                     document_paths=[str(pdf_path)],
@@ -385,27 +393,22 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
 
     def test_remote_ocr_requires_server_and_request_network_consent(self) -> None:
         class OCR:
+            parser_kind = "paddleocr"
             calls = 0
 
-            def extract_document(self, _file_path: Path, _expected_pages: int) -> dict[int, str]:
+            def extract_document(self, _file_path: Path) -> dict[int, str]:
                 self.calls += 1
                 return {1: "ACME covenant headroom narrowed."}
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pdf_path = root / "scan.pdf"
-            pdf = fitz.open()
-            page = pdf.new_page()
-            pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10), 0)
-            pixmap.clear_with(255)
-            page.insert_image(fitz.Rect(72, 72, 172, 172), pixmap=pixmap)
-            pdf.save(pdf_path)
-            pdf.close()
+            write_stub_pdf(pdf_path)
             ocr = OCR()
             service = FinanceAnalysisService(
                 make_config(root, allow_network=True),
-                pdf_ocr_provider=ocr,
-                pdf_ocr_network_access=True,
+                pdf_document_parser=ocr,
+                pdf_parser_network_access=True,
             )
 
             with self.assertRaisesRegex(ValueError, "network authorization"):
@@ -426,25 +429,27 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
                 export_artifacts=False,
             )
             self.assertEqual(ocr.calls, 1)
-            self.assertEqual(response["document_diagnostics"][0]["ocr_page_count"], 1)
+            self.assertEqual(response["document_diagnostics"][0]["parsed_page_count"], 1)
+            self.assertEqual(response["document_diagnostics"][0]["parser_kind"], "paddleocr")
             self.assertEqual(response["result"]["status"], "succeeded")
 
     def test_uploaded_pdf_preserves_page_citation_and_explicit_unknown_entity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pdf_path = root / "credit-review.pdf"
-            pdf = fitz.open()
-            first = pdf.new_page()
-            first.insert_text((72, 72), "General introduction without company-specific findings.")
-            second = pdf.new_page()
-            second.insert_text(
-                (72, 72),
-                "ACME liquidity covenant headroom narrowed and refinancing risk increased.",
+            write_stub_pdf(pdf_path)
+            parser = MCPPDFParserFixture(
+                {
+                    pdf_path.name: {
+                        1: "General introduction without company-specific findings.",
+                        2: "ACME liquidity covenant headroom narrowed and refinancing risk increased.",
+                    }
+                }
             )
-            pdf.save(pdf_path)
-            pdf.close()
 
-            response = FinanceAnalysisService(make_config(root)).analyze(
+            response = FinanceAnalysisService(
+                make_config(root), pdf_document_parser=parser, pdf_parser_network_access=False
+            ).analyze(
                 "根据这份 PDF，ACME 的主要风险是什么？",
                 entities=["ACME"],
                 document_paths=[str(pdf_path)],
@@ -460,7 +465,8 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             self.assertIn("page=2", document_items[0]["source"]["locator"])
             self.assertEqual(len(document_items[0]["source"]["metadata"]["document_id"]), 64)
             self.assertEqual(response["document_diagnostics"][0]["text_page_count"], 2)
-            self.assertEqual(response["document_diagnostics"][0]["ocr_page_count"], 0)
+            self.assertEqual(response["document_diagnostics"][0]["parsed_page_count"], 2)
+            self.assertEqual(response["document_diagnostics"][0]["parser_kind"], "mcp")
 
     def test_injected_internal_rag_is_planned_and_visible_in_catalog(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

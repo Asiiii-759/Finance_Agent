@@ -16,7 +16,7 @@ from .agent import AdaptivePlanner, DeterministicSynthesizer, ResearchRequest
 from .config import AppConfig
 from .contracts import stable_id
 from .corpus import CorpusDocument, InMemoryCorpus
-from .documents import PDFOCRProvider, detect_companies, parse_pdf_document
+from .documents import PDFDocumentParser, detect_companies, parse_pdf_document
 from .embeddings import EmbeddingProvider, HTTPEmbeddingClient
 from .formula import formula_harness_tool
 from .graph import FinancialResearchAgent
@@ -68,14 +68,14 @@ class FinanceAnalysisService:
         *,
         retrieval_sources: Sequence[RetrievalSource] = (),
         evidence_tools: Sequence[Tool] = (),
-        pdf_ocr_provider: PDFOCRProvider | None = None,
-        pdf_ocr_network_access: bool = True,
+        pdf_document_parser: PDFDocumentParser | None = None,
+        pdf_parser_network_access: bool = True,
         embedding_provider: EmbeddingProvider | None = None,
     ) -> None:
         self.config = config
         self.retrieval_sources = tuple(retrieval_sources)
         self.evidence_tools = tuple(evidence_tools)
-        self.pdf_ocr_provider = pdf_ocr_provider or (
+        self.pdf_document_parser = pdf_document_parser or (
             PaddleOCRClient(
                 config.paddleocr_access_token,
                 job_url=config.paddleocr_job_url,
@@ -86,7 +86,7 @@ class FinanceAnalysisService:
             if config.paddleocr_access_token
             else None
         )
-        self.pdf_ocr_network_access = pdf_ocr_network_access
+        self.pdf_parser_network_access = pdf_parser_network_access
         if embedding_provider is not None and config.embedding_endpoint:
             raise ValueError("inject either an embedding provider or configured embedding endpoint, not both")
         self.embedding_provider = embedding_provider or (
@@ -495,9 +495,9 @@ class FinanceAnalysisService:
             )
 
         explicit_document_entities = _normalized_entities(entities or [])
-        if document_paths and self.pdf_ocr_provider is None:
-            raise ValueError("PaddleOCR is required for PDF document analysis")
-        if document_paths and self.pdf_ocr_network_access and not network_allowed:
+        if document_paths and self.pdf_document_parser is None:
+            raise ValueError("a PaddleOCR or MCP PDF document parser is required for PDF analysis")
+        if document_paths and self.pdf_parser_network_access and not network_allowed:
             raise ValueError("PDF parsing requires server and request network authorization")
         current_document_contexts = [
             parse_pdf_document(
@@ -507,7 +507,7 @@ class FinanceAnalysisService:
                 max_file_bytes=self.config.max_upload_bytes,
                 max_text_characters=self.config.max_pdf_text_characters,
                 display_name=self._upload_display_name(Path(path)),
-                ocr_provider=self.pdf_ocr_provider,
+                document_parser=self.pdf_document_parser,
             )
             for path in (document_paths or [])
         ]
@@ -573,7 +573,7 @@ class FinanceAnalysisService:
                         )
                     )
             if not ingested_chunks:
-                raise ValueError("PaddleOCR returned no extractable PDF text")
+                raise ValueError("PDF document parser returned no extractable text")
             corpus_adapter = RetrievalEvidenceAdapter(corpus)
             harness.register(
                 retrieval_harness_tool(
@@ -865,7 +865,8 @@ class FinanceAnalysisService:
                     "filename": item["filename"],
                     "page_count": item["page_count"],
                     "text_page_count": item["text_page_count"],
-                    "ocr_page_count": item["ocr_page_count"],
+                    "parsed_page_count": item["parsed_page_count"],
+                    "parser_kind": item["parser_kind"],
                     "lifecycle": item["lifecycle"],
                     "warnings": list(item["warnings"]),
                 }
@@ -948,7 +949,8 @@ class FinanceAnalysisService:
                 "filename": item["filename"],
                 "page_count": item["page_count"],
                 "text_page_count": item["text_page_count"],
-                "ocr_page_count": item["ocr_page_count"],
+                "parsed_page_count": item["parsed_page_count"],
+                "parser_kind": item["parser_kind"],
                 "expires_at": expires_at,
             }
             for item in documents
@@ -1143,9 +1145,9 @@ class FinanceAnalysisService:
         if not 1 <= len(document_paths) <= self.config.max_upload_files:
             raise ValueError("personal knowledge upload count is invalid")
         network_allowed = self.config.allow_network and allow_network
-        if self.pdf_ocr_provider is None:
-            raise ValueError("PaddleOCR is required for personal PDF ingestion")
-        if self.pdf_ocr_network_access and not network_allowed:
+        if self.pdf_document_parser is None:
+            raise ValueError("a PaddleOCR or MCP PDF document parser is required for personal PDF ingestion")
+        if self.pdf_parser_network_access and not network_allowed:
             raise ValueError("personal PDF parsing requires server and request network authorization")
         tenant_key, user_key = _personal_principal_ids(tenant_id, user_id)
         results = []
@@ -1158,10 +1160,10 @@ class FinanceAnalysisService:
                 max_file_bytes=self.config.max_upload_bytes,
                 max_text_characters=self.config.max_pdf_text_characters,
                 display_name=self._upload_display_name(path),
-                ocr_provider=self.pdf_ocr_provider,
+                document_parser=self.pdf_document_parser,
             )
             if not parsed.get("pages"):
-                raise ValueError("PaddleOCR returned no extractable personal PDF text")
+                raise ValueError("PDF document parser returned no extractable personal PDF text")
             results.append(self.personal_knowledge_store.add_document(tenant_key, user_key, parsed))
         return results
 

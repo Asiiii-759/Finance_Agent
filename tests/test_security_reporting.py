@@ -5,14 +5,20 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import fitz
+from pdf_fixtures import MCPPDFParserFixture, write_stub_pdf
 
+from mas_finance import PDFDocumentParser as PublicPDFDocumentParser
 from mas_finance.documents import parse_pdf_document
 from mas_finance.reporting import export_run_artifacts
 from mas_finance.security import safe_child, safe_identifier, safe_upload_name
 
 
 class SecurityBoundaryTests(unittest.TestCase):
+    def test_pdf_document_parser_is_a_public_package_export(self) -> None:
+        from mas_finance.documents import PDFDocumentParser
+
+        self.assertIs(PublicPDFDocumentParser, PDFDocumentParser)
+
     def test_untrusted_names_cannot_escape_root(self) -> None:
         self.assertEqual(safe_upload_name("../../report.PDF"), "report.pdf")
         self.assertEqual(safe_upload_name("C:\\temp\\report.pdf"), "report.pdf")
@@ -39,13 +45,10 @@ class SecurityBoundaryTests(unittest.TestCase):
     def test_pdf_page_limit_fails_before_text_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "large.pdf"
-            pdf = fitz.open()
-            pdf.new_page()
-            pdf.new_page()
-            pdf.save(path)
-            pdf.close()
+            write_stub_pdf(path)
+            parser = MCPPDFParserFixture({path.name: {1: "first", 2: "second"}})
             with self.assertRaisesRegex(ValueError, "page processing limit"):
-                parse_pdf_document(path, max_pages=1)
+                parse_pdf_document(path, max_pages=1, document_parser=parser)
 
     def test_pdf_file_size_limit_fails_before_parser_open(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -57,42 +60,34 @@ class SecurityBoundaryTests(unittest.TestCase):
     def test_pdf_extracted_text_is_bounded_before_rag_indexing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "text-heavy.pdf"
-            pdf = fitz.open()
-            page = pdf.new_page()
-            page.insert_text((72, 72), "ACME " + ("risk " * 100))
-            pdf.save(path)
-            pdf.close()
+            write_stub_pdf(path)
+            parser = MCPPDFParserFixture({path.name: {1: "ACME " + ("risk " * 100)}})
             with self.assertRaisesRegex(ValueError, "extracted text exceeds"):
-                parse_pdf_document(path, max_text_characters=32)
+                parse_pdf_document(path, max_text_characters=32, document_parser=parser)
 
-    def test_image_only_pdf_has_diagnostics_and_optional_ocr(self) -> None:
-        class OCR:
-            calls: list[tuple[Path, int]] = []
+    def test_pdf_requires_managed_parser_and_accepts_mcp_parser(self) -> None:
+        class LocalParser:
+            parser_kind = "local"
 
-            def extract_document(self, file_path: Path, expected_pages: int) -> dict[int, str]:
-                self.calls.append((file_path, expected_pages))
-                return {1: "ACME covenant headroom narrowed."}
+            def extract_document(self, _file_path: Path) -> dict[int, str]:
+                return {1: "local text"}
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "scan.pdf"
-            pdf = fitz.open()
-            page = pdf.new_page()
-            pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 10, 10), 0)
-            pixmap.clear_with(255)
-            page.insert_image(fitz.Rect(72, 72, 172, 172), pixmap=pixmap)
-            pdf.save(path)
-            pdf.close()
+            write_stub_pdf(path)
 
-            without_ocr = parse_pdf_document(path, include_pages=True)
-            self.assertEqual(without_ocr["text_page_count"], 0)
-            self.assertEqual(without_ocr["warnings"][0]["code"], "ocr_required")
+            with self.assertRaisesRegex(ValueError, "PaddleOCR or MCP"):
+                parse_pdf_document(path, include_pages=True)
+            with self.assertRaisesRegex(ValueError, "must be PaddleOCR or MCP"):
+                parse_pdf_document(path, document_parser=LocalParser())  # type: ignore[arg-type]
 
-            ocr = OCR()
-            parsed = parse_pdf_document(path, include_pages=True, ocr_provider=ocr)
-            self.assertEqual(ocr.calls, [(path, 1)])
-            self.assertEqual(parsed["ocr_page_count"], 1)
+            parser = MCPPDFParserFixture({path.name: {1: "ACME covenant headroom narrowed."}})
+            parsed = parse_pdf_document(path, include_pages=True, document_parser=parser)
+            self.assertEqual(parser.calls, [path])
+            self.assertEqual(parsed["parsed_page_count"], 1)
+            self.assertEqual(parsed["parser_kind"], "mcp")
             self.assertEqual(parsed["warnings"], [])
-            self.assertEqual(parsed["pages"][0]["extraction_method"], "ocr")
+            self.assertEqual(parsed["pages"][0]["extraction_method"], "mcp")
             self.assertIn("covenant headroom", parsed["pages"][0]["text"])
 
 

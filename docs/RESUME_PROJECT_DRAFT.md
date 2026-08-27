@@ -6,7 +6,7 @@
 
 ### MAS Finance｜可溯源金融研究 Agent
 
-**技术栈：** Python、LangGraph、FastAPI、DeepSeek、SQLite、PyMuPDF、PaddleOCR-VL、BM25、向量检索、Reranker
+**技术栈：** Python、LangGraph、FastAPI、DeepSeek、SQLite、PaddleOCR-VL、PDF 解析 MCP、BM25、向量检索、Reranker
 
 设计并实现具备自主规划、多源取证、跨轮记忆与结果校验能力的**金融研究 Agent**，打通从研报、行情及监管数据获取，到金融计算、证据融合与可溯源报告生成的端到端研究闭环。
 

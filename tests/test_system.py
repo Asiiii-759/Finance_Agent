@@ -9,8 +9,8 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-import fitz
 from httpx import ASGITransport, AsyncClient
+from pdf_fixtures import MCPPDFParserFixture, write_stub_pdf
 
 from mas_finance.api.app import create_app
 from mas_finance.config import AppConfig
@@ -117,11 +117,15 @@ class FinanceSystemTestCase(unittest.TestCase):
     def test_personal_knowledge_api_persists_parsed_pages_and_deletes_document(self) -> None:
         tmp_root = ROOT / "test_artifacts" / f"personal-knowledge-{uuid4().hex[:8]}"
         tmp_root.mkdir(parents=True, exist_ok=True)
-        app = create_app(build_test_config(tmp_root, api_key=None))
-        pdf = fitz.open()
-        pdf.new_page().insert_text((72, 72), "Personal policy: review duration and credit spread.")
-        pdf_bytes = pdf.tobytes()
-        pdf.close()
+        parser = MCPPDFParserFixture(
+            {"policy.pdf": {1: "Personal policy: review duration and credit spread."}}
+        )
+        app = create_app(
+            build_test_config(tmp_root, api_key=None),
+            pdf_document_parser=parser,
+            pdf_parser_network_access=False,
+        )
+        pdf_bytes = b"%PDF-1.7\n%%EOF\n"
 
         async def scenario():
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -196,12 +200,13 @@ class FinanceSystemTestCase(unittest.TestCase):
             root = Path(tmp_dir)
             config = build_test_config(root)
             pdf_path = root / "acme.pdf"
-            pdf = fitz.open()
-            page = pdf.new_page()
-            page.insert_text((72, 72), "ACME revenue demand and operating cash flow remained resilient in 2026")
-            pdf.save(pdf_path)
-            pdf.close()
-            response = FinanceAnalysisService(config).analyze(
+            write_stub_pdf(pdf_path)
+            parser = MCPPDFParserFixture(
+                {pdf_path.name: {1: "ACME revenue demand and operating cash flow remained resilient in 2026"}}
+            )
+            response = FinanceAnalysisService(
+                config, pdf_document_parser=parser, pdf_parser_network_access=False
+            ).analyze(
                 "Analyze ACME demand and cash flow",
                 thread_id="test-e2e",
                 entities=["ACME"],
@@ -369,12 +374,13 @@ class FinanceSystemTestCase(unittest.TestCase):
     def test_upload_endpoint(self) -> None:
         tmp_root = ROOT / "test_artifacts" / f"upload-test-{uuid4().hex[:8]}"
         tmp_root.mkdir(parents=True, exist_ok=True)
-        app = create_app(build_test_config(tmp_root, api_key=None))
-        pdf = fitz.open()
-        page = pdf.new_page()
-        page.insert_text((72, 72), "Apple revenue 400 EBITDA 120 risk warning")
-        pdf_bytes = pdf.tobytes()
-        pdf.close()
+        parser = MCPPDFParserFixture({"Apple_report.pdf": {1: "Apple revenue 400 EBITDA 120 risk warning"}})
+        app = create_app(
+            build_test_config(tmp_root, api_key=None),
+            pdf_document_parser=parser,
+            pdf_parser_network_access=False,
+        )
+        pdf_bytes = b"%PDF-1.7\n%%EOF\n"
 
         async def scenario():
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -398,18 +404,20 @@ class FinanceSystemTestCase(unittest.TestCase):
         self.assertTrue(all(item["title"] == "Apple_report.pdf" for item in document_sources))
         self.assertTrue(all("Apple_report.pdf" in item["locator"] for item in document_sources))
         self.assertEqual(payload["document_diagnostics"][0]["text_page_count"], 1)
-        self.assertEqual(payload["document_diagnostics"][0]["ocr_page_count"], 0)
+        self.assertEqual(payload["document_diagnostics"][0]["parsed_page_count"], 1)
+        self.assertEqual(payload["document_diagnostics"][0]["parser_kind"], "mcp")
         self.assertEqual(list((tmp_root / "uploads").glob("*")), [])
 
     def test_upload_can_be_retained_for_explicit_session_recall_and_deleted(self) -> None:
         tmp_root = ROOT / "test_artifacts" / f"session-upload-test-{uuid4().hex[:8]}"
         tmp_root.mkdir(parents=True, exist_ok=True)
-        app = create_app(build_test_config(tmp_root, api_key=None))
-        pdf = fitz.open()
-        page = pdf.new_page()
-        page.insert_text((72, 72), "ACME refinancing maturity is September 2027.")
-        pdf_bytes = pdf.tobytes()
-        pdf.close()
+        parser = MCPPDFParserFixture({"maturity.pdf": {1: "ACME refinancing maturity is September 2027."}})
+        app = create_app(
+            build_test_config(tmp_root, api_key=None),
+            pdf_document_parser=parser,
+            pdf_parser_network_access=False,
+        )
+        pdf_bytes = b"%PDF-1.7\n%%EOF\n"
 
         async def scenario():
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

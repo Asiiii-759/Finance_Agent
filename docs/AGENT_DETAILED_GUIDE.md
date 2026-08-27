@@ -476,7 +476,7 @@ Harness 是所有工具的唯一执行入口。工具不能因为 Planner 或 LL
 流程是：
 
 ```text
-PDF → 安全校验 → 视觉顺序按页解析 → 必要时受控 OCR → CorpusDocument → chunks
+PDF → 安全校验 → PaddleOCR 或成熟 PDF 解析 MCP → CorpusDocument → chunks
     → BM25，或配置后的 embedding/cosine + RRF → RetrievalEvidenceAdapter → document Evidence
 ```
 
@@ -489,7 +489,7 @@ PDF → 安全校验 → 视觉顺序按页解析 → 必要时受控 OCR → Co
 - 实现 provider-neutral 的 `search_json(payload)` 契约；
 - 默认生命周期限定在当前分析请求；只有显式 opt-in 才把解析页文本放入短 TTL 会话层，仍不形成长期知识库。
 
-PDF 解析默认最多 500 页、每份最多 5,000,000 个抽取字符。PyMuPDF 使用视觉坐标排序并做有限 Unicode/空白归一化；每页记录 native/ocr 提取方式、文本字符数和图像数。纯图片页产生 `ocr_required` 诊断。配置 PaddleOCR-VL-1.6 后，整份 PDF 只提交一次，仅接收页级 Markdown，不下载返回图片；轮询、请求、文件和 JSONL 均有上限，且 OCR 需要服务端与本次请求双重网络授权。页面独立进入 corpus，因此 evidence locator 能保留真实页码。
+PDF 解析默认最多 500 页、每份最多 5,000,000 个抽取字符。系统不再包含 PyMuPDF 本地提取分支，只接受 PaddleOCR-VL-1.6 或部署注入的成熟 PDF 解析 MCP；解析器必须返回从 1 开始且连续的页级文本。PaddleOCR 整份 PDF 只提交一次，仅接收页级 Markdown，不下载返回图片；轮询、请求、文件和 JSONL 均有上限。远程解析需要服务端与本次请求双重网络授权。页面独立进入 corpus，因此 evidence locator 能保留真实页码和解析器类型。
 
 部署还可注入有序 `RetrievalSource`。来源可以是进程内企业 corpus，也可以是 `HTTPJSONRAGClient` 对接的固定 HTTPS gateway。Gateway 返回统一 chunks contract；`fixed_filters` 由服务端绑定且优先于调用参数，避免 Agent 放宽 tenant/ACL 条件。外部来源声明 `network_access=true` 后继续受服务端与请求端双重授权。
 

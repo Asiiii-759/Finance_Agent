@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 
 from ..config import AppConfig
-from ..documents import PDFOCRProvider
+from ..documents import PDFDocumentParser
 from ..embeddings import EmbeddingProvider
 from ..harness import Tool
 from ..logging_utils import configure_logging, request_logging_middleware
@@ -32,8 +32,8 @@ def create_app(
     *,
     retrieval_sources: Sequence[RetrievalSource] = (),
     evidence_tools: Sequence[Tool] = (),
-    pdf_ocr_provider: PDFOCRProvider | None = None,
-    pdf_ocr_network_access: bool = True,
+    pdf_document_parser: PDFDocumentParser | None = None,
+    pdf_parser_network_access: bool = True,
     embedding_provider: EmbeddingProvider | None = None,
 ) -> FastAPI:
     configure_logging()
@@ -42,8 +42,8 @@ def create_app(
         app_config,
         retrieval_sources=retrieval_sources,
         evidence_tools=evidence_tools,
-        pdf_ocr_provider=pdf_ocr_provider,
-        pdf_ocr_network_access=pdf_ocr_network_access,
+        pdf_document_parser=pdf_document_parser,
+        pdf_parser_network_access=pdf_parser_network_access,
         embedding_provider=embedding_provider,
     )
     auth_dependency = build_api_key_dependency(app_config.api_key)

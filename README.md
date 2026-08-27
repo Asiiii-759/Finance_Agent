@@ -16,7 +16,7 @@ intent → planning ↔ validation → final_generation → validation → END
 
 ## 能力
 
-- PDF 上传、视觉顺序文本提取、扫描页诊断、可选 PaddleOCR-VL-1.6、页级引用，以及 request/session/personal BM25 + embedding/RRF 双路检索
+- PDF 上传、PaddleOCR-VL-1.6 或部署注入的成熟 PDF 解析 MCP、页级引用，以及 request/session/personal BM25 + embedding/RRF 双路检索
 - 可注入内部/外部 RAG 源，以及固定 HTTPS canonical JSON 搜索网关
 - 中英金融场景识别、结构化 ResearchScope、模型自主逐步规划与确定性规划降级
 - 受控开放网页搜索：模型生成检索式、时效窗口和域名范围；URL/内容去重、来源分散度校验，snippet 只能形成带复核提示的推断
@@ -35,7 +35,7 @@ intent → planning ↔ validation → final_generation → validation → END
 - 只读 canonical-evidence 工具注入边界，可接企业 RAG、MCP gateway 或 licensed feed；未注入时不启用
 - 带逐字 evidence quote 验证的 LLM 合成与确定性降级
 - FastAPI、后台作业、CLI、报告与审计产物
-- 11 个可独立运行的黑盒验收场景和 142 项自动化测试
+- 11 个可独立运行的黑盒验收场景和 143 项自动化测试
 
 完整的运行机制、状态契约、数据源、记忆、安全边界和扩展方法见
 [Agent 详细说明](docs/AGENT_DETAILED_GUIDE.md)；架构决策摘要见
@@ -85,7 +85,7 @@ mas-finance \
 python run_demo.py --query "分析这份财报" --pdf ./report.pdf
 ```
 
-扫描版 PDF 可选启用 PaddleOCR。密钥只配置在环境中，并继续要求双重网络授权：
+内置 PDF 解析使用 PaddleOCR。密钥只配置在环境中，并继续要求双重网络授权：
 
 ```bash
 set -a; source .env; set +a
@@ -229,8 +229,10 @@ PADDLEOCR_MODEL=PaddleOCR-VL-1.6
 都需要服务端允许且本次请求显式 `allow_network=true`。`BOCHA_SEARCH_API_KEY` 或
 `BRAVE_SEARCH_API_KEY` 只启用 `web.search`；两者同时存在时显式优先 Bocha，
 模型仍不能构造任意 HTTP 请求。网页搜索结果只是发现层，不会冒充 SEC/FRED/行情等结构化一手数据。
-PaddleOCR 未配置时，扫描页会给出诊断，纯扫描件失败关闭；配置后只消费页级
-Markdown，不下载远端图片资源。未配置 LLM 时使用确定性规划器和只复述证据的确定性合成器。
+PDF 不再走本地 PyMuPDF 文本提取。运行时必须配置 PaddleOCR，或通过 `create_app` / `FinanceAnalysisService`
+注入实现 `PDFDocumentParser` 契约的成熟 PDF 解析 MCP adapter；两者都返回从 1 开始、连续的页级文本。
+PaddleOCR 只消费页级 Markdown，不下载远端图片资源。未配置解析器时上传快速失败。
+未配置 LLM 时使用确定性规划器和只复述证据的确定性合成器。
 embedding 未配置时只注册 BM25 工具；配置 OpenAI-compatible HTTPS endpoint 后额外注册 hybrid/RRF 工具，
 模型可自主选择，远程调用继续要求双重网络授权。系统不会把 DeepSeek 对话接口误作 embedding 接口。
 

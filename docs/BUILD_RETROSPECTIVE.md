@@ -190,8 +190,8 @@ FRED observations 的接口边界依据 [FRED 官方 series observations](https:
 | RAG-09 | BM25 接口会把 list query 或 bool top_k 强转 | 畸形请求看似成功 | query/top_k/filter 严格类型与大小校验 | coercion tests | 已解决 |
 | RAG-10 | lexical score 被当作 confidence | 排名分数并非概率 | 只使用显式 extraction confidence；BM25/RRF score 留在 metadata | adapter tests | 已解决 |
 | RAG-11 | 文档可能包含提示注入 | RAG 并不能消除间接 prompt injection | 文档位于 evidence trust zone；不能改变工具权限；模型输出仍受引用和校验约束 | injection/Markdown tests | 已解决 |
-| RAG-12 | scanned PDF 没有 OCR | 无文本时无法检索 | 原生提取先诊断；可选 PaddleOCR-VL-1.6 有界整文档解析；无 OCR 或无结果时失败关闭 | image-only、授权、MockTransport 与真实单页 smoke | 已解决 |
-| RAG-13 | PDF 对象顺序不等于阅读顺序 | 多栏财报文本可能交错 | PyMuPDF `sort=True` 按视觉坐标提取，并做有限 Unicode/空白归一化 | parser tests | 已解决 |
+| RAG-12 | scanned PDF 没有 OCR | 无文本时无法检索 | PaddleOCR-VL-1.6 有界整文档解析；无解析器或无结果时失败关闭 | 授权、MockTransport 与真实单页 smoke | 已解决 |
+| RAG-13 | 本地 PDF 对象顺序不等于阅读顺序 | 多栏财报文本可能交错 | 删除 PyMuPDF 分支，统一交给 PaddleOCR 或成熟 PDF 解析 MCP 返回页级文本 | parser contract tests | 已解决 |
 | RAG-14 | OCR 示例无限轮询并下载所有图片 | 任务悬挂、内存/存储增长及外域资源风险 | 固定请求/轮询/文件/JSONL 上限；只读取页 Markdown；结果下载不携带 bearer token | OCR adapter tests | 已解决 |
 | RAG-15 | 已限定“根据内部文档”的收入问题仍自动要求 SEC | 文档证据充分却被错误标成 degraded | 文档模式不隐式追加 regulatory requirement；显式交叉核验仍可同时要求 SEC | scope regression + real fallback RAG retest | 已解决 |
 

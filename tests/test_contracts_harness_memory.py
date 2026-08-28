@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
@@ -18,7 +19,6 @@ from mas_finance.harness import (
 )
 from mas_finance.memory_store import (
     ConversationEventKind,
-    EntityRelation,
     InMemoryStore,
     MemoryNamespace,
     SQLiteMemoryStore,
@@ -36,9 +36,11 @@ class CharacterTokenCounter:
 class SummaryFixture:
     def __init__(self) -> None:
         self.calls = 0
+        self.event_kinds: tuple[ConversationEventKind, ...] = ()
 
     def summarize(self, previous_summary, events):
         self.calls += 1
+        self.event_kinds = tuple(event.kind for event in events)
         return {
             "conversation_summary": f"Summarized through event {events[-1].sequence}.",
             "user_goals": ["Compare Apple and Microsoft."],
@@ -199,6 +201,72 @@ class HarnessTests(unittest.TestCase):
 
 
 class MemoryTests(unittest.TestCase):
+    def test_store_removes_obsolete_entity_relation_column_without_losing_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "memory.db"
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    """
+                    CREATE TABLE conversation_events (
+                        tenant_id TEXT NOT NULL, user_id TEXT NOT NULL, kind TEXT NOT NULL,
+                        thread_id TEXT NOT NULL, sequence INTEGER NOT NULL, event_id TEXT NOT NULL,
+                        event_kind TEXT NOT NULL, content TEXT NOT NULL, occurred_at TEXT NOT NULL,
+                        run_id TEXT NOT NULL, entities_json TEXT NOT NULL, relations_json TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        PRIMARY KEY (tenant_id, user_id, kind, thread_id, sequence),
+                        UNIQUE (tenant_id, user_id, kind, thread_id, event_id)
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO conversation_events VALUES
+                    ('tenant', 'user', 'conversation_history', 'thread', 1, 'event-1',
+                     'user_message', '分析 Apple', '2026-08-26T12:00:00+08:00', 'run-1',
+                     '["Apple"]', '[{"subject":"Apple","predicate":"has_symbol","object":"AAPL"}]', '{}')
+                    """
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            store = SQLiteMemoryStore(path)
+            namespace = MemoryNamespace("tenant", "user", "conversation_history", "thread")
+            self.assertEqual(store.list_conversation_events(namespace)[0].content, "分析 Apple")
+            connection = sqlite3.connect(path)
+            try:
+                columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(conversation_events)")}
+            finally:
+                connection.close()
+            self.assertNotIn("relations_json", columns)
+
+    def test_conversation_window_replays_every_atomic_fact_without_top_k_clipping(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteMemoryStore(Path(directory) / "memory.db")
+            namespace = MemoryNamespace("tenant", "user", "conversation_history", "thread")
+            for index in range(25):
+                store.append_conversation_event(
+                    namespace,
+                    event_id=f"fact-{index}",
+                    kind=ConversationEventKind.ATOMIC_FACT,
+                    content=f"原子事实 {index}。",
+                    occurred_at=f"2026-08-26T12:{index:02d}:00+08:00",
+                    run_id=f"run-{index}",
+                    payload={"source_event_ids": [f"source-{index}"], "status": "completed"},
+                )
+
+            context = build_conversation_window(
+                store,
+                namespace,
+                max_tokens=16_000,
+                recent_tokens=4_000,
+                token_counter=CharacterTokenCounter(),
+            )
+            self.assertEqual(len(context["atomic_facts"]), 25)
+            self.assertEqual(context["atomic_facts"][0]["event_id"], "fact-0")
+            self.assertEqual(context["atomic_facts"][-1]["event_id"], "fact-24")
+
     def test_memory_record_can_be_deleted_without_deleting_namespace(self) -> None:
         namespace = MemoryNamespace("tenant", "user", "personal_memory")
         store = InMemoryStore()
@@ -207,10 +275,6 @@ class MemoryTests(unittest.TestCase):
         self.assertTrue(store.delete(namespace, "first"))
         self.assertFalse(store.delete(namespace, "first"))
         self.assertEqual([item.key for item in store.list(namespace)], ["second"])
-
-    def test_entity_relation_deserialization_does_not_coerce_types(self) -> None:
-        with self.assertRaisesRegex(ValueError, "must be strings"):
-            EntityRelation.from_dict({"subject": 123, "predicate": "has_symbol", "object": "AAPL"})
 
     def test_namespace_isolation_and_defensive_copy(self) -> None:
         store = InMemoryStore()
@@ -332,11 +396,8 @@ class MemoryTests(unittest.TestCase):
             self.assertLessEqual(context["manifest"]["estimated_token_count"], 16_000)
             self.assertEqual(context["manifest"]["token_count_method"], "character-test-counter")
             self.assertEqual(summarizer.calls, 1)
+            self.assertNotIn(ConversationEventKind.ATOMIC_FACT, summarizer.event_kinds)
             self.assertIn("Summarized through event", context["summary"]["conversation_summary"])
-            self.assertEqual(context["focus_entities"], ["Apple"])
-            self.assertEqual(context["focus_history"][-1]["entities"], ["Apple"])
-            self.assertEqual(context["entity_state"]["Apple"]["mention_count"], 9)
-            self.assertEqual(context["entity_state"]["Apple"]["symbol"], "AAPL")
             self.assertEqual(context["atomic_facts"][0]["content"], "用户要求比较 Apple 与 Microsoft。")
             self.assertLessEqual(context["manifest"]["recent_context_tokens"], 4_000)
             self.assertEqual(context["manifest"]["max_recent_context_tokens"], 4_000)
@@ -372,7 +433,7 @@ class MemoryTests(unittest.TestCase):
                 )
             self.assertEqual(
                 reopened.delete_conversation(namespace),
-                {"events": 19, "summaries": 1, "run_logs": 0},
+                {"events": 19, "summaries": 1, "run_logs": 0, "runs": 0},
             )
             self.assertEqual(reopened.list_conversation_events(namespace), [])
 

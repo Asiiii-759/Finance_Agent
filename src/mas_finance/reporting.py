@@ -9,7 +9,21 @@ from uuid import uuid4
 from .security import safe_child, safe_identifier
 
 
-def export_run_artifacts(result: dict[str, Any], output_dir: Path, thread_id: str) -> dict[str, str]:
+def export_run_artifacts(
+    result: dict[str, Any],
+    output_dir: Path,
+    thread_id: str,
+    *,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+) -> dict[str, str]:
+    if (tenant_id is None) != (user_id is None):
+        raise ValueError("artifact tenant and user must be provided together")
+    if tenant_id is not None and user_id is not None:
+        output_dir = safe_child(
+            output_dir,
+            f"{safe_identifier(tenant_id, fallback='tenant')}--{safe_identifier(user_id, fallback='user')}",
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")
     base_name = f"{safe_identifier(thread_id, fallback='thread')}_{timestamp}_{uuid4().hex[:8]}"

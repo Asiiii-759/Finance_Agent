@@ -115,6 +115,8 @@ class EvidenceBoundLLMSynthesizer:
                     max_tool_calls=request.max_tool_calls,
                     max_network_calls=request.max_network_calls,
                     max_model_calls=request.max_model_calls,
+                    max_model_input_tokens=request.max_model_input_tokens,
+                    max_model_output_tokens=request.max_model_output_tokens,
                 ),
             ),
         )

@@ -105,14 +105,35 @@ class LLMSkillExtractor:
         value = json.loads(response)
         if not isinstance(value, Mapping) or set(value) != {"skill"}:
             raise ValueError("skill extractor must return a skill object")
-        return None if value["skill"] is None else LearnedSkill.from_dict(value["skill"])
+        if value["skill"] is None:
+            return None
+        skill = LearnedSkill.from_dict(value["skill"])
+        allowed_capabilities = {str(item) for item in run_context.get("successful_capabilities") or ()}
+        if set(skill.required_capabilities).difference(allowed_capabilities):
+            raise ValueError("learned skill contains a capability not observed in the successful run")
+        reusable_text = " ".join((skill.name, skill.description, skill.applicability, *skill.steps))
+        if re.search(r"https?://|www\.", reusable_text, re.IGNORECASE) or re.search(r"\d", reusable_text):
+            raise ValueError("learned skill contains a URL, date, symbol or numeric run detail")
+        for entity in run_context.get("entities") or ():
+            name = str(entity.get("name") or "").strip() if isinstance(entity, Mapping) else ""
+            symbol = str(entity.get("symbol") or "").strip() if isinstance(entity, Mapping) else ""
+            if (name and name.casefold() in reusable_text.casefold()) or (
+                symbol and symbol.casefold() in reusable_text.casefold()
+            ):
+                raise ValueError("learned skill contains an entity-specific run detail")
+        return skill
 
 
 def skill_run_context(result: Mapping[str, Any]) -> dict[str, Any] | None:
+    audit_capabilities = {
+        str(item.get("call_id")): str(item.get("capability"))
+        for item in result.get("audit_events") or ()
+        if item.get("call_id") and item.get("capability")
+    }
     observations = [
         {
             "tool_name": item.get("task", {}).get("tool_name"),
-            "capability": item.get("task", {}).get("category"),
+            "capability": audit_capabilities.get(str(item.get("result", {}).get("call_id") or "")),
             "reason": item.get("task", {}).get("reason"),
             "ok": item.get("result", {}).get("ok"),
             "error_code": item.get("result", {}).get("error_code"),
@@ -135,6 +156,10 @@ def skill_run_context(result: Mapping[str, Any]) -> dict[str, Any] | None:
             for item in result.get("plans") or ()
         ],
         "observations": observations,
+        "successful_capabilities": list(
+            dict.fromkeys(str(item["capability"]) for item in successful if item.get("capability"))
+        ),
+        "entities": list(task_frame.get("entities") or ()),
         "coverage_complete": (result.get("coverage") or {}).get("complete"),
         "unresolved_gap_codes": [
             item.get("code") for item in result.get("gaps") or () if not item.get("resolved", False)

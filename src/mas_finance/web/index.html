@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="MAS Finance 证据优先金融研究工作台" />
+    <title>MAS Finance · 研究工作台</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">M</span>
+          <div>
+            <strong>MAS Finance</strong>
+            <span>Research workspace</span>
+          </div>
+        </div>
+
+        <button class="new-thread" id="new-thread" type="button">
+          <span>＋</span>
+          新研究
+        </button>
+
+        <div class="sidebar-label">最近对话</div>
+        <nav class="thread-list" id="thread-list" aria-label="对话列表"></nav>
+
+        <nav class="library-nav" aria-label="个人空间">
+          <button type="button" data-manager="memories"><span>记</span>长期记忆</button>
+          <button type="button" data-manager="knowledge"><span>库</span>个人知识库</button>
+          <button type="button" data-manager="skills"><span>技</span>Learned Skills</button>
+          <button type="button" data-manager="jobs"><span>任</span>后台任务</button>
+        </nav>
+
+        <div class="sidebar-footer">
+          <button class="identity-card" id="open-settings" type="button">
+            <span class="presence"></span>
+            <span>
+              <strong id="identity-name">local / owner</strong>
+              <small>本地隔离空间</small>
+            </span>
+            <span class="more">···</span>
+          </button>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="workspace-header">
+          <div>
+            <span class="eyebrow">EVIDENCE-FIRST AGENT</span>
+            <h1 id="thread-title">新的金融研究</h1>
+          </div>
+          <div class="header-status">
+            <span class="status-dot"></span>
+            <span id="system-status">正在连接</span>
+          </div>
+        </header>
+
+        <section class="conversation" id="conversation" aria-live="polite">
+          <div class="welcome" id="welcome">
+            <span class="welcome-kicker">从一个明确的问题开始</span>
+            <h2>把研究过程变成<br />可核验的证据链。</h2>
+            <p>询问公司、指标或上传财报。Agent 会规划工具、核对证据，并把缺口和引用一起交给你。</p>
+            <div class="suggestions">
+              <button type="button" data-prompt="比较 Apple 和 Microsoft 最近一年的回撤与波动率">
+                <span>市场比较</span>
+                比较两家公司最近一年的风险
+              </button>
+              <button type="button" data-prompt="分析这份财报的现金流质量与主要风险">
+                <span>文档研究</span>
+                分析财报中的现金流与风险
+              </button>
+              <button type="button" data-prompt="解释自由现金流收益率，并说明使用时最容易犯的错误">
+                <span>概念解释</span>
+                解释指标并指出使用误区
+              </button>
+            </div>
+          </div>
+          <div class="message-list" id="message-list"></div>
+        </section>
+
+        <section class="composer-wrap">
+          <form class="composer" id="composer">
+            <label class="attachment-button" for="pdf-input" title="添加 PDF">
+              <span>＋</span>
+              <input id="pdf-input" type="file" accept="application/pdf,.pdf" multiple />
+            </label>
+            <div class="composer-main">
+              <textarea
+                id="query-input"
+                rows="1"
+                maxlength="8000"
+                placeholder="询问公司、市场、财报或一个金融概念…"
+                aria-label="研究问题"
+              ></textarea>
+              <div class="attachment-list" id="attachment-list"></div>
+              <div class="composer-options">
+                <label><input id="network-toggle" type="checkbox" checked />允许联网工具</label>
+                <label><input id="retain-toggle" type="checkbox" checked />附件保留到本线程</label>
+              </div>
+            </div>
+            <button class="send-button" id="send-button" type="submit" aria-label="发送">
+              <span>↑</span>
+            </button>
+          </form>
+          <p class="composer-note">回答可能存在误差；重要结论请结合引用来源核验。</p>
+        </section>
+      </main>
+
+      <aside class="inspector">
+        <div class="inspector-head">
+          <span class="eyebrow">RUN INSPECTOR</span>
+          <h2>研究过程</h2>
+        </div>
+        <div class="run-empty" id="run-empty">
+          <div class="run-orbit"><span></span></div>
+          <strong>尚未运行</strong>
+          <p>发起研究后，这里会显示规划、工具、证据、缺口与最终状态。</p>
+        </div>
+        <div class="run-panel hidden" id="run-panel"></div>
+      </aside>
+    </div>
+
+    <dialog id="settings-dialog">
+      <form method="dialog" class="settings-card">
+        <div>
+          <span class="eyebrow">LOCAL ACCESS</span>
+          <h2>连接设置</h2>
+          <p>API Key 只保存在当前浏览器标签页，用于连接本地服务。</p>
+        </div>
+        <label>
+          X-API-Key
+          <input id="api-key-input" type="password" autocomplete="off" placeholder="未启用时留空" />
+        </label>
+        <div class="dialog-actions">
+          <button value="cancel" type="submit">取消</button>
+          <button id="save-settings" value="default" type="button">保存并重连</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="manager-dialog" class="manager-dialog">
+      <div class="manager-card">
+        <header>
+          <div>
+            <span class="eyebrow">PERSONAL CONTEXT</span>
+            <h2 id="manager-title">个人空间</h2>
+          </div>
+          <button id="close-manager" type="button" aria-label="关闭">×</button>
+        </header>
+        <nav class="manager-tabs">
+          <button type="button" data-manager="memories">长期记忆</button>
+          <button type="button" data-manager="knowledge">知识库</button>
+          <button type="button" data-manager="skills">Skills</button>
+          <button type="button" data-manager="jobs">任务</button>
+        </nav>
+        <section id="manager-content" class="manager-content"></section>
+      </div>
+    </dialog>
+
+    <div class="toast hidden" id="toast" role="status"></div>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

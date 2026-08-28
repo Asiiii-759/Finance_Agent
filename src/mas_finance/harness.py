@@ -14,7 +14,11 @@ from enum import StrEnum
 from hashlib import sha256
 from typing import Any, Protocol
 
+from opentelemetry import trace
+
 from .contracts import EvidenceBundle, utc_now
+
+_TRACER = trace.get_tracer("mas_finance.tools")
 
 
 class SideEffect(StrEnum):
@@ -157,6 +161,8 @@ class ExecutionPolicy:
     max_tool_calls: int = 20
     max_network_calls: int = 8
     max_model_calls: int = 1
+    max_model_input_tokens: int = 300_000
+    max_model_output_tokens: int = 32_768
 
     def __post_init__(self) -> None:
         if not 0 <= self.max_tool_calls <= 1_000:
@@ -165,6 +171,10 @@ class ExecutionPolicy:
             raise ValueError("network-attempt budget must be between 0 and 10000")
         if not 0 <= self.max_model_calls <= 100:
             raise ValueError("model-call budget must be between 0 and 100")
+        if not 1_000 <= self.max_model_input_tokens <= 1_000_000:
+            raise ValueError("model input-token budget must be between 1000 and 1000000")
+        if not 256 <= self.max_model_output_tokens <= 200_000:
+            raise ValueError("model output-token budget must be between 256 and 200000")
         if min(self.max_tool_calls, self.max_network_calls, self.max_model_calls) < 0:
             raise ValueError("execution budgets cannot be negative")
 
@@ -237,6 +247,8 @@ class ToolAuditEvent:
     attempts: int
     budget_consumed: bool
     network_attempts: int
+    model_input_tokens: int
+    model_output_tokens: int
     duration_ms: float
     timestamp: str
     error_code: str | None = None
@@ -249,6 +261,8 @@ class _Budget:
     tool_calls: int = 0
     network_calls: int = 0
     model_calls: int = 0
+    model_input_tokens: int = 0
+    model_output_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -260,6 +274,8 @@ class _RunBoundary:
     max_tool_calls: int
     max_network_calls: int
     max_model_calls: int
+    max_model_input_tokens: int
+    max_model_output_tokens: int
 
 
 @dataclass(frozen=True)
@@ -267,6 +283,8 @@ class ToolBudgetUsage:
     tool_calls: int
     network_attempts: int
     model_calls: int
+    model_input_tokens: int
+    model_output_tokens: int
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -319,6 +337,8 @@ class ToolHarness:
         tool_calls: int,
         network_calls: int,
         model_calls: int,
+        model_input_tokens: int = 0,
+        model_output_tokens: int = 0,
         sequence: int,
     ) -> None:
         """Restore counters before resuming a persisted run.
@@ -327,17 +347,29 @@ class ToolHarness:
         reusing call identifiers. It intentionally restores counters, not audit
         payloads; durable observations live in the agent checkpoint.
         """
-        if min(tool_calls, network_calls, model_calls, sequence) < 0:
+        if min(tool_calls, network_calls, model_calls, model_input_tokens, model_output_tokens, sequence) < 0:
             raise ValueError("invalid restored harness counters")
         with self._lock:
             self._budgets[run_id] = _Budget(
                 tool_calls=tool_calls,
                 network_calls=network_calls,
                 model_calls=model_calls,
+                model_input_tokens=model_input_tokens,
+                model_output_tokens=model_output_tokens,
             )
             self._sequences[run_id] = sequence
 
     def invoke(self, name: str, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
+        with _TRACER.start_as_current_span(
+            "agent.tool",
+            attributes={"agent.tool.name": name, "agent.run.id": context.run_id},
+        ) as span:
+            result = self._invoke(name, arguments, context)
+            span.set_attribute("agent.tool.status", result.status.value)
+            span.set_attribute("agent.tool.duration_ms", result.duration_ms)
+            return result
+
+    def _invoke(self, name: str, arguments: Mapping[str, Any], context: ToolContext) -> ToolResult:
         started_at = utc_now()
         start = self._clock()
         valid_name = isinstance(name, str) and bool(re.fullmatch(r"[a-z][a-z0-9_.-]{0,99}", name))
@@ -404,6 +436,8 @@ class ToolHarness:
         with self._lock:
             budget = self._budgets.setdefault(context.run_id, _Budget())
             is_model = tool.spec.capability == "model.generate"
+            input_tokens = _model_input_tokens(arguments) if is_model else 0
+            requested_output_tokens = int(arguments.get("max_tokens", 600)) if is_model else 0
             if is_model and budget.model_calls >= context.policy.max_model_calls:
                 return self._finish(
                     call_id=call_id,
@@ -416,6 +450,36 @@ class ToolHarness:
                     attempts=0,
                     error_code="model_call_budget_exhausted",
                     error_message="run model-call budget exhausted",
+                )
+            if is_model and budget.model_input_tokens + input_tokens > context.policy.max_model_input_tokens:
+                return self._finish(
+                    call_id=call_id,
+                    tool=tool,
+                    context=context,
+                    arguments=arguments,
+                    status=ToolStatus.BUDGET_EXHAUSTED,
+                    started_at=started_at,
+                    start=start,
+                    attempts=0,
+                    error_code="model_input_token_budget_exhausted",
+                    error_message="run model input-token budget exhausted",
+                )
+            if (
+                is_model
+                and budget.model_output_tokens + requested_output_tokens
+                > context.policy.max_model_output_tokens
+            ):
+                return self._finish(
+                    call_id=call_id,
+                    tool=tool,
+                    context=context,
+                    arguments=arguments,
+                    status=ToolStatus.BUDGET_EXHAUSTED,
+                    started_at=started_at,
+                    start=start,
+                    attempts=0,
+                    error_code="model_output_token_budget_exhausted",
+                    error_message="run model output-token budget exhausted",
                 )
             if not is_model and budget.tool_calls >= context.policy.max_tool_calls:
                 return self._finish(
@@ -445,6 +509,7 @@ class ToolHarness:
                 )
             if is_model:
                 budget.model_calls += 1
+                budget.model_input_tokens += input_tokens
             else:
                 budget.tool_calls += 1
                 budget.network_calls += int(tool.spec.network_access)
@@ -454,6 +519,10 @@ class ToolHarness:
             try:
                 data = tool(arguments, context)
                 _validate_tool_output(tool.spec, data)
+                if is_model:
+                    with self._lock:
+                        content = data.get("content") if isinstance(data, Mapping) else ""
+                        self._budgets[context.run_id].model_output_tokens += _estimated_tokens(str(content))
                 elapsed = self._clock() - start
                 if elapsed > tool.spec.timeout_seconds:
                     return self._finish(
@@ -570,6 +639,8 @@ class ToolHarness:
                 tool_calls=budget.tool_calls,
                 network_attempts=budget.network_calls,
                 model_calls=budget.model_calls,
+                model_input_tokens=budget.model_input_tokens,
+                model_output_tokens=budget.model_output_tokens,
             )
 
     def clear_run(self, run_id: str) -> None:
@@ -588,6 +659,8 @@ class ToolHarness:
             max_tool_calls=context.policy.max_tool_calls,
             max_network_calls=context.policy.max_network_calls,
             max_model_calls=context.policy.max_model_calls,
+            max_model_input_tokens=context.policy.max_model_input_tokens,
+            max_model_output_tokens=context.policy.max_model_output_tokens,
         )
         with self._lock:
             existing = self._run_boundaries.get(context.run_id)
@@ -688,6 +761,18 @@ class ToolHarness:
             attempts=attempts,
             budget_consumed=attempts > 0,
             network_attempts=(attempts if tool.spec.network_access and tool.spec.capability != "model.generate" else 0),
+            model_input_tokens=(
+                _model_input_tokens(arguments)
+                if tool.spec.capability == "model.generate" and attempts
+                else 0
+            ),
+            model_output_tokens=(
+                _estimated_tokens(str(data.get("content", "")))
+                if tool.spec.capability == "model.generate"
+                and status is ToolStatus.SUCCESS
+                and isinstance(data, Mapping)
+                else 0
+            ),
             duration_ms=duration_ms,
             timestamp=started_at,
             error_code=error_code,
@@ -788,6 +873,16 @@ def _result_summary(value: Any) -> dict[str, Any]:
     if isinstance(value, (list, tuple)):
         return {"type": "array", "item_count": len(value)}
     return {"type": type(value).__name__}
+
+
+def _model_input_tokens(arguments: Mapping[str, Any]) -> int:
+    return _estimated_tokens(str(arguments.get("system_prompt", ""))) + _estimated_tokens(
+        str(arguments.get("user_prompt", ""))
+    )
+
+
+def _estimated_tokens(text: str) -> int:
+    return max(1, (len(text.encode("utf-8")) + 2) // 3)
 
 
 def _is_secret_key(value: str) -> bool:

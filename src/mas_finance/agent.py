@@ -48,6 +48,8 @@ class ResearchRequest:
     max_tool_calls: int = 12
     max_network_calls: int = 8
     max_model_calls: int = 8
+    max_model_input_tokens: int = 300_000
+    max_model_output_tokens: int = 32_768
     max_parallel_tool_calls: int = 4
     require_documents: bool = True
     require_market_data: bool | None = None
@@ -105,6 +107,10 @@ class ResearchRequest:
             raise ValueError("max_network_calls must be between zero and max_tool_calls")
         if not 0 <= self.max_model_calls <= 20:
             raise ValueError("max_model_calls must be between zero and twenty")
+        if not 16_000 <= self.max_model_input_tokens <= 1_000_000:
+            raise ValueError("max_model_input_tokens must be between 16000 and 1000000")
+        if not 1_024 <= self.max_model_output_tokens <= 200_000:
+            raise ValueError("max_model_output_tokens must be between 1024 and 200000")
         if not 1 <= self.max_parallel_tool_calls <= 8:
             raise ValueError("max_parallel_tool_calls must be between 1 and 8")
         object.__setattr__(self, "macro_series", validate_macro_series(self.macro_series))
@@ -122,8 +128,8 @@ class ResearchRequest:
             raise ValueError("thread_context must be JSON serializable") from exc
         if len(thread_payload) > 2_000_000:
             raise ValueError("thread_context exceeds length limit")
-        if len(self.personal_context) > 20 or any(not isinstance(item, Mapping) for item in self.personal_context):
-            raise ValueError("personal_context must contain at most 20 objects")
+        if len(self.personal_context) > 501 or any(not isinstance(item, Mapping) for item in self.personal_context):
+            raise ValueError("personal_context must contain at most 501 objects")
         try:
             personal_payload = json.dumps(
                 [dict(item) for item in self.personal_context],
@@ -132,7 +138,7 @@ class ResearchRequest:
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("personal_context must be JSON serializable") from exc
-        if len(personal_payload) > 20_000:
+        if len(personal_payload) > 110_000:
             raise ValueError("personal_context exceeds length limit")
         if len(self.skill_index) > 100 or any(not isinstance(item, Mapping) for item in self.skill_index):
             raise ValueError("skill_index must contain at most 100 objects")
@@ -177,6 +183,8 @@ class ResearchRequest:
             max_tool_calls=int(value.get("max_tool_calls", 12)),
             max_network_calls=int(value.get("max_network_calls", 8)),
             max_model_calls=int(value.get("max_model_calls", 8)),
+            max_model_input_tokens=int(value.get("max_model_input_tokens", 300_000)),
+            max_model_output_tokens=int(value.get("max_model_output_tokens", 32_768)),
             max_parallel_tool_calls=int(value.get("max_parallel_tool_calls", 4)),
             require_documents=bool(value.get("require_documents", True)),
             require_market_data=value.get("require_market_data"),

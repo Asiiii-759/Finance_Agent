@@ -6,7 +6,7 @@ import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock, Thread
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -18,7 +18,7 @@ from .config import AppConfig
 from .contracts import stable_id
 from .conversation import LLMConversationSummarizer
 from .corpus import CorpusDocument, InMemoryCorpus
-from .documents import PDFDocumentParser, detect_companies, parse_pdf_document
+from .documents import PDFDocumentParser, parse_pdf_document
 from .embeddings import EmbeddingProvider, HTTPEmbeddingClient
 from .formula import formula_harness_tool
 from .graph import FinancialResearchAgent
@@ -71,6 +71,8 @@ from .web_search import BochaWebSearchClient, BraveWebSearchClient, WebSearchEvi
 
 if TYPE_CHECKING:
     from .database import JobRepository
+
+_MAX_PERSONAL_MEMORY_CHARACTERS = 100_000
 
 
 class FinanceAnalysisService:
@@ -571,6 +573,14 @@ class FinanceAnalysisService:
         actual_thread_id = thread_id or f"run-{uuid4().hex[:8]}"
         actual_run_id = run_id or f"run-{uuid4().hex[:12]}"
         conversation_namespace = self._conversation_namespace(tenant_id, user_id, actual_thread_id)
+        self.memory_store.upsert_conversation_thread(
+            conversation_namespace.tenant_id,
+            conversation_namespace.user_id,
+            actual_thread_id,
+            title=query.strip()[:200],
+            run_id=actual_run_id,
+            status="running",
+        )
         self.memory_store.append_run_log(
             conversation_namespace,
             run_id=actual_run_id,
@@ -611,7 +621,7 @@ class FinanceAnalysisService:
             },
         )
         personal_context = (
-            (*self._user_profile_context(), *self._recall_personal_memories(tenant_id, user_id, query))
+            (*self._user_profile_context(), *self._personal_memory_context(tenant_id, user_id))
             if use_personal_memory and self.config.personal_memory_enabled
             else ()
         )
@@ -825,15 +835,9 @@ class FinanceAnalysisService:
             else:
                 document_tool_names.append("personal.search")
 
-        detected_entities = detect_companies(
-            query
-            + " "
-            + " ".join(
-                company for document in document_contexts for company in document.get("detected_companies") or []
-            )
-        )
-        # The task-frame model resolves references from durable atomic facts.
-        requested_entities = _normalized_entities([*(entities or []), *detected_entities])
+        # Explicit API entities remain request parameters. Natural-language entity
+        # extraction and reference resolution belong to the LLM TaskFrame.
+        requested_entities = _normalized_entities(entities or [])
         request_thread_context = dict(thread_context)
         market_client = MarketDataClient(
             provider=self.config.market_data_provider,
@@ -854,14 +858,9 @@ class FinanceAnalysisService:
             )
         )
 
-        remembered_symbols = {
-            str(entity): str(state["symbol"])
-            for entity, state in (thread_context.get("entity_state") or {}).items()
-            if isinstance(state, dict) and isinstance(state.get("symbol"), str)
-        }
         resolved_symbols: dict[str, str] = {}
         for entity in requested_entities:
-            candidate = (symbols or {}).get(entity) or remembered_symbols.get(entity) or DEFAULT_TICKER_MAP.get(entity)
+            candidate = (symbols or {}).get(entity) or DEFAULT_TICKER_MAP.get(entity)
             if candidate:
                 resolved_symbols[entity] = str(candidate).strip()
             elif re.fullmatch(r"[A-Za-z0-9.^=_:-]{1,32}", entity):
@@ -900,6 +899,8 @@ class FinanceAnalysisService:
             allow_network=network_allowed,
             max_iterations=6,
             max_model_calls=8,
+            max_model_input_tokens=self.config.model_input_token_budget,
+            max_model_output_tokens=self.config.model_output_token_budget,
             max_parallel_tool_calls=4,
             require_documents=document_research_required,
             require_market_data=require_market_data,
@@ -951,6 +952,7 @@ class FinanceAnalysisService:
         finally:
             self._close_graph_checkpointer()
             for audit in harness.audit_events(actual_run_id):
+                self.memory_store.append_audit_event(conversation_namespace, audit)
                 if self.config.conversation_memory_enabled:
                     self.memory_store.append_conversation_event(
                         conversation_namespace,
@@ -988,6 +990,8 @@ class FinanceAnalysisService:
                             "result_status",
                             "attempts",
                             "network_attempts",
+                            "model_input_tokens",
+                            "model_output_tokens",
                             "duration_ms",
                             "error_code",
                             "error_message",
@@ -1005,6 +1009,12 @@ class FinanceAnalysisService:
                     details={"phase": "agent_execution", "error_type": type(agent_failure).__name__},
                 )
         result = outcome.to_dict()
+        self.memory_store.record_run_usage(
+            conversation_namespace,
+            actual_run_id,
+            result.get("budget_usage") or {},
+        )
+        assistant_reply = _assistant_reply(result)
         self.memory_store.append_run_log(
             conversation_namespace,
             run_id=actual_run_id,
@@ -1026,11 +1036,27 @@ class FinanceAnalysisService:
         )
         if self.config.conversation_memory_enabled:
             namespace = self._conversation_namespace(tenant_id, user_id, actual_thread_id)
+            self.memory_store.put_conversation_run(
+                namespace,
+                run_id=actual_run_id,
+                status=str(result["status"]),
+                stop_reason=str(result.get("stop_reason") or "unknown"),
+                assistant_reply=assistant_reply,
+                result=result,
+            )
+            self.memory_store.upsert_conversation_thread(
+                namespace.tenant_id,
+                namespace.user_id,
+                actual_thread_id,
+                title=query.strip()[:200],
+                run_id=actual_run_id,
+                status=str(result["status"]),
+            )
             self.memory_store.append_conversation_event(
                 namespace,
                 event_id=stable_id("event", {"run_id": actual_run_id, "kind": "assistant"}),
                 kind=ConversationEventKind.ASSISTANT_MESSAGE,
-                content=str(result["report"]),
+                content=assistant_reply,
                 run_id=actual_run_id,
                 entities=requested_entities,
                 payload={
@@ -1051,37 +1077,36 @@ class FinanceAnalysisService:
             )
             try:
                 atomic_facts = atomic_fact_extractor.extract(run_events)
+                for fact in atomic_facts:
+                    self.memory_store.append_conversation_event(
+                        namespace,
+                        event_id=stable_id(
+                            "fact",
+                            {"run_id": actual_run_id, "text": fact.text, "sources": fact.source_event_ids},
+                        ),
+                        kind=ConversationEventKind.ATOMIC_FACT,
+                        content=fact.text,
+                        run_id=actual_run_id,
+                        entities=fact.entities,
+                        payload={"source_event_ids": list(fact.source_event_ids), "status": fact.status},
+                    )
+                self.memory_store.append_run_log(
+                    conversation_namespace,
+                    run_id=actual_run_id,
+                    event_type="memory.atomic_facts_completed",
+                    level="info",
+                    message="原子事实已写入独立账本。",
+                    details={"fact_count": len(atomic_facts)},
+                )
             except Exception as exc:
                 self.memory_store.append_run_log(
                     conversation_namespace,
                     run_id=actual_run_id,
                     event_type="memory.atomic_facts_failed",
                     level="error",
-                    message="原子事实提取失败。",
-                    details={"phase": "atomic_fact_extraction", "error_type": type(exc).__name__},
+                    message="原子事实提取或写入失败。",
+                    details={"phase": "atomic_fact_persistence", "error_type": type(exc).__name__},
                 )
-                raise
-            for fact in atomic_facts:
-                self.memory_store.append_conversation_event(
-                    namespace,
-                    event_id=stable_id(
-                        "fact",
-                        {"run_id": actual_run_id, "text": fact.text, "sources": fact.source_event_ids},
-                    ),
-                    kind=ConversationEventKind.ATOMIC_FACT,
-                    content=fact.text,
-                    run_id=actual_run_id,
-                    entities=fact.entities,
-                    payload={"source_event_ids": list(fact.source_event_ids), "status": fact.status},
-                )
-            self.memory_store.append_run_log(
-                conversation_namespace,
-                run_id=actual_run_id,
-                event_type="memory.atomic_facts_completed",
-                level="info",
-                message="原子事实已写入独立账本。",
-                details={"fact_count": len(atomic_facts)},
-            )
             try:
                 build_conversation_window(
                     self.memory_store,
@@ -1100,7 +1125,6 @@ class FinanceAnalysisService:
                     message="对话上下文投影或压缩失败。",
                     details={"phase": "conversation_compaction", "error_type": type(exc).__name__},
                 )
-                raise
             if memory_extractor is not None and use_personal_memory and self.config.personal_memory_enabled:
                 run_events = tuple(
                     event
@@ -1125,25 +1149,37 @@ class FinanceAnalysisService:
                         message="长期记忆候选处理失败。",
                         details={"phase": "long_term_memory", "error_type": type(exc).__name__},
                     )
-                    raise
-                self.memory_store.append_run_log(
-                    conversation_namespace,
-                    run_id=actual_run_id,
-                    event_type="memory.long_term_completed",
-                    level="info",
-                    message="长期记忆候选已处理。",
-                    details={},
-                )
-        self._record_tool_usage_memory(
-            tenant_id,
-            user_id,
-            harness.audit_events(actual_run_id),
-        )
+                else:
+                    self.memory_store.append_run_log(
+                        conversation_namespace,
+                        run_id=actual_run_id,
+                        event_type="memory.long_term_completed",
+                        level="info",
+                        message="长期记忆候选已处理。",
+                        details={},
+                    )
+        try:
+            self._record_tool_usage_memory(
+                tenant_id,
+                user_id,
+                harness.audit_events(actual_run_id),
+            )
+        except Exception as exc:
+            self.memory_store.append_run_log(
+                conversation_namespace,
+                run_id=actual_run_id,
+                event_type="tool_usage.learning_failed",
+                level="error",
+                message="成功工具参数沉淀失败。",
+                details={"phase": "tool_usage_learning", "error_type": type(exc).__name__},
+            )
         if skill_extractor is not None:
             context = skill_run_context(result)
             if context is not None:
                 try:
                     skill = skill_extractor.extract(context)
+                    if skill is not None:
+                        self._save_learned_skill(tenant_id, user_id, actual_run_id, skill)
                 except Exception as exc:
                     self.memory_store.append_run_log(
                         conversation_namespace,
@@ -1153,17 +1189,15 @@ class FinanceAnalysisService:
                         message="成功工作路径学习失败。",
                         details={"phase": "skill_learning", "error_type": type(exc).__name__},
                     )
-                    raise
-                if skill is not None:
-                    self._save_learned_skill(tenant_id, user_id, actual_run_id, skill)
-                self.memory_store.append_run_log(
-                    conversation_namespace,
-                    run_id=actual_run_id,
-                    event_type="skill.learning_completed",
-                    level="info",
-                    message="成功工作路径学习已处理。",
-                    details={"skill_created": skill is not None},
-                )
+                else:
+                    self.memory_store.append_run_log(
+                        conversation_namespace,
+                        run_id=actual_run_id,
+                        event_type="skill.learning_completed",
+                        level="info",
+                        message="成功工作路径学习已处理。",
+                        details={"skill_created": skill is not None},
+                    )
 
         artifacts: dict[str, str] = {}
         if export_artifacts:
@@ -1171,6 +1205,8 @@ class FinanceAnalysisService:
                 result=result,
                 output_dir=self.config.output_dir,
                 thread_id=actual_thread_id,
+                tenant_id=stable_id("tenant", {"value": tenant_id}),
+                user_id=stable_id("user", {"value": user_id}),
             )
 
         return {
@@ -1353,6 +1389,11 @@ class FinanceAnalysisService:
         namespace = self._conversation_namespace(tenant_id, user_id, thread_id)
         run_ids = self.memory_store.conversation_run_ids(namespace)
         deleted = self.memory_store.delete_conversation(namespace)
+        deleted["threads"] = self.memory_store.delete_conversation_thread(
+            namespace.tenant_id,
+            namespace.user_id,
+            thread_id,
+        )
         checkpointer = self._open_graph_checkpointer()
         try:
             for stored_run_id in run_ids:
@@ -1381,6 +1422,72 @@ class FinanceAnalysisService:
                 run_id,
             )
         ]
+
+    def list_conversation_messages(
+        self,
+        thread_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 200,
+        tenant_id: str = "default",
+        user_id: str = "anonymous",
+    ) -> list[dict]:
+        _validate_thread_id(thread_id)
+        events = self.memory_store.list_conversation_messages(
+            self._conversation_namespace(tenant_id, user_id, thread_id),
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+        return [
+            {
+                "sequence": event.sequence,
+                "event_id": event.event_id,
+                "role": "user" if event.kind is ConversationEventKind.USER_MESSAGE else "assistant",
+                "content": event.content,
+                "run_id": event.run_id,
+                "occurred_at": event.occurred_at,
+                "status": event.payload.get("status"),
+            }
+            for event in events
+        ]
+
+    def list_conversations(
+        self,
+        *,
+        limit: int = 100,
+        tenant_id: str = "default",
+        user_id: str = "anonymous",
+    ) -> list[dict[str, str]]:
+        tenant_key, user_key = _personal_principal_ids(tenant_id, user_id)
+        return self.memory_store.list_conversation_threads(tenant_key, user_key, limit=limit)
+
+    def list_conversation_runs(
+        self,
+        thread_id: str,
+        *,
+        limit: int = 100,
+        tenant_id: str = "default",
+        user_id: str = "anonymous",
+    ) -> list[dict]:
+        _validate_thread_id(thread_id)
+        return self.memory_store.list_conversation_runs(
+            self._conversation_namespace(tenant_id, user_id, thread_id),
+            limit=limit,
+        )
+
+    def get_conversation_run(
+        self,
+        thread_id: str,
+        run_id: str,
+        *,
+        tenant_id: str = "default",
+        user_id: str = "anonymous",
+    ) -> dict | None:
+        _validate_thread_id(thread_id)
+        return self.memory_store.get_conversation_run(
+            self._conversation_namespace(tenant_id, user_id, thread_id),
+            run_id,
+        )
 
     def _personal_memory_namespace(self, tenant_id: str, user_id: str) -> MemoryNamespace:
         tenant_key, user_key = _personal_principal_ids(tenant_id, user_id)
@@ -1472,11 +1579,12 @@ class FinanceAnalysisService:
             "mem",
             {"kind": memory.kind.value, "title": memory.title.strip().casefold()},
         )
-        self.memory_store.put(
-            self._personal_memory_namespace(tenant_id, user_id),
+        self._store_personal_memory(
+            tenant_id,
+            user_id,
             memory_id,
             value,
-            metadata={
+            {
                 "schema_version": 1,
                 "write_policy": "explicit_user_action",
                 "source": "user",
@@ -1525,38 +1633,41 @@ class FinanceAnalysisService:
     ) -> bool:
         return self.memory_store.delete(self._personal_memory_namespace(tenant_id, user_id), memory_id)
 
-    def _recall_personal_memories(self, tenant_id: str, user_id: str, query: str) -> tuple[dict, ...]:
-        query_terms = _memory_terms(query)
-        ranked: list[tuple[int, str, dict]] = []
-        for item in self.list_personal_memories(tenant_id=tenant_id, user_id=user_id):
-            memory_terms = _memory_terms(" ".join((item["title"], item["content"], " ".join(item["tags"]))))
-            overlap = len(query_terms.intersection(memory_terms))
-            always_relevant = item["kind"] in {
-                PersonalMemoryKind.PROFILE.value,
-                PersonalMemoryKind.PREFERENCE.value,
-            }
-            if not always_relevant and overlap == 0:
-                continue
-            payload = {
+    def _personal_memory_context(self, tenant_id: str, user_id: str) -> tuple[dict, ...]:
+        memories = tuple(
+            {
                 "memory_id": item["memory_id"],
                 "kind": item["kind"],
                 "title": item["title"],
-                "content": item["content"][:2_000],
+                "content": item["content"],
                 "tags": item["tags"],
+                "authority": "低于系统规则和用户当前明确要求",
             }
-            ranked.append((overlap + int(always_relevant), item["updated_at"], payload))
-        ranked.sort(key=lambda value: (value[0], value[1]), reverse=True)
-        selected: list[dict] = []
-        characters = 0
-        for _score, _updated_at, payload in ranked:
-            size = len(json.dumps(payload, ensure_ascii=False))
-            if characters + size > 12_000:
-                continue
-            selected.append(payload)
-            characters += size
-            if len(selected) == 8:
-                break
-        return tuple(selected)
+            for item in self.list_personal_memories(tenant_id=tenant_id, user_id=user_id)
+        )
+        if len(json.dumps(memories, ensure_ascii=False)) > _MAX_PERSONAL_MEMORY_CHARACTERS:
+            raise ValueError("个人长期记忆总量超过 100000 字符，必须先合并或删除后才能完整注入")
+        return memories
+
+    def _store_personal_memory(
+        self,
+        tenant_id: str,
+        user_id: str,
+        memory_id: str,
+        value: dict,
+        metadata: dict,
+    ) -> None:
+        namespace = self._personal_memory_namespace(tenant_id, user_id)
+        proposed = {
+            record.key: PersonalMemory.from_dict(record.value).to_dict()
+            for record in self.memory_store.list(namespace, limit=500)
+        }
+        proposed[memory_id] = PersonalMemory.from_dict(value).to_dict()
+        if len(proposed) > 500:
+            raise ValueError("个人长期记忆不能超过 500 条")
+        if len(json.dumps(list(proposed.values()), ensure_ascii=False)) > _MAX_PERSONAL_MEMORY_CHARACTERS:
+            raise ValueError("个人长期记忆总量不能超过 100000 字符")
+        self.memory_store.put(namespace, memory_id, value, metadata=metadata)
 
     def _user_profile_context(self) -> tuple[dict, ...]:
         path = self.config.user_profile_path
@@ -1608,6 +1719,8 @@ class FinanceAnalysisService:
         existing: list[dict],
     ) -> None:
         matched = _matching_memory(candidate, existing)
+        if candidate.operation == "update" and matched is None:
+            raise ValueError("长期记忆 update 未匹配到已有同槽位记忆")
         if matched is not None:
             metadata = dict(matched.get("metadata") or {})
             evidence_runs = list(dict.fromkeys([*(metadata.get("evidence_run_ids") or []), run_id]))
@@ -1636,11 +1749,12 @@ class FinanceAnalysisService:
                 metadata["write_policy"] = "automatic_llm_consolidation"
                 metadata["scope"] = candidate.scope
                 metadata["replaces_prior_memory"] = True
-            self.memory_store.put(
-                self._personal_memory_namespace(tenant_id, user_id),
+            self._store_personal_memory(
+                tenant_id,
+                user_id,
                 matched["memory_id"],
                 value,
-                metadata=metadata,
+                metadata,
             )
             return
 
@@ -1676,11 +1790,12 @@ class FinanceAnalysisService:
             "mem",
             {"kind": candidate.kind.value, "title": candidate.title.casefold()},
         )
-        self.memory_store.put(
-            self._personal_memory_namespace(tenant_id, user_id),
+        self._store_personal_memory(
+            tenant_id,
+            user_id,
             memory_id,
             memory.to_dict(),
-            metadata={
+            {
                 "schema_version": 2,
                 "write_policy": "automatic_llm_consolidation",
                 "source": "conversation_inference",
@@ -1797,7 +1912,14 @@ class FinanceAnalysisService:
             )
             if not parsed.get("pages"):
                 raise ValueError("PDF document parser returned no extractable personal PDF text")
-            results.append(self.personal_knowledge_store.add_document(tenant_key, user_key, parsed))
+            results.append(
+                self.personal_knowledge_store.add_document(
+                    tenant_key,
+                    user_key,
+                    parsed,
+                    embedding_provider=self.embedding_provider,
+                )
+            )
         return results
 
     def list_personal_documents(
@@ -1819,36 +1941,108 @@ class FinanceAnalysisService:
         tenant_key, user_key = _personal_principal_ids(tenant_id, user_id)
         return self.personal_knowledge_store.delete_document(tenant_key, user_key, document_id)
 
-    def submit_job(self, query: str, thread_id: str | None = None) -> dict:
-        actual_thread_id = thread_id or f"run-{uuid4().hex[:8]}"
-        job_id = f"job-{uuid4().hex[:10]}"
-        self.repository.create_job(job_id=job_id, thread_id=actual_thread_id, query=query)
-        return {"job_id": job_id, "thread_id": actual_thread_id, "status": "pending"}
-
-    def enqueue_job(
+    def submit_job(
         self,
-        job_id: str,
         query: str,
-        thread_id: str,
+        thread_id: str | None = None,
+        *,
         export_artifacts: bool = True,
         document_paths: list[str] | None = None,
         cleanup_documents: bool = False,
-    ) -> bool:
-        if not self.config.redis_url:
-            return False
-        from .queueing import RedisQueueManager
-
-        queue = RedisQueueManager(self.config.redis_url, self.config.redis_queue_name)
-        queue.enqueue(
-            {
-                "job_id": job_id,
+        idempotency_key: str | None = None,
+        tenant_id: str = "default",
+        user_id: str = "anonymous",
+        allow_network: bool = False,
+        use_session_documents: bool = False,
+        use_personal_memory: bool = True,
+        use_personal_knowledge: bool = True,
+        retain_documents_for_session: bool = False,
+    ) -> dict:
+        actual_thread_id = thread_id or f"run-{uuid4().hex[:8]}"
+        job_id = f"job-{uuid4().hex[:10]}"
+        key = idempotency_key or job_id
+        job, created = self.repository.submit_job(
+            job_id=job_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            thread_id=actual_thread_id,
+            query=query,
+            payload={
                 "query": query,
-                "thread_id": thread_id,
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "thread_id": actual_thread_id,
                 "export_artifacts": export_artifacts,
                 "document_paths": document_paths or [],
                 "cleanup_documents": cleanup_documents,
-            }
+                "allow_network": allow_network,
+                "use_session_documents": use_session_documents,
+                "use_personal_memory": use_personal_memory,
+                "use_personal_knowledge": use_personal_knowledge,
+                "retain_documents_for_session": retain_documents_for_session,
+            },
+            idempotency_key=key,
+            max_attempts=self.config.job_max_attempts,
         )
+        return {
+            "job_id": job["job_id"],
+            "thread_id": job["thread_id"],
+            "status": job["status"],
+            "created": created,
+        }
+
+    def process_queued_job(self, worker_id: str, *, job_id: str | None = None) -> bool:
+        from .queueing import ReliableJobQueue
+
+        queue = ReliableJobQueue(
+            self.repository,
+            lease_seconds=self.config.job_lease_seconds,
+            retry_delay_seconds=self.config.job_retry_delay_seconds,
+        )
+        payload = queue.claim(worker_id, job_id=job_id)
+        if payload is None:
+            return False
+        heartbeat_stop = Event()
+
+        def renew_lease() -> None:
+            interval = max(1, self.config.job_lease_seconds // 3)
+            while not heartbeat_stop.wait(interval):
+                if not queue.renew(payload["job_id"], payload["lease_token"]):
+                    return
+
+        heartbeat = Thread(target=renew_lease, name=f"lease-{payload['job_id']}", daemon=True)
+        heartbeat.start()
+        try:
+            self.run_job(
+                payload["job_id"],
+                payload["query"],
+                payload["thread_id"],
+                payload.get("export_artifacts", True),
+                payload.get("document_paths") or [],
+                tenant_id=payload["tenant_id"],
+                user_id=payload["user_id"],
+                allow_network=payload.get("allow_network", False),
+                use_session_documents=payload.get("use_session_documents", False),
+                use_personal_memory=payload.get("use_personal_memory", True),
+                use_personal_knowledge=payload.get("use_personal_knowledge", True),
+                retain_documents_for_session=payload.get("retain_documents_for_session", False),
+                resume=payload["attempt_count"] > 1,
+            )
+        except Exception as exc:
+            heartbeat_stop.set()
+            heartbeat.join(timeout=1)
+            status = queue.fail(payload["job_id"], payload["lease_token"], type(exc).__name__)
+            if status == "dead" and payload.get("cleanup_documents"):
+                for document_path in payload.get("document_paths") or []:
+                    Path(document_path).unlink(missing_ok=True)
+            return True
+        heartbeat_stop.set()
+        heartbeat.join(timeout=1)
+        if not queue.complete(payload["job_id"], payload["lease_token"]):
+            raise RuntimeError("analysis completed after its job lease expired")
+        if payload.get("cleanup_documents"):
+            for document_path in payload.get("document_paths") or []:
+                Path(document_path).unlink(missing_ok=True)
         return True
 
     def run_job(
@@ -1858,22 +2052,55 @@ class FinanceAnalysisService:
         thread_id: str,
         export_artifacts: bool = True,
         document_paths: list[str] | None = None,
-        cleanup_documents: bool = False,
+        *,
+        tenant_id: str = "default",
+        user_id: str = "anonymous",
+        allow_network: bool = False,
+        use_session_documents: bool = False,
+        use_personal_memory: bool = True,
+        use_personal_knowledge: bool = True,
+        retain_documents_for_session: bool = False,
+        resume: bool = False,
     ) -> None:
         existing = self.repository.get_job(job_id)
         if existing is None:
             raise ValueError("analysis job does not exist")
-        resume = existing["status"] == "running"
         self.repository.update_job_status(job_id=job_id, status="running")
         try:
-            response = self.analyze(
-                query=query,
-                thread_id=thread_id,
-                export_artifacts=export_artifacts,
-                document_paths=document_paths,
-                run_id=job_id,
-                resume=resume,
-            )
+            try:
+                response = self.analyze(
+                    query=query,
+                    thread_id=thread_id,
+                    export_artifacts=export_artifacts,
+                    document_paths=document_paths,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    allow_network=allow_network,
+                    use_session_documents=use_session_documents,
+                    use_personal_memory=use_personal_memory,
+                    use_personal_knowledge=use_personal_knowledge,
+                    retain_documents_for_session=retain_documents_for_session,
+                    run_id=job_id,
+                    resume=resume,
+                )
+            except ValueError as exc:
+                if not resume or str(exc) != "no LangGraph checkpoint exists for this run":
+                    raise
+                response = self.analyze(
+                    query=query,
+                    thread_id=thread_id,
+                    export_artifacts=export_artifacts,
+                    document_paths=document_paths,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    allow_network=allow_network,
+                    use_session_documents=use_session_documents,
+                    use_personal_memory=use_personal_memory,
+                    use_personal_knowledge=use_personal_knowledge,
+                    retain_documents_for_session=retain_documents_for_session,
+                    run_id=job_id,
+                    resume=False,
+                )
             self.repository.update_job_status(
                 job_id=job_id,
                 status="completed",
@@ -1892,16 +2119,61 @@ class FinanceAnalysisService:
                 error_message=f"Analysis failed ({type(exc).__name__}).",
             )
             raise
-        finally:
-            if cleanup_documents:
-                for document_path in document_paths or []:
-                    Path(document_path).unlink(missing_ok=True)
 
-    def get_job(self, job_id: str) -> dict | None:
-        return self.repository.get_job(job_id)
+    def get_job(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str = "default",
+        user_id: str = "anonymous",
+    ) -> dict | None:
+        return self.repository.get_job_for_principal(job_id, tenant_id, user_id)
 
-    def list_jobs(self, limit: int = 20) -> list[dict]:
-        return self.repository.list_jobs(limit=limit)
+    def cancel_job(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str = "default",
+        user_id: str = "anonymous",
+    ) -> str | None:
+        from .queueing import ReliableJobQueue
+
+        if self.repository.get_job_for_principal(job_id, tenant_id, user_id) is None:
+            return None
+        return ReliableJobQueue(self.repository).request_cancellation(job_id)
+
+    def list_jobs(
+        self,
+        limit: int = 20,
+        *,
+        tenant_id: str = "default",
+        user_id: str = "anonymous",
+    ) -> list[dict]:
+        return self.repository.list_jobs(tenant_id, user_id, limit=limit)
+
+    def run_retention(self, *, now: datetime | None = None) -> dict[str, int]:
+        current = now or datetime.now(UTC)
+        operational_cutoff = current - timedelta(days=self.config.operational_retention_days)
+        job_cutoff = current - timedelta(days=self.config.completed_job_retention_days)
+        deleted = self.memory_store.delete_operational_history_before(operational_cutoff.isoformat())
+        deleted["analysis_jobs"] = self.repository.delete_terminal_jobs_before(job_cutoff.isoformat())
+        with self._session_documents_lock:
+            expired = [key for key, record in self._session_documents.items() if record[0] <= current]
+            for key in expired:
+                del self._session_documents[key]
+        deleted["session_document_namespaces"] = len(expired)
+        for name, directory, cutoff in (
+            ("upload_files", self.config.upload_dir, operational_cutoff),
+            ("artifact_files", self.config.output_dir, job_cutoff),
+        ):
+            count = 0
+            if directory.exists():
+                for path in directory.rglob("*"):
+                    if path.is_file() and datetime.fromtimestamp(path.stat().st_mtime, UTC) < cutoff:
+                        path.unlink()
+                        count += 1
+            deleted[name] = count
+        return deleted
 
     def save_uploaded_files(self, files: list[tuple[str, bytes]]) -> list[str]:
         if not 1 <= len(files) <= self.config.max_upload_files:
@@ -1933,6 +2205,17 @@ def _validate_thread_id(thread_id: str) -> None:
 
 def _normalized_entities(values: Sequence[object]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(text for item in values if (text := str(item).strip()) and len(text) <= 200))[:50]
+
+
+def _assistant_reply(result: dict) -> str:
+    if result.get("status") == "needs_clarification":
+        return str(result["report"]).strip()
+    claims = [
+        str(item.get("text") or "").strip()
+        for item in (result.get("bundle") or {}).get("claims") or ()
+        if str(item.get("text") or "").strip()
+    ]
+    return "\n\n".join(claims) if claims else str(result["report"]).strip()
 
 
 def _requests_document_research(query: str) -> bool:

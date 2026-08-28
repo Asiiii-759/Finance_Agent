@@ -1,6 +1,8 @@
 # MAS Finance 全过程构建复盘与问题总账
 
-状态：与 1.4 实现同步
+> 本文是构建过程总账，不是现行契约。现行分层见 [文档地图](README.md)。
+
+状态：历史复盘
 复盘日期：2026-08-12
 覆盖范围：最初 Git 基线、第一次完整重构、企业级故障注入目标、RAG/上传/记忆复审目标
 
@@ -238,13 +240,13 @@ NIST 的生成式 AI 风险框架指出，模型可能生成错误内容以及�
 | MEM-04 | Neo4j 初始化异常静默回退内存 | 运维以为持久化，实际丢数据 | 删除该未完成能力；provider 失败必须可见 | 代码边界审计 | 已解决 |
 | MEM-05 | 线程记忆没有 tenant/user/thread 精确 namespace | 跨用户泄漏 | namespace 哈希并精确查找，不提供跨 namespace 搜索 | isolation tests | 已解决 |
 | MEM-06 | 会话历史的保留语义不符合长对话需求 | 7 天 TTL 会在用户未删除时丢失历史 | 完整事件账本保留到显式删除，并同时清理摘要与关联 checkpoint | restart/delete tests | 已解决 |
-| MEM-07 | 事件或关系内容可被错误重放/强转 | 损坏记录可能伪装合法，同 ID 不同内容可能静默覆盖语义 | 严格 JSON/类型/时区校验；幂等 ID 内容冲突快速失败 | coercion/idempotency tests | 已解决 |
+| MEM-07 | 事件内容可被错误重放/强转 | 损坏记录可能伪装合法，同 ID 不同内容可能静默覆盖语义 | 严格 JSON/类型/时区校验；幂等 ID 内容冲突快速失败 | coercion/idempotency tests | 已解决 |
 | MEM-08 | Apple 后改问 Microsoft 仍沿用 Apple | 旧实体优先级错误 | 显式实体 → 当前检测实体 → 真正指代时 remembered entity | entity switch black-box | 已解决 |
 | MEM-09 | 自动长期记忆若不区分临时要求与长期变更，会污染跨会话偏好 | 本轮格式覆盖长期习惯，或旧偏好永远无法更新 | LLM 候选限定 profile/preference/experience；临时要求 ignore，明确长期 update 覆盖；显式 CRUD 可查看删除 | promotion/update/ignore tests | 已解决 |
 | MEM-10 | 一次性 PDF 无法跨同线程追问 | 要么重复上传，要么误把临时文档永久入库 | 显式 session opt-in；只保留解析页文本、短 TTL、namespace 隔离和删除接口 | service/API follow-up tests | 已解决 |
 | MEM-11 | 临时上传与永久知识库语义混在一起 | 用户同意、ACL、删除传播无法成立 | 三层生命周期；临时绝不自动 promotion，永久文档仅走受控 RAG | lifecycle contract review | 已解决 |
 | MEM-12 | 只保存上一轮最小快照 | 多轮长对话和工具过程无法进入上下文 | user/tool/assistant append-only ledger；旧摘要 + 最近原始事件投影 | persistence/tool-event tests | 已解决 |
-| MEM-13 | 单实体字符串替换无法解析实体顺序和歧义 | “前者/后者/它们”错误，多个候选下的“它”会误猜 | 确定性 `entity_state + focus_history`；symbol 随实体保存；歧义单数不继承 | reference-resolution tests | 已解决 |
+| MEM-13 | 规则式焦点继承无法可靠理解实体顺序和歧义 | “前者/后者/它们”可能把后续工具发给错误标的 | 删除规则式实体状态和关系表；LLM TaskFrame 读取原子事实并声明来源，歧义时澄清 | task-frame provenance/reference tests | 已解决 |
 | MEM-14 | 长对话完整注入 prompt | 上下文无界、成本和模型注意力恶化 | 300K token 预算达到 85% 时用 LLM 滚动摘要；实体焦点独立保真；原账本不删除 | compaction/ledger-retention tests | 已解决 |
 | MEM-15 | 测试命令导入虚拟环境旧安装包 | 修改后的源码可能“假通过” | 质量门显式设置 `PYTHONPATH=src` | full-suite current-source run | 已解决 |
 
@@ -269,7 +271,7 @@ NIST 的生成式 AI 风险框架指出，模型可能生成错误内容以及�
 | API-04 | job 保存原始异常文本 | provider URL/token 可能公开 | 只持久化异常类型，详细信息交给受保护 telemetry | job error test | 已解决 |
 | API-05 | artifact 文件名可路径穿越或覆盖 | 任意文件写入 | 安全 identifier、固定输出根、随机后缀 | reporting security tests | 已解决 |
 | API-06 | HTTP API key 被误当多租户 identity | 所有调用共享 principal | 文档明确其仅为单部署门；多租户需要网关/OIDC principal | 生产路线图 | 生产门槛 |
-| API-07 | Redis list pop 无 lease/visibility timeout | worker 崩溃后任务可能丢失 | 暂不伪装 exactly-once；建议 Streams/RQ/Celery/outbox | 文档化 | 生产门槛 |
+| API-07 | Redis list pop 无 lease/visibility timeout | worker 崩溃后任务可能丢失 | 数据库 lease/fencing token、心跳、幂等、有限重试与 dead 状态 | queue/infrastructure tests | 已解决 |
 
 ### 4.11 测试与 Harness 工程
 
@@ -446,7 +448,7 @@ compileall、Compose YAML、PEP 517 构建和全新临时目录 wheel 导入全�
 - RAG 只按 entity/source 分组导致同一 PDF 的重叠 chunks 垄断上下文；增加 document/domain/provider origin 分组和问题附近窗口。
 - 输出 token 与输入上下文混为一谈；分成规划 24K、生成 48K evidence 字符和 4096 输出 token，预算可配置且 manifest 可审计。
 - `require_documents=true` 在没有 document provider 时被静默改成 false，且概念知识可能错误满足文档要求；保留显式 requirement，并排除 curated knowledge 伪装用户文档。
-- 个人偏好若按内容 ID 写入会同时召回冲突版本；改为 kind+title 稳定槽位，由最新显式写入覆盖。
+- 个人偏好若按内容 ID 写入会同时注入冲突版本；改为 kind+title 稳定槽位，由最新显式写入覆盖。
 - 临时 PDF 与长期知识库容易发生隐式留存；拆为 request/session/personal 三套接口和生命周期，原文件始终请求后删除。
 - “模型设计函数”若等同动态 Python 会突破安全边界；改为 AST 白名单声明式公式，验证执行安全与数值域，但不伪称语义正确。
 - MCP/企业能力若直接暴露原始工具会带入副作用和任意 schema；部署注入只接受现有只读 capability + canonical EvidenceBundle。
@@ -458,7 +460,7 @@ compileall、Compose YAML、PEP 517 构建和全新临时目录 wheel 导入全�
 - 真实模型用 hybrid 后再调用 lexical 命中同一 chunk，两份 Evidence 因搜索模式 tags 不同而同 ID 冲突；将模式
   留在 provenance/observation，语义 tags 固定，跨检索路径幂等去重，真实 DeepSeek 复测成功。
 
-最终打包与安装后验证结果同时记录在 `IMPLEMENTATION_STATUS.md`。
+最终打包与安装后验证结果同时记录在 `VALIDATION_AND_STATUS.md`。
 
 ### 7.1 记忆基础重审：问题、取舍与落地
 
@@ -470,7 +472,6 @@ compileall、Compose YAML、PEP 517 构建和全新临时目录 wheel 导入全�
 | Skill 被塞进 personal memory | 把“用户是谁/喜欢什么”和“系统怎样成功做事”混为一谈 | Skill 独立 namespace，只从成功且多步骤的 run 提取 | 防止一次任务路径污染用户画像，也便于单独查看和删除 |
 | 所有 Skill 完整注入 prompt | 缺少渐进披露入口 | TaskFrame 只看短索引并选择最多 3 个，Planner 只看选中 Skill 的完整步骤 | 控制上下文并降低历史路径的指令注入面 |
 | 原子事件由关键词规则生成 | “提到/计算/比较”标签不是用户所说的最小事实 | LLM 输出独立中文短句，代码仅校验结构和来源事件 ID | 语义由模型理解，确定性代码只守系统边界 |
-| 原子事件只保留 100 条、每轮召回 20 条 | 先截断再相关性排序使对话开头的实体永远不可见 | `atomic_fact` 不参加摘要，构造窗口时从完整账本全量回放 | 满足长对话早期指代；超硬预算时显式失败，不静默遗漏 |
 | 会话事件兼作运维日志 | 用户可见历史缺少失败阶段、返回摘要和独立查询 | 新增 `run_logs`，记录 run/context/tool/terminal，成功返回只存结构摘要 | 对话语义和后端可观测性生命周期不同 |
 | Harness audit 没有错误消息和成功返回信息 | 只记录状态/错误码无法排障 | 审计增加脱敏错误消息与不含内容的 result summary | 可诊断，同时不把 PDF、网页、prompt 或密钥复制进日志 |
 | 摘要器错误依赖请求的金融数据联网授权 | 把内部模型调用和外部数据出网混成一个开关 | 已配置模型即可摘要；外部工具仍需部署 + 请求双重授权 | 内部上下文维护不应因用户拒绝网页/行情访问而失效 |
@@ -480,7 +481,7 @@ compileall、Compose YAML、PEP 517 构建和全新临时目录 wheel 导入全�
 LangGraph checkpoint 保存中断，前端明确展示工具、参数和影响范围后再恢复同一 run。
 
 本轮回归增加了：明确长期更新与临时 ignore、原子事实来源边界、早期事实跨摘要保留、Skill 选中后才披露完整步骤、
-Agent 失败后日志仍可查询、工具审计返回摘要和线程删除联动日志。完整现状见 `CONVERSATION_MEMORY.md`。
+Agent 失败后日志仍可查询、工具审计返回摘要和线程删除联动日志。完整现状见 `AGENT_DETAILED_GUIDE.md` 第 25.5 节。
 
 ## 8. 仍然存在的边界
 
@@ -488,16 +489,15 @@ Agent 失败后日志仍可查询、工具审计返回摘要和线程删除联�
 
 1. 用 OIDC/JWT 或可信网关注入 principal，贯穿 job、memory、RAG filter 和 artifact ACL；
 2. 用有许可、SLA、时效和 corporate-action 口径的行情源替换实验性 Yahoo；
-3. 用带 lease、visibility timeout、幂等和死信的可靠队列替换 Redis list；
-4. checkpoint、memory、upload 和 artifact 加密，建立 retention/delete/export；
-5. 为新闻、网页和内部文档建立许可、ACL、索引版本和删除传播。
+3. checkpoint、memory、upload 和 artifact 加密，并建立用户 export；
+4. 为新闻、网页和内部文档建立许可、ACL、索引版本和删除传播。
 
 ### P1：可靠性与质量
 
-1. provider 改为 async 或进程隔离，支持真实取消；
+1. 逐个 provider 改为原生 async；job 已用隔离子进程支持真实取消；
 2. 加入共享 rate limiter、circuit breaker、cache freshness 和 schema drift 录制回归；
 3. 建立金融 RAG relevance set，测 Recall@k、nDCG、citation precision 和 no-answer accuracy；
-4. 将远程 OCR 调用移入可取消的 worker/任务队列，并补供应商 retention、删除、区域和敏感文档政策；
+4. 为远程 OCR 补供应商 retention、删除、区域和敏感文档政策；运行已位于可取消 job 子进程；
 5. 引入 tokenizer-aware context budget 与数值 claim parser。
 
 ### P2：高级能力
@@ -505,7 +505,7 @@ Agent 失败后日志仍可查询、工具审计返回摘要和线程删除联�
 1. 在金融标注集上选择 embedding 模型并验证当前 hybrid BM25/vector/RRF；收益达标后再引入 reranker；
 2. 增加 earnings call、新闻、内部 SQL/warehouse 的固定契约 adapter；
 3. 对高风险结论增加 NLI/规则校验和人工抽检；
-4. 建立 append-only audit、OpenTelemetry、成本/token/provider 配额和 SLO。
+4. 配置 OpenTelemetry exporter、真实 provider 单价/金额预算、配额和 SLO；append-only audit 与 token 分账已有。
 
 ## 9. 以后如何避免重新走回旧路
 

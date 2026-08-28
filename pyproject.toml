@@ -8,6 +8,7 @@ dependencies = [
   "httpx>=0.27,<1",
   "langgraph>=1.2,<2",
   "langgraph-checkpoint-sqlite>=3,<4",
+  "opentelemetry-api>=1.28,<2",
   "typing-extensions>=4.12,<5",
 ]
 
@@ -25,7 +26,6 @@ api = [
 ]
 infra = [
   "psycopg[binary]>=3.2,<4",
-  "redis>=5.2,<7",
 ]
 all = [
   "fastapi>=0.115,<1",
@@ -35,7 +35,6 @@ all = [
   "starlette>=1.3,<2",
   "uvicorn>=0.30,<1",
   "psycopg[binary]>=3.2,<4",
-  "redis>=5.2,<7",
 ]
 dev = [
   "build>=1.2,<2",
@@ -54,6 +53,9 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+mas_finance = ["web/*.html", "web/*.css", "web/*.js"]
 
 [tool.ruff]
 target-version = "py311"

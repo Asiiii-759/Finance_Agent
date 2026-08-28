@@ -11,22 +11,21 @@ intent → planning ↔ validation → final_generation → validation → END
 `planning` 由模型选择最多四个下一步工具动作并在同一节点内经 Harness 执行；Harness
 是执行 middleware，不是图节点。MCP 工具走渐进发现。校验节点可以拒绝模型过早结束并送回规划。
 LLM 是研究链路的必需依赖：未配置模型或模型计划违反契约时，请求快速失败，不再回退到规则 planner。
-
-没有证据时系统会失败关闭，不使用演示数据或模型常识填空。项目不包含交易/下单能力。
+检索/计算题没有证据时失败关闭，不使用演示数据填空；概念题允许无引用 inferred，但不能把模型输出登记为 Evidence。项目不包含交易/下单能力。
 
 ## 能力
 
 - PDF 上传、PaddleOCR-VL-1.6 或部署注入的成熟 PDF 解析 MCP、页级引用，以及 request/session/personal BM25 + embedding/RRF 双路检索
 - 可注入内部/外部 RAG 源，以及固定 HTTPS canonical JSON 搜索网关
 - 部署期 MCP Host/Client：按 allowlist 连接本地 stdio 或固定 HTTPS MCP server，只把只读 Evidence 工具送进 Harness
-- 中英金融场景识别、结构化 ResearchScope、模型自主逐步规划（非法 JSON 快速失败）
+- LLM TaskFrame 生成结构化 ResearchScope、模型自主逐步规划（非法 JSON 快速失败）
 - 受控开放网页搜索：模型生成检索式、时效窗口和域名范围；URL/内容去重、来源分散度校验，snippet 只能形成带复核提示的推断
 - 显式 provider 行情快照、adjusted/raw 历史收益、波动率和最大回撤（默认 offline）
 - SEC EDGAR Company Facts、最近 filing 元数据与扩展财务比率
 - FRED 宏观时间序列
 - CAGR、现值/终值、贷款支付、年化收益/波动、Sharpe 等白名单计算
 - 受限声明式公式：允许模型组织公式与参数，但只执行 AST 白名单，不执行模型生成的 Python/SQL/Shell；结果保留输入血缘并标注语义待核验
-- 版本化金融概念、公式和解释知识工具
+- 概念解释由模型直接作答；引用检索证据时才做逐字 quote 校验
 - 统一 `SourceRef / Evidence / Claim` 契约和 citation ledger
 - 工具输入/输出契约、run identity、capability、网络、副作用、分账预算、重试、超时和审计控制
 - 主/备数据源重规划、模型 `finish` 证据校验与明确停止原因
@@ -36,23 +35,11 @@ LLM 是研究链路的必需依赖：未配置模型或模型计划违反契约�
 - 只读 canonical-evidence 工具注入边界，可接企业 RAG、MCP gateway 或 licensed feed；未注入时不启用
 - 带逐字 evidence quote 验证的 LLM 合成；非法输出快速失败
 - FastAPI、后台作业、CLI、报告与审计产物
-- 9 个可独立运行的黑盒验收场景和 165 项自动化测试
+- 7 个可独立运行的黑盒验收场景和自动化测试（以 `unittest` / `pytest` 当前结果为准）
 
-完整的运行机制、状态契约、数据源、记忆、安全边界和扩展方法见
-[Agent 详细说明](docs/AGENT_DETAILED_GUIDE.md)；架构决策摘要见
-[架构文档](docs/ARCHITECTURE.md)，LangGraph、自主规划、Harness 配套执行和恢复细节见
-[LangGraph 编排、自主规划与恢复设计](docs/LANGGRAPH_RUNTIME.md)，工具与调用详见
-[工具及调用逻辑](docs/TOOLS_AND_REASONING.md)，当前进度和限制见
-[实施状态](docs/IMPLEMENTATION_STATUS.md)，发现问题与生产上线门槛见
-[企业级验证与故障注入报告](docs/ENTERPRISE_EVALUATION.md)。从最初实现到当前版本的完整问题、根因、方案和验证记录见
-[全过程构建复盘与问题总账](docs/BUILD_RETROSPECTIVE.md)；真实模型、回退和恢复结果见
-[真实 LLM、Harness 回退与 Checkpoint 恢复验证](docs/LIVE_LLM_EVALUATION.md)。
-[Bocha 搜索与当前模型配置实测](docs/LIVE_PROVIDER_EVALUATION.md)记录了线上契约、调用结果和保留边界。
-个人记忆、个人知识库、上下文预算、联网来源质量、MCP/企业扩展与模型自拟公式的当前边界见
-[个人金融助手：记忆、上下文与扩展边界](docs/PERSONAL_ASSISTANT_MEMORY_AND_CONTEXT.md)。
-[持久对话记忆与动态上下文](docs/CONVERSATION_MEMORY.md)详述事件账本、压缩、指代和删除语义。
-双路召回的算法、真实工具边界、部署接口、生命周期、测试与未完成项见
-[BM25 + Embedding 双路检索设计](docs/HYBRID_RETRIEVAL.md)。
+文档已经按用途收敛，先看 [文档地图](docs/README.md)。现行架构、运行机制及所有子系统契约统一见
+[完整系统设计](docs/AGENT_DETAILED_GUIDE.md)，实现状态和验证快照见
+[实施状态与验证记录](docs/VALIDATION_AND_STATUS.md)。
 
 ## 环境
 
@@ -139,7 +126,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/analyze-upload \
 临时上传默认只用于当前请求；需要同一线程连续追问时，首次上传增加
 `retain_for_session=true`，后续 JSON 请求增加 `use_session_documents=true`。
 原 PDF 仍会在上传请求结束后删除，会话中只保留解析页文本并受短 TTL 控制。
-完整边界见 [PDF、RAG 与记忆生命周期设计](docs/DOCUMENT_LIFECYCLE.md)。
+完整边界见 [完整系统设计](docs/AGENT_DETAILED_GUIDE.md) 第 25.7 节。
 
 用户仍可明确保存、覆盖或删除个人偏好：
 
@@ -257,11 +244,18 @@ embedding 未配置时只注册 BM25 工具；配置 OpenAI-compatible HTTPS end
 报告会显示迭代数、工具调用数、停止原因、数据缺口、来源脚注和非投资建议声明；API 结果中的
 `context_manifests` 记录每次规划/生成实际纳入和省略的证据、来源类型、分组及字符预算。
 
+## 对话与后台任务
+
+- `GET /api/v1/conversations/{thread_id}/messages` 返回按 sequence 排序的用户/助手气泡；助手气泡只保存 claims 组成的回答正文或澄清问题。
+- `GET /api/v1/conversations/{thread_id}/runs` 返回 run 摘要；`.../runs/{run_id}` 才返回完整 report、证据、缺口和引用，供界面展开核验。
+- `POST /api/v1/jobs` 支持 `idempotency_key`。数据库队列使用 lease、心跳、有限重试和 dead 状态；`DELETE /api/v1/jobs/{job_id}` 可取消任务。
+- worker 在独立子进程执行整次分析；取消会终止该子进程，因此 HTTP、数据库与 PDF 解析不会留在 API/worker 主进程中继续运行。
+
 ## 生产注意事项
 
 核心 Agent 已做到可验证、失败关闭，但整个部署尚未完成生产认证。当前 HTTP API key 是单部署身份边界，
 所以开箱形态按单用户部署使用；Service 层已有 tenant/user 隔离，但多用户 SaaS 必须先接 OIDC/API gateway，
-不能信任客户端自报身份。同步 provider 会阻塞单个 event loop；SQLite 个人数据未做静态加密；Redis list worker、
-licensed market feed 和 append-only audit 尚未达到生产要求，详见企业评测报告。
+不能信任客户端自报身份。同步兼容分析接口通过线程执行器运行；需要硬取消时应使用隔离进程的 job API。
+SQLite 个人数据仍未做静态加密，licensed market feed 也尚未接入，详见企业评测报告。
 
 Docker Compose 启动前必须显式设置 `POSTGRES_PASSWORD`，仓库不提供数据库默认密码。

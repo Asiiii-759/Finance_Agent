@@ -40,14 +40,21 @@ class AppConfig:
     upload_dir: Path
     db_path: Path
     database_url: str = field(repr=False)
-    redis_url: str | None = field(repr=False)
-    redis_queue_name: str
     market_data_provider: str
     alphavantage_api_key: str | None = field(repr=False)
     host: str
     port: int
     api_key: str | None = field(repr=False)
     llm: LLMSettings
+    local_tenant_id: str = "local"
+    local_user_id: str = "owner"
+    job_lease_seconds: int = 300
+    job_max_attempts: int = 3
+    job_retry_delay_seconds: int = 30
+    operational_retention_days: int = 90
+    completed_job_retention_days: int = 30
+    model_input_token_budget: int = 300_000
+    model_output_token_budget: int = 32_768
     max_upload_bytes: int = 25 * 1024 * 1024
     max_upload_files: int = 8
     max_pdf_pages: int = 500
@@ -90,10 +97,34 @@ class AppConfig:
     market_max_calls_per_minute: int = 6
 
     def __post_init__(self) -> None:
+        for principal_name, principal_value in (
+            ("local_tenant_id", self.local_tenant_id),
+            ("local_user_id", self.local_user_id),
+        ):
+            if (
+                not principal_value.strip()
+                or len(principal_value) > 200
+                or any(ord(item) < 32 or ord(item) == 127 for item in principal_value)
+            ):
+                raise ValueError(f"{principal_name} is invalid")
         if self.market_data_provider not in {"yahoo", "alphavantage", "offline", "disabled", "none"}:
             raise ValueError("unsupported market data provider")
         if not 1 <= self.port <= 65_535:
             raise ValueError("port must be between 1 and 65535")
+        if not 10 <= self.job_lease_seconds <= 3_600:
+            raise ValueError("job lease must be between 10 and 3600 seconds")
+        if not 1 <= self.job_max_attempts <= 10:
+            raise ValueError("job max attempts must be between 1 and 10")
+        if not 0 <= self.job_retry_delay_seconds <= 3_600:
+            raise ValueError("job retry delay must be between 0 and 3600 seconds")
+        if not 1 <= self.operational_retention_days <= 3_650:
+            raise ValueError("operational retention must be between 1 and 3650 days")
+        if not 1 <= self.completed_job_retention_days <= 3_650:
+            raise ValueError("completed job retention must be between 1 and 3650 days")
+        if not 16_000 <= self.model_input_token_budget <= 1_000_000:
+            raise ValueError("model input-token budget must be between 16000 and 1000000")
+        if not 1_024 <= self.model_output_token_budget <= 200_000:
+            raise ValueError("model output-token budget must be between 1024 and 200000")
         if (
             min(
                 self.max_upload_bytes,
@@ -149,8 +180,13 @@ class AppConfig:
             upload_dir=Path(os.getenv("MAS_UPLOAD_DIR", "uploads")),
             db_path=Path(raw_db_path),
             database_url=os.getenv("MAS_DATABASE_URL", f"sqlite:///{raw_db_path.replace(os.sep, '/')}"),
-            redis_url=os.getenv("MAS_REDIS_URL"),
-            redis_queue_name=os.getenv("MAS_REDIS_QUEUE_NAME", "finance-analysis"),
+            job_lease_seconds=int(os.getenv("MAS_JOB_LEASE_SECONDS", "300")),
+            job_max_attempts=int(os.getenv("MAS_JOB_MAX_ATTEMPTS", "3")),
+            job_retry_delay_seconds=int(os.getenv("MAS_JOB_RETRY_DELAY_SECONDS", "30")),
+            operational_retention_days=int(os.getenv("MAS_OPERATIONAL_RETENTION_DAYS", "90")),
+            completed_job_retention_days=int(os.getenv("MAS_COMPLETED_JOB_RETENTION_DAYS", "30")),
+            model_input_token_budget=int(os.getenv("MAS_MODEL_INPUT_TOKEN_BUDGET", "300000")),
+            model_output_token_budget=int(os.getenv("MAS_MODEL_OUTPUT_TOKEN_BUDGET", "32768")),
             # External market data is an explicit deployment choice.  The
             # default must not silently depend on an undocumented endpoint.
             market_data_provider=os.getenv("MAS_MARKET_DATA_PROVIDER", "offline").strip().lower(),
@@ -159,6 +195,8 @@ class AppConfig:
             port=int(os.getenv("MAS_PORT", "8000")),
             api_key=os.getenv("MAS_API_KEY"),
             llm=LLMSettings.from_env(),
+            local_tenant_id=os.getenv("MAS_LOCAL_TENANT_ID", "local"),
+            local_user_id=os.getenv("MAS_LOCAL_USER_ID", "owner"),
             max_upload_bytes=int(os.getenv("MAS_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024))),
             max_upload_files=int(os.getenv("MAS_MAX_UPLOAD_FILES", "8")),
             max_pdf_pages=int(os.getenv("MAS_MAX_PDF_PAGES", "500")),

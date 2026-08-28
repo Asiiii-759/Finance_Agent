@@ -25,6 +25,34 @@ class StaticMemoryExtractor:
 
 
 class MemoryConsolidationTests(unittest.TestCase):
+    def test_temporary_candidate_must_be_ignore_and_update_must_be_explicit(self) -> None:
+        with self.assertRaisesRegex(ValueError, "临时偏好候选必须标记为 ignore"):
+            LongTermMemoryCandidate.from_dict(
+                {
+                    "kind": "preference",
+                    "title": "回答语言",
+                    "content": "用户本轮要求使用日文。",
+                    "scope": "本轮",
+                    "explicitness": "explicit",
+                    "confidence": 0.99,
+                    "operation": "add",
+                    "tags": [],
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "只有用户明确陈述"):
+            LongTermMemoryCandidate.from_dict(
+                {
+                    "kind": "preference",
+                    "title": "回答语言",
+                    "content": "用户长期偏好使用英文。",
+                    "scope": "全局",
+                    "explicitness": "inferred",
+                    "confidence": 0.9,
+                    "operation": "update",
+                    "tags": [],
+                }
+            )
+
     def test_explicit_long_term_update_replaces_prior_preference_but_temporary_ignore_does_not(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             service = research_service(build_test_config(Path(directory)))

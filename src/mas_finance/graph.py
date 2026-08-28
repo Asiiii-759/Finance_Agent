@@ -604,16 +604,22 @@ class FinancialResearchAgent:
                 max_tool_calls=request.max_tool_calls,
                 max_network_calls=request.max_network_calls,
                 max_model_calls=request.max_model_calls,
+                max_model_input_tokens=request.max_model_input_tokens,
+                max_model_output_tokens=request.max_model_output_tokens,
             ),
         )
 
     def _prime_harness(self, state: ResearchState) -> None:
-        tool_calls, network_calls, model_calls, sequence = self._audit_usage(state.audit_events)
+        tool_calls, network_calls, model_calls, model_input_tokens, model_output_tokens, sequence = self._audit_usage(
+            state.audit_events
+        )
         self.harness.prime_run(
             state.request.run_id,
             tool_calls=tool_calls,
             network_calls=network_calls,
             model_calls=model_calls,
+            model_input_tokens=model_input_tokens,
+            model_output_tokens=model_output_tokens,
             sequence=sequence,
         )
 
@@ -622,7 +628,9 @@ class FinancialResearchAgent:
             state.audit_events,
             self.harness.audit_events(state.request.run_id),
         )
-        tool_calls, network_calls, model_calls, _ = self._audit_usage(state.audit_events)
+        tool_calls, network_calls, model_calls, model_input_tokens, model_output_tokens, _ = self._audit_usage(
+            state.audit_events
+        )
         return ResearchOutcome(
             state=state,
             audit_events=tuple(state.audit_events),
@@ -630,11 +638,13 @@ class FinancialResearchAgent:
                 "tool_calls": tool_calls,
                 "network_attempts": network_calls,
                 "model_calls": model_calls,
+                "model_input_tokens": model_input_tokens,
+                "model_output_tokens": model_output_tokens,
             },
         )
 
     @staticmethod
-    def _audit_usage(events: Sequence[Mapping[str, Any]]) -> tuple[int, int, int, int]:
+    def _audit_usage(events: Sequence[Mapping[str, Any]]) -> tuple[int, int, int, int, int, int]:
         tool_calls = sum(
             1 for item in events if item.get("capability") != "model.generate" and bool(item.get("budget_consumed"))
         )
@@ -644,11 +654,13 @@ class FinancialResearchAgent:
         network_calls = sum(
             int(item.get("network_attempts") or 0) for item in events if item.get("capability") != "model.generate"
         )
+        model_input_tokens = sum(int(item.get("model_input_tokens") or 0) for item in events)
+        model_output_tokens = sum(int(item.get("model_output_tokens") or 0) for item in events)
         sequence = max(
             (int(str(item["call_id"]).rsplit(":", 1)[-1]) for item in events if item.get("call_id")),
             default=0,
         )
-        return tool_calls, network_calls, model_calls, sequence
+        return tool_calls, network_calls, model_calls, model_input_tokens, model_output_tokens, sequence
 
     @staticmethod
     def _state(graph_state: Mapping[str, Any]) -> ResearchState:

@@ -185,8 +185,12 @@ def _evaluate_thread_entity_switch(root: Path, llm_client: BaseLLMClient) -> Eva
         thread_id="entity-switch",
         export_artifacts=False,
     )["result"]
-    entities = tuple(response["request"]["entities"])
-    failures = () if entities == ("Microsoft",) else (f"entity bleed detected: {entities}",)
+    entities = tuple(
+        (str(item.get("name")), str(item.get("origin")))
+        for item in (response.get("task_frame") or {}).get("entities") or ()
+    )
+    expected = (("Microsoft", "current_request"),)
+    failures = () if entities == expected else (f"entity bleed detected: {entities}",)
     return EvaluationResult(
         name="thread_memory_does_not_override_current_entity",
         passed=not failures,
@@ -280,8 +284,6 @@ def _evaluation_config(root: Path, market_provider: str) -> AppConfig:
         upload_dir=root / "uploads",
         db_path=db_path,
         database_url=f"sqlite:///{db_path.as_posix()}",
-        redis_url=None,
-        redis_queue_name="evaluation",
         market_data_provider=market_provider,
         alphavantage_api_key=None,
         host="127.0.0.1",

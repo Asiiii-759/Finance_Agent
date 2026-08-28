@@ -95,6 +95,45 @@ class InMemoryCorpus:
                 break
         return count
 
+    def index_embeddings(self) -> int:
+        """Materialize document vectors so a persistence layer can save them."""
+        provider = self.embedding_provider
+        if provider is None or not self._chunks:
+            return 0
+        missing = [chunk for chunk in self._chunks if chunk.chunk_id not in self._embeddings]
+        if not missing:
+            return 0
+        dimension: int | None = None
+        for start in range(0, len(missing), 128):
+            batch = missing[start : start + 128]
+            vectors = provider.embed_texts([chunk.content for chunk in batch])
+            if len(vectors) != len(batch):
+                raise ValueError("embedding provider returned an unexpected vector count")
+            normalized = [_normalized_vector(vector) for vector in vectors]
+            batch_dimensions = {len(vector) for vector in normalized}
+            if len(batch_dimensions) != 1 or (dimension is not None and dimension not in batch_dimensions):
+                raise ValueError("embedding model returned inconsistent vector dimensions")
+            dimension = len(normalized[0])
+            for chunk, vector in zip(batch, normalized, strict=True):
+                self._embeddings[chunk.chunk_id] = vector
+        return len(missing)
+
+    def index_records(self) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            {
+                "chunk_id": chunk.chunk_id,
+                "content": chunk.content,
+                "metadata": dict(chunk.metadata),
+                "embedding": list(self._embeddings[chunk.chunk_id]) if chunk.chunk_id in self._embeddings else None,
+            }
+            for chunk in self._chunks
+        )
+
+    def restore_embedding(self, chunk_id: str, vector: Sequence[float]) -> None:
+        if chunk_id not in {chunk.chunk_id for chunk in self._chunks}:
+            raise ValueError("embedding chunk does not exist in the corpus")
+        self._embeddings[chunk_id] = _normalized_vector(vector)
+
     def search_json(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         raw_query = payload.get("query")
         raw_top_k = payload.get("top_k", 5)

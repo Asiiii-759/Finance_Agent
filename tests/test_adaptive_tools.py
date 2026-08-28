@@ -349,7 +349,6 @@ class ContextAndMemoryTests(unittest.TestCase):
             entities=("Alpha", "Beta"),
             require_documents=False,
             thread_context={
-                "focus_entities": ["Alpha"],
                 "manifest": {"memory_is_evidence": False},
                 "forbidden": "drop me",
             },

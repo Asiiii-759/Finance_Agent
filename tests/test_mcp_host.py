@@ -38,8 +38,6 @@ def _config(root: Path) -> AppConfig:
         upload_dir=root / "uploads",
         db_path=db_path,
         database_url=f"sqlite:///{db_path.as_posix()}",
-        redis_url=None,
-        redis_queue_name="mcp-test",
         market_data_provider="offline",
         alphavantage_api_key=None,
         host="127.0.0.1",

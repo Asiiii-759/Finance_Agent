@@ -12,6 +12,7 @@ from mas_finance.api.app import create_app
 from mas_finance.graph import FinancialResearchAgent
 from mas_finance.harness import ToolHarness
 from mas_finance.llm import BaseLLMClient
+from mas_finance.market_data import DEFAULT_TICKER_MAP
 from mas_finance.metrics import MetricRequest, infer_metric_requests
 from mas_finance.planning import ModelPlanner, llm_planning_harness_tool
 from mas_finance.service import FinanceAnalysisService
@@ -111,6 +112,9 @@ class FixtureResearchLLM(BaseLLMClient):
         current = payload.get("current_request") or {}
         query = str(current.get("query") or "")
         current_entities = [str(item) for item in current.get("explicit_or_detected_entities") or ()]
+        current_entities.extend(
+            name for name in DEFAULT_TICKER_MAP if name in query and name not in current_entities
+        )
         symbols = dict(current.get("symbols") or {})
         replay = _atomic_fact_replay(str(payload.get("atomic_fact_history") or ""))
         unique_history = _unique_replay_entities(replay)

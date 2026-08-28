@@ -1,29 +1,40 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
-from redis import Redis
+from .database import JobRepository
 
 
-@dataclass
-class RedisQueueManager:
-    redis_url: str
-    queue_name: str
+@dataclass(frozen=True)
+class ReliableJobQueue:
+    repository: JobRepository
+    lease_seconds: int = 300
+    retry_delay_seconds: int = 30
 
-    def connection(self) -> Redis:
-        return Redis.from_url(self.redis_url)
-
-    def enqueue(self, payload: dict[str, Any]) -> None:
-        self.connection().rpush(self.queue_name, json.dumps(payload, ensure_ascii=False))
-
-    def dequeue(self, timeout_seconds: int = 5) -> dict[str, Any] | None:
-        result = cast(
-            tuple[bytes, bytes] | None,
-            self.connection().blpop([self.queue_name], timeout=timeout_seconds),
+    def claim(self, worker_id: str, *, job_id: str | None = None) -> dict[str, Any] | None:
+        return self.repository.claim_job(
+            worker_id=worker_id,
+            lease_seconds=self.lease_seconds,
+            job_id=job_id,
         )
-        if not result:
-            return None
-        _, raw_payload = result
-        return json.loads(raw_payload.decode("utf-8"))
+
+    def renew(self, job_id: str, lease_token: str) -> bool:
+        return self.repository.renew_job_lease(job_id, lease_token, self.lease_seconds)
+
+    def complete(self, job_id: str, lease_token: str) -> bool:
+        return self.repository.complete_job_lease(job_id, lease_token)
+
+    def fail(self, job_id: str, lease_token: str, error_type: str) -> str:
+        return self.repository.fail_job_lease(
+            job_id,
+            lease_token,
+            error_type=error_type,
+            retry_delay_seconds=self.retry_delay_seconds,
+        )
+
+    def request_cancellation(self, job_id: str) -> str | None:
+        return self.repository.request_job_cancellation(job_id)
+
+    def complete_cancellation(self, job_id: str, lease_token: str) -> bool:
+        return self.repository.complete_job_cancellation(job_id, lease_token)

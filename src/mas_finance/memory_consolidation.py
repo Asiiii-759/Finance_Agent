@@ -70,6 +70,13 @@ class LongTermMemoryCandidate:
             raise ValueError("长期记忆候选 confidence 无效")
         if operation not in {"add", "reinforce", "update", "ignore"}:
             raise ValueError("长期记忆候选 operation 无效")
+        if operation == "update" and explicitness != "explicit":
+            raise ValueError("只有用户明确陈述才能更新长期记忆")
+        temporary_text = f"{scope} {title} {content}"
+        temporary = re.search(r"本轮|本次|这次|今天|当前(?:任务|报告|对话)", temporary_text)
+        durable = re.search(r"从今以后|今后|以后都|长期|固定|永久", temporary_text)
+        if temporary and not durable and operation != "ignore":
+            raise ValueError("临时偏好候选必须标记为 ignore")
         if not isinstance(tags, list) or len(tags) > 10 or any(not isinstance(item, str) for item in tags):
             raise ValueError("长期记忆候选 tags 无效")
         return cls(kind, title, content, scope, explicitness, float(confidence), operation, tuple(tags))

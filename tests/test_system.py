@@ -29,8 +29,6 @@ def build_test_config(root: Path, api_key: str | None = None) -> AppConfig:
         upload_dir=root / "uploads",
         db_path=db_path,
         database_url=f"sqlite:///{db_path.as_posix()}",
-        redis_url=None,
-        redis_queue_name="finance-analysis-test",
         market_data_provider="offline",
         alphavantage_api_key=None,
         host="127.0.0.1",
@@ -47,7 +45,25 @@ def build_test_config(root: Path, api_key: str | None = None) -> AppConfig:
 
 
 class FinanceSystemTestCase(unittest.TestCase):
-    def test_personal_memory_is_explicit_scoped_recalled_and_deletable(self) -> None:
+    def test_personal_memory_capacity_is_enforced_before_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = research_service(build_test_config(Path(directory)))
+            for index in range(12):
+                service.save_personal_memory(
+                    kind=PersonalMemoryKind.EXPERIENCE,
+                    title=f"长期经验 {index}",
+                    content="x" * 7_800,
+                )
+            with self.assertRaisesRegex(ValueError, "100000 字符"):
+                service.save_personal_memory(
+                    kind=PersonalMemoryKind.EXPERIENCE,
+                    title="超限经验",
+                    content="x" * 7_800,
+                )
+            self.assertEqual(len(service.list_personal_memories()), 12)
+            service.close()
+
+    def test_personal_memory_is_explicit_scoped_fully_injected_and_deletable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             service = research_service(build_test_config(Path(directory)))
             preference = service.save_personal_memory(
@@ -82,8 +98,9 @@ class FinanceSystemTestCase(unittest.TestCase):
                 user_id="alice",
             )["result"]
             personal = result["request"]["personal_context"]
-            self.assertEqual([item["kind"] for item in personal], ["preference"])
+            self.assertEqual([item["kind"] for item in personal], ["preference", "experience"])
             self.assertIn("先展示结论", personal[0]["content"])
+            self.assertIn("久期", personal[1]["content"])
             self.assertNotIn("personal_context", result["bundle"])
             self.assertEqual(service.list_personal_memories(user_id="bob"), [])
             self.assertTrue(service.delete_personal_memory(preference["memory_id"], user_id="alice"))
@@ -114,6 +131,40 @@ class FinanceSystemTestCase(unittest.TestCase):
         self.assertEqual(listed.json()[0]["kind"], "profile")
         self.assertTrue(deleted.json()["deleted"])
         self.assertEqual(empty.json(), [])
+
+    def test_api_principal_is_server_owned_and_isolates_personal_data(self) -> None:
+        tmp_root = ROOT / "test_artifacts" / f"principal-isolation-{uuid4().hex[:8]}"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        base = build_test_config(tmp_root, api_key=None)
+        alice_app = create_app(replace(base, local_user_id="alice"))
+        bob_app = create_app(replace(base, local_user_id="bob"))
+
+        async def scenario():
+            async with (
+                AsyncClient(transport=ASGITransport(app=alice_app), base_url="http://alice") as alice,
+                AsyncClient(transport=ASGITransport(app=bob_app), base_url="http://bob") as bob,
+            ):
+                created = await alice.post(
+                    "/api/v1/memories",
+                    json={
+                        "kind": "preference",
+                        "title": "输出语言",
+                        "content": "长期使用中文。",
+                        "tags": [],
+                    },
+                )
+                alice_memories = await alice.get("/api/v1/memories")
+                bob_memories = await bob.get("/api/v1/memories")
+                alice_config = await alice.get("/api/v1/config")
+                bob_config = await bob.get("/api/v1/config")
+                return created, alice_memories, bob_memories, alice_config, bob_config
+
+        created, alice_memories, bob_memories, alice_config, bob_config = asyncio.run(scenario())
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(len(alice_memories.json()), 1)
+        self.assertEqual(bob_memories.json(), [])
+        self.assertEqual(alice_config.json()["principal"]["user_id"], "alice")
+        self.assertEqual(bob_config.json()["principal"]["user_id"], "bob")
 
     def test_personal_knowledge_api_persists_parsed_pages_and_deletes_document(self) -> None:
         tmp_root = ROOT / "test_artifacts" / f"personal-knowledge-{uuid4().hex[:8]}"
@@ -161,6 +212,23 @@ class FinanceSystemTestCase(unittest.TestCase):
             self.assertNotIn("fred-secret", rendered)
             self.assertNotIn("search-secret", rendered)
             self.assertNotIn("bocha-secret", rendered)
+
+    def test_web_workspace_is_served_with_the_api(self) -> None:
+        tmp_root = ROOT / "test_artifacts" / f"web-workspace-{uuid4().hex[:8]}"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        app = create_app(build_test_config(tmp_root, api_key=None))
+
+        async def scenario():
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                page = await client.get("/")
+                script = await client.get("/static/app.js")
+                return page, script
+
+        page, script = asyncio.run(scenario())
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("MAS Finance · 研究工作台", page.text)
+        self.assertEqual(script.status_code, 200)
+        self.assertIn("submitResearch", script.text)
 
     def test_bocha_is_the_explicit_web_search_preference_when_both_keys_exist(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -315,14 +383,25 @@ class FinanceSystemTestCase(unittest.TestCase):
                         "export_artifacts": False,
                     },
                 )
+                run_id = analysis.json()["run_id"]
+                messages = await client.get("/api/v1/conversations/memory-delete-test/messages")
+                conversations = await client.get("/api/v1/conversations")
+                runs = await client.get("/api/v1/conversations/memory-delete-test/runs")
+                run = await client.get(f"/api/v1/conversations/memory-delete-test/runs/{run_id}")
                 tools = await client.get("/api/v1/tools")
                 config = await client.get("/api/v1/config")
                 deleted = await client.delete("/api/v1/conversations/memory-delete-test")
-                return analysis, tools, config, deleted
+                return analysis, messages, conversations, runs, run, tools, config, deleted
 
-        analysis, tools, config, deleted = asyncio.run(scenario())
+        analysis, messages, conversations, runs, run, tools, config, deleted = asyncio.run(scenario())
         self.assertEqual(analysis.status_code, 200)
         self.assertEqual(analysis.json()["status"], "succeeded")
+        self.assertEqual([item["role"] for item in messages.json()["messages"]], ["user", "assistant"])
+        assistant = messages.json()["messages"][1]
+        self.assertEqual(assistant["content"], analysis.json()["evidence_bundle"]["claims"][0]["text"])
+        self.assertEqual(conversations.json()["conversations"][0]["thread_id"], "memory-delete-test")
+        self.assertNotIn("result", runs.json()["runs"][0])
+        self.assertEqual(run.json()["result"]["report"], analysis.json()["report"])
         self.assertEqual(tools.status_code, 200)
         catalog = {item["name"]: item for item in tools.json()}
         names = set(catalog)
@@ -349,9 +428,11 @@ class FinanceSystemTestCase(unittest.TestCase):
         self.assertIsNone(config_payload["embedding_model"])
         self.assertEqual(config_payload["conversation_context_tokens"], 300_000)
         self.assertEqual(config_payload["conversation_recent_tokens"], 20_000)
+        self.assertEqual(config_payload["principal"], {"tenant_id": "local", "user_id": "owner"})
         self.assertEqual(deleted.status_code, 200)
         self.assertGreaterEqual(deleted.json()["events"], 2)
         self.assertEqual(deleted.json()["summaries"], 0)
+        self.assertEqual(deleted.json()["runs"], 1)
         self.assertEqual(deleted.json()["checkpoints"], 1)
 
     def test_embedding_config_requires_endpoint_and_model_together(self) -> None:

@@ -23,8 +23,6 @@ def make_config(root: Path, *, allow_network: bool = False) -> AppConfig:
         upload_dir=root / "uploads",
         db_path=db_path,
         database_url=f"sqlite:///{db_path.as_posix()}",
-        redis_url=None,
-        redis_queue_name="test",
         market_data_provider="offline",
         alphavantage_api_key=None,
         host="127.0.0.1",
@@ -136,7 +134,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
                 catalog["corpus.hybrid_search"]["input_contract"]["optional"],
             )
 
-    def test_personal_documents_gain_hybrid_search_without_embedding_at_ingest(self) -> None:
+    def test_personal_document_vectors_persist_and_hybrid_search_only_embeds_query(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pdf_path = root / "personal-treasury.pdf"
@@ -153,7 +151,8 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             )
 
             service.ingest_personal_documents([str(pdf_path)], user_id="alice")
-            self.assertEqual(embedding.calls, 0)
+            self.assertEqual(embedding.calls, 1)
+            self.assertEqual(service.list_personal_documents(user_id="alice")[0]["index_status"], "vector_ready")
             result = service.analyze(
                 "What does my library say about liquidity resilience?",
                 require_documents=True,
@@ -164,7 +163,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "succeeded")
             self.assertEqual(result["observations"][0]["task"]["tool_name"], "personal.hybrid_search")
-            self.assertEqual(embedding.calls, 1)
+            self.assertEqual(embedding.calls, 2)
 
     def test_deployment_extension_rejects_side_effecting_or_non_evidence_tools(self) -> None:
         side_effecting = function_tool(

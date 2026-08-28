@@ -10,8 +10,9 @@ services:
       MAS_UPLOAD_DIR: /app/uploads
       MAS_DB_PATH: /app/data/mas_finance.db
       MAS_DATABASE_URL: postgresql+psycopg://mas_user:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/mas_finance
-      MAS_REDIS_URL: redis://redis:6379/0
-      MAS_REDIS_QUEUE_NAME: finance-analysis
+      MAS_JOB_LEASE_SECONDS: ${MAS_JOB_LEASE_SECONDS:-300}
+      MAS_JOB_MAX_ATTEMPTS: ${MAS_JOB_MAX_ATTEMPTS:-3}
+      MAS_JOB_RETRY_DELAY_SECONDS: ${MAS_JOB_RETRY_DELAY_SECONDS:-30}
       MAS_MARKET_DATA_PROVIDER: ${MAS_MARKET_DATA_PROVIDER:-offline}
       MAS_ALLOW_NETWORK: ${MAS_ALLOW_NETWORK:-false}
       MAS_SEC_USER_AGENT: ${MAS_SEC_USER_AGENT:-}
@@ -43,13 +44,14 @@ services:
       PADDLEOCR_JOB_URL: ${PADDLEOCR_JOB_URL:-https://paddleocr.aistudio-app.com/api/v2/ocr/jobs}
       PADDLEOCR_MODEL: ${PADDLEOCR_MODEL:-PaddleOCR-VL-1.6}
       MAS_API_KEY: ${MAS_API_KEY:-}
+      MAS_LOCAL_TENANT_ID: ${MAS_LOCAL_TENANT_ID:-local}
+      MAS_LOCAL_USER_ID: ${MAS_LOCAL_USER_ID:-owner}
     volumes:
       - mas_outputs:/app/outputs
       - mas_data:/app/data
       - mas_uploads:/app/uploads
     depends_on:
       - postgres
-      - redis
 
   mas-finance-worker:
     build: .
@@ -59,8 +61,9 @@ services:
       MAS_UPLOAD_DIR: /app/uploads
       MAS_DB_PATH: /app/data/mas_finance.db
       MAS_DATABASE_URL: postgresql+psycopg://mas_user:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/mas_finance
-      MAS_REDIS_URL: redis://redis:6379/0
-      MAS_REDIS_QUEUE_NAME: finance-analysis
+      MAS_JOB_LEASE_SECONDS: ${MAS_JOB_LEASE_SECONDS:-300}
+      MAS_JOB_MAX_ATTEMPTS: ${MAS_JOB_MAX_ATTEMPTS:-3}
+      MAS_JOB_RETRY_DELAY_SECONDS: ${MAS_JOB_RETRY_DELAY_SECONDS:-30}
       MAS_MARKET_DATA_PROVIDER: ${MAS_MARKET_DATA_PROVIDER:-offline}
       MAS_ALLOW_NETWORK: ${MAS_ALLOW_NETWORK:-false}
       MAS_SEC_USER_AGENT: ${MAS_SEC_USER_AGENT:-}
@@ -97,7 +100,6 @@ services:
       - mas_uploads:/app/uploads
     depends_on:
       - postgres
-      - redis
 
   postgres:
     image: postgres:16
@@ -109,11 +111,6 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-
-  redis:
-    image: redis:7
-    ports:
-      - "6379:6379"
 
 volumes:
   mas_outputs:

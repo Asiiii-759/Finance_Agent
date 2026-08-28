@@ -198,9 +198,6 @@ def _safe_thread_context(value: Mapping[str, Any]) -> dict[str, Any]:
     allowed = {
         "summary",
         "recent_events",
-        "entity_state",
-        "focus_history",
-        "focus_entities",
         "run_state",
         "manifest",
     }

@@ -61,8 +61,6 @@ def make_test_config(root: Path) -> AppConfig:
         upload_dir=root / "uploads",
         db_path=db_path,
         database_url=f"sqlite:///{db_path.as_posix()}",
-        redis_url=None,
-        redis_queue_name="enterprise-test",
         market_data_provider="offline",
         alphavantage_api_key=None,
         host="127.0.0.1",
@@ -370,7 +368,13 @@ class EnterpriseBoundaryTests(unittest.TestCase):
         self.assertTrue(harness.invoke("model", {}, context).ok)
         self.assertEqual(
             harness.budget_usage("separate-budgets").to_dict(),
-            {"tool_calls": 1, "network_attempts": 1, "model_calls": 1},
+            {
+                "tool_calls": 1,
+                "network_attempts": 1,
+                "model_calls": 1,
+                "model_input_tokens": 2,
+                "model_output_tokens": 2,
+            },
         )
 
     def test_harness_binds_run_identity_and_budget_ceilings(self) -> None:
@@ -495,7 +499,13 @@ class EnterpriseBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(
             resumed.budget_usage,
-            {"tool_calls": 1, "network_attempts": 0, "model_calls": 2},
+            {
+                "tool_calls": 1,
+                "network_attempts": 0,
+                "model_calls": 2,
+                "model_input_tokens": 1601,
+                "model_output_tokens": 212,
+            },
         )
 
     def test_graph_checkpoint_history_contains_business_steps(self) -> None:
@@ -638,7 +648,9 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 thread_id="switch",
                 export_artifacts=False,
             )["result"]
-            self.assertEqual(switched["request"]["entities"], ["Microsoft"])
+            self.assertEqual(switched["request"]["entities"], [])
+            switched_names = [item["name"] for item in (switched.get("task_frame") or {}).get("entities") or ()]
+            self.assertEqual(switched_names, ["Microsoft"])
 
             service.analyze(
                 "解释 Apple 的市盈率",
@@ -654,7 +666,7 @@ class EnterpriseBoundaryTests(unittest.TestCase):
             self.assertEqual(inherited["request"]["entities"], [])
             frame_names = [item["name"] for item in (inherited.get("task_frame") or {}).get("entities") or ()]
             self.assertEqual(frame_names, ["Apple"])
-            self.assertEqual(inherited["request"]["thread_context"]["focus_entities"], ["Apple"])
+            self.assertNotIn("focus_entities", inherited["request"]["thread_context"])
 
     def test_conversation_history_persists_until_explicit_deletion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

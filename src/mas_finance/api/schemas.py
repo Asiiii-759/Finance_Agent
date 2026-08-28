@@ -53,9 +53,7 @@ class AnalyzeRequest(BaseModel):
     )
     use_personal_memory: bool = Field(
         default=True,
-        description=(
-            "Recall explicitly saved personal preferences/profile and relevant skills; never financial evidence."
-        ),
+        description="Inject all active personal profile/preference/experience context; never financial evidence.",
     )
     use_personal_knowledge: bool = Field(
         default=True,
@@ -136,6 +134,11 @@ class SubmitJobRequest(BaseModel):
     query: QueryText = Field(description="User query for asynchronous financial analysis.")
     thread_id: RunIdentifier | None = Field(default=None, description="Optional workflow thread id.")
     export_artifacts: bool = Field(default=True, description="Whether the background job should export files.")
+    allow_network: bool = Field(default=False, description="Request network tools; server policy still applies.")
+    use_session_documents: bool = Field(default=False)
+    use_personal_memory: bool = Field(default=True)
+    use_personal_knowledge: bool = Field(default=True)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=200, pattern=r".*\S.*")
 
 
 class SubmitJobResponse(BaseModel):

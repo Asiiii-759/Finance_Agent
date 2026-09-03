@@ -1,7 +1,7 @@
 # MAS Finance：实施状态与验证记录
 
 状态：当前状态清单 + 按日期保留的验证快照
-更新日期：2026-08-28
+更新日期：2026-09-03
 
 本文合并实施状态、企业级故障注入、真实 LLM 与外部 Provider 实测。第一章描述当前实现；后续章节是带时间语义的验证记录，若快照与当前实现冲突，以第一章、代码和测试为准。
 
@@ -9,22 +9,27 @@
 
 > 已完成项与限制清单，可能滞后于代码。现行分层见 [文档地图](README.md)。
 
-最后更新：2026-08-28
-版本：2.3
+最后更新：2026-09-03
+版本：2.2
 
 ### 已完成
 
 - 本仓库是唯一主项目；旧固定角色图、样例数据和兼容入口已删除。
+- 同服务 Web 工作台支持线程/消息、PDF、可靠任务进度、run/log、长期记忆、Skill、个人知识库和受鉴权产物下载。
+- 服务端固定 Principal 贯穿 API、Service、Job、checkpoint、对话、个人空间、日志、预算与产物；CLI/Service 默认使用配置 owner，不再生成匿名数据。
+- Job 表和幂等键按 tenant/user 隔离；旧数据库启动时补齐 `local/owner` 并重写旧幂等键，迁移有回归测试。
+- Job API 不回显服务器文件路径；产物下载重新校验 Principal、Job artifact allowlist 和 output 根目录，跨用户与越界均为 404。
+- 隔离 PDF Job 的 session 页文本经受控临时文件回传 API 进程；导入与 lease 完成前 Job 不暴露 completed，避免完成状态竞态。
 - LangGraph 唯一业务图：intent → planning ↔ validation → final_generation → validation；无 Harness/act 业务节点。
-- `llm.task_frame` / `llm.plan` / `llm.synthesize` 是研究链路三个必需角色；未配置或非法 JSON 快速失败，无规则 planner / 确定性合成降级。
+- `llm.task_frame` / `llm.plan` / `llm.synthesize` 是研究链路三个基础模型角色；文档/网页在确定性 Coverage 完成后按需调用 `llm.validate_evidence`。未配置或持续非法 JSON 快速失败，无规则 planner / 确定性合成降级。
 - `ModelPlanner` 从动态工具目录自主选择最多四个下一动作或 finish；MCP 走渐进发现；校验可拒绝过早 finish。
 - LLM TaskFrame 生成字段级 requirement、显式 unsupported requirement 和稳定停止原因；`category` 由模型从白名单选择。
 - `SourceRef / Evidence / Claim / EvidenceBundle`：content-addressed ID、引用完整性、冲突检测、数量/字符上限和严格 JSON。
 - Tool Harness：run identity/预算上限绑定、capability、side effect、双重网络授权、严格输入/输出契约、只读 retry、观测 timeout、错误/参数脱敏和审计。
 - 研究工具、数据 provider attempts、模型调用独立预算；恢复时 denied 调用不误计预算。
-- 页级 request/session/personal BM25 corpus、可配置 embedding/cosine/RRF 双路召回、PDF 字节/页数/抽取文本上限、provider-neutral retrieval adapter。
+- PaddleOCR 结构化 request/session/personal corpus：heading/text/table/chart、1024/256 token 分块、BM25 + embedding/cosine/RRF、0.50 向量 abstention、重叠块坐标合并与 provider-neutral adapter。
 - lexical 与 hybrid 拆为独立 ToolSpec：模型自主选择，网络属性在调用前可判定，未配置 embedding/reranker 时不伪装能力；提供受限 OpenAI-compatible HTTPS embedding client。
-- PDF 解析收敛到 PaddleOCR-VL-1.6 或部署注入的成熟 PDF 解析 MCP；无本地 PyMuPDF fallback。PaddleOCR 整文档单次提交、有限轮询、结果字节上限且不下载图片。
+- PDF 解析收敛到 PaddleOCR-VL-1.6 或部署注入的成熟 PDF 解析 MCP；无本地 PyMuPDF fallback。PaddleOCR 整文档单次提交、有限轮询、结构化版面 block、结果字节上限且不下载图片。
 - 部署期可注入多个内部/外部 `RetrievalSource`；固定 ACL filters、主备规划和受控 HTTPS JSON gateway。
 - provider-neutral `web.search` 与 Bocha/Brave adapters：模型控制 query、freshness 和域名范围；域名
   allowlist 在响应边界强制执行；canonical URL/内容去重、公开域名校验、来源分散度和 snippet 推断降级。
@@ -37,17 +42,17 @@
 - `finance.formula` 受限声明式 AST：模型可组织公式和参数但不能执行代码；数值保留输入血缘，公式语义固定标为待核验推断。
 - `/api/v1/tools` 公开每个计算 operation 的 required/optional inputs、公式和默认单位；多余字段、类型强转和不兼容单位被拒绝。
 - 概念解释由模型直接作答，不依赖代码内金融词库；引用了检索证据才做逐字 quote 校验。
-- `finance-evidence-synthesis-v3` 上下文：trust zones、entity/source/domain 平衡、按意图可选 document 分散、规划 24K/生成 48K 可调字符预算、逐阶段 ContextManifest。
+- `finance-evidence-synthesis-v3` 上下文：trust zones、entity/source/domain 平衡、按意图可选 document 分散、规划 48K/生成 96K 可调 token 预算、完整 passage 与逐阶段 ContextManifest。
 - LLM JSON/逐字 quote 校验；被裁掉证据不可引用；一个 quote 不能附带无关 citation；非法合成快速失败。
-- DeepSeek 真实验证覆盖十种批量计算、知识、主备 RAG、间接提示注入、多源上下文和 checkpoint 恢复；生成输出上限提高到 4096，输入 evidence 预算独立扩到 48K 字符。
+- DeepSeek 真实验证覆盖十种批量计算、知识、主备 RAG、间接提示注入、多源上下文、checkpoint 恢复，以及纯概念、确定性 CAGR 自主工具选择和结构化工具错误后的参数修正；生成输出上限 4096，输入 evidence 预算独立为 48K/96K token。
 - 报告 Markdown 注入转义、citation/footnote/gap/calculation lineage/risk notice 硬校验。
-- 持久 conversation event ledger：user/tool/assistant/atomic_fact 全历史、tenant/user/thread namespace、300K token 默认 prompt 预算、85% 阈值 LLM 滚动摘要、最近原始事件、全历史原子事实；指代由 TaskFrame 消解，歧义时澄清，显式删除关联 checkpoints。
+- 持久 conversation event ledger：user/tool/assistant/atomic_fact 全历史、tenant/user/thread namespace、85% 阈值 LLM 滚动摘要；原子事实只从用户问题、约束和纠正提取，工具事件与助手正文不进入提取 Prompt。Prompt 使用摘要、最近原始事件以及默认 32K token 的原子事实时间尾部，不做关键词相关性筛选，数据库不删除被省略事实。指代由 TaskFrame 消解，歧义时澄清，显式删除关联 checkpoints。
 - 显式会话文档：原 PDF 请求后删除，仅在 opt-in 时将解析页文本按 tenant/user/thread 保留于进程内存；默认 1 小时 TTL，支持列举、召回和删除。
 - 个人长期记忆：profile/preference/experience 支持 CRUD 与受限 LLM 沉淀；明确长期更新覆盖、临时要求忽略，绝不充当 Evidence。成功工作路径进入独立 Learned Skill 并渐进披露。
-- 持久个人 PDF 知识库：只保存解析页文本和元数据，tenant/user 精确隔离，支持上传、列表、检索和删除；临时文档不自动入库。
+- 持久个人 PDF 知识库：保存页级 Markdown、结构化 block、owner ACL、chunking/version manifest 和可选持久向量；tenant/user 精确隔离，支持上传、显式 reindex、列表、检索和删除；临时文档不自动入库。
 - 部署级 `evidence_tools` 注入边界：只接受 read-only canonical `EvidenceBundle` 工具。
 - MCP Host/Client：`MAS_MCP_SERVERS` allowlist 连接 stdio 或固定 HTTPS JSON-RPC；只读+Evidence 过滤后进入 Harness；规划侧用 `mcp.search_tools` / `mcp.describe_tool` / `mcp.call_tool` 渐进发现。AllTick/必盈可自动挂载 `extmarket` server。FRED/Bocha/行情/MCP call 有每分钟滑动窗口限流。计算与内部 RAG 仍为内置工具。
-- 长期记忆：用户可维护独立 Markdown 指令；完成 run 后中文 LLM 最多提取两个候选，显式偏好可晋升、推断偏好需跨两个 run，冲突不覆盖。实体使用原子事件回放；MCP 成功参数进入 schema 版本化的独立工具经验库。
+- 长期记忆：用户可维护独立 Markdown 指令；完成 run 后中文 LLM 最多提取两个候选，显式偏好可晋升、推断偏好需跨两个 run，明确长期 update 可覆盖旧值而临时要求必须忽略。实体使用原子事件回放；MCP 成功参数进入 schema 版本化的独立工具经验库。
 - 删除自建 checkpoint；Agent 只注入 LangGraph InMemorySaver/SqliteSaver。主服务和 job 使用 SQLite graph checkpoint，job_id 稳定恢复。
 - `/api/v1/tools` 输出工具 input/result contract、availability、visibility 和行情 support tier。
 - `/api/v1/config` 不再返回可能含密码的 DSN 或内部文件路径。
@@ -61,32 +66,38 @@
 
 ```text
 7 enterprise black-box scenarios defined
-178 tests passed under pytest; no skips
-84.18% total source coverage; 80% gate passed
+216 tests collected；默认全量 213 passed / 3 live skipped
+3 个受控 DeepSeek live 场景单独启用后通过
 Ruff passed for src/tests
-mypy passed for all 46 source files
+mypy passed for all 50 source files
 compileall passed
+QuickJS compiled the packaged frontend script successfully
 Real DeepSeek planner selected authorized catalog tools; conceptual questions may finish without retrieval
 Real DeepSeek selected corpus.hybrid_search first for a semantic-only PDF query; cross-checked lexical, deduplicated one Evidence, succeeded in 5 model calls
 Bocha raw API and project EvidenceBundle path both returned two results; deepseek-v4-pro short live call succeeded
 Compose YAML parsed successfully; Docker CLI was unavailable, so no image-build claim is made
-PEP 517 sdist/wheel built with installed build requirements; 2.2.0 wheel imported successfully from a clean temporary target
+PEP 517 sdist/wheel built with isolated build requirements; packaged HTML/CSS/JS present; 2.2.0 wheel imported and created the API from a clean temporary target
 ```
+
+本轮 live 复测还暴露并修复了一个真实供应商边界：第二次 `llm.plan` 曾遇到瞬时服务端错误。现在
+`llm.task_frame`、`llm.plan`、`llm.synthesize` 仅对 HTTP 429/5xx 和传输错误最多重试一次；HTTP 400、
+响应 JSON/正文契约错误不会重试。故障注入验证 500→成功共两次 attempt；概念题、CAGR 确定性计算题，以及受控行情工具
+返回 `unknown_symbol + suggested_symbol + change_arguments` 后由模型改参重试的场景，均执行真实 DeepSeek 全链路并通过。
 
 完整评测设计、发现问题、外部数据源判断和上线门槛见本文第 2 章。
 
 ### 当前明确限制
 
-- HTTP API key 是单部署身份边界；尚无 OIDC/JWT principal、RBAC 和完整多租户 ACL。
-- 同步兼容 API 已移出 event loop；job 路径由可终止子进程执行并传播取消。provider 本身仍不是原生 async。
+- HTTP API key + 服务端固定 owner Principal 是单部署身份边界；尚无 OIDC/JWT 登录、RBAC 和组 ACL，不能宣称多用户 SaaS 已完成。
+- 同步兼容 API 在请求协程内执行同步研究；前端与并发调用应走数据库 Job。Job 路径由隔离子进程执行并传播取消，provider 本身仍不是原生 async。
 - 数据库 job queue 已有幂等键、lease/fencing token、心跳、有限重试、dead/cancelled 状态；语义不是 exactly-once。
 - 工具审计已写入禁止 UPDATE/DELETE 的 append-only ledger，并发出 OpenTelemetry span；运行日志、usage、job、upload/artifact 有 worker retention。checkpoint、memory 和 artifact 仍缺 KMS 静态加密。
-- 上传 corpus 默认 request-local；会话页文本只在单进程短 TTL 可见。内建 hybrid 已实现，但当前个人库只持久化
-  SQLite 页文本、owner ACL、内容哈希、索引 manifest 和文档向量；查询只计算 query 向量。大规模向量库、组 ACL 与跨系统删除传播仍未实现。
+- 上传 corpus 默认 request-local；会话解析 block 只在单进程短 TTL 可见。个人库持久化页级 Markdown、结构化 block、
+  owner ACL、内容哈希、chunking/model manifest 和文档向量；查询只计算 query 向量。大规模向量库、组 ACL 与跨系统删除传播仍未实现。
 - SEC recent filings 只返回元数据与 primary locator，没有自动 ingest filing HTML 全文。
 - Yahoo endpoint 非契约化；AlphaVantage 历史使用 raw close；AllTick/必盈为免费档 MCP 行情补充，受每分钟限流。
 - 官方 SEC EDGAR 仍只用 `MAS_SEC_USER_AGENT`；第三方 SEC API token 尚未接入。
-- 字符预算不是 tokenizer；literal quote 不等于完整语义蕴含。
+- evidence 预算已使用 BGE-M3 tokenizer；literal quote 仍不等于完整语义蕴含。
 - 尚无真实 provider 录制响应、跨实例 SEC 全局限速、并发压测、长时间 soak 和灾难恢复演练。
 - 尚无新闻、earnings call、商业行情、内部 SQL/warehouse adapter。
 - `web.search` 的 Bocha API 与项目 EvidenceBundle 路径已完成小规模真实验证；Brave 仅完成 fixture 验证。
@@ -232,7 +243,7 @@ python -m mas_finance.evaluation
 | 搜索 tracking URL/重复摘要占满上下文 | 表面多来源、实际重复 | canonical URL 与内容双去重，按 domain 分组 |
 | 单一普通站点即可满足 web coverage | 低质量单点信息被当作完整研究 | 普通网页要求至少两个 domain；公共机构可单源满足覆盖；snippet claim 始终 inferred |
 | Context 只按实体/来源类型分组 | 综合多 PDF 时同一文档重叠 chunk 可淹没其他文档 | 增加由研究意图控制的 document 分散、domain 分组与 query-centered window；普通问题仍全局相关排序 |
-| 3,000 输出 token 被误解为全部上下文 | 多 PDF 综合能力被低估且预算不可审计 | 规划/生成输入证据独立为 24K/48K 字符，可调到 200K，并持久化 manifest |
+| 3,000 输出 token 被误解为全部上下文 | 多 PDF 综合能力被低估且预算不可审计 | 规划/生成输入证据独立为 48K/96K token，可调到 200K，并持久化 manifest |
 | 个人记忆与 Skill 无明确边界 | 自动学习会放大错误和提示注入 | 个人记忆仅含 profile/preference/experience；Skill 独立存成功路径并渐进披露；两者都不是 Evidence |
 | 临时 PDF 与长期知识库边界不清 | 无意永久留存或跨用户泄漏 | request/session/personal 三套显式生命周期，个人库 tenant/user 查询隔离并可删除 |
 | 模型自拟计算只能执行代码或完全禁止 | 任意代码风险或缺乏灵活性 | 新增受限 AST 声明式公式；保留输入血缘，语义固定降级为 inferred |
@@ -292,7 +303,7 @@ FRED latest/previous observation 分别形成证据，变化值标记为 `calcul
 3. thread context：LLM 滚动摘要、最近原始 run 和运行状态，明确不是证据；
 4. evidence cards：ID、内容、结构化值、provider、locator、period、as-of、published-at。
 
-Evidence 按 `entity × source_type × domain/provider origin` 分组轮询；只有模型/明确多文档意图要求时，文档 origin 才切换成 document ID。这样综合任务避免单一 PDF 垄断，聚焦问题仍保持全局相关排序。随后按查询重合、来源质量、结构化程度、confidence 和 retrieval rank 排序。规划默认 24K、最终生成默认 48K evidence 字符，可配置到 200K；字符预算不是 tokenizer。逐阶段 `ContextManifest` 记录纳入/遗漏证据、来源类型和预算，LLM 只能引用 manifest 中的 ID。模型必须输出 JSON 和逐字 quote；quote 只证明引用文本存在，不能证明完整语义蕴含，因此高风险结论仍需要人工/NLI 审核。
+Evidence 按 `entity × source_type × domain/provider origin` 分组轮询；只有模型/明确多文档意图要求时，文档 origin 才切换成 document ID。这样综合任务避免单一 PDF 垄断，聚焦问题仍保持全局相关排序。随后按查询重合、来源质量、结构化程度、confidence 和 retrieval rank 排序。规划默认 48K、最终生成默认 96K evidence token，可配置到 200K；完整 passage 不做逐条字符截断。逐阶段 `ContextManifest` 记录纳入/遗漏证据、来源类型和预算，LLM 只能引用 manifest 中的 ID。模型必须输出 JSON 和逐字 quote；quote 只证明引用文本存在，不能证明完整语义蕴含，因此高风险结论仍需要人工/NLI 审核。
 
 ### 9. 记忆层评估
 
@@ -303,9 +314,9 @@ Evidence 按 `entity × source_type × domain/provider origin` 分组轮询；�
 | Personal memory | SQLite，精确 tenant/user namespace，显式 CRUD + 受限 LLM 沉淀 | profile、preference、experience | Skill、事实 Evidence、可执行指令、凭据 |
 | Learned Skill | SQLite 独立 tenant/user namespace，可列出和删除 | 成功多步骤工作路径 | 用户画像、具体实体/日期/数值/URL、凭据、金融结论 |
 | Domain corpus | 上传 PDF 的 request/session BM25 | 当前请求或显式会话授权的文档 chunk | 默认不跨请求；opt-in session 默认 1 小时 |
-| Personal corpus | SQLite 页文本 + request-time BM25 | 用户明确持久上传的 PDF 页与 provenance | 原始 PDF、其他用户文档、自动入库 |
+| Personal corpus | SQLite block + BM25 + 可选持久向量 | 用户明确持久上传的 PDF 结构化内容与 provenance | 原始 PDF、其他用户文档、自动入库 |
 
-实体与指代只由 LLM TaskFrame 结合当前问题、全历史原子事实、摘要和最近 run 解析；代码只验证历史实体引用了真实 atomic_fact event ID，歧义时要求澄清，不再维护规则式焦点或实体关系表。当前有效的个人 profile/preference/experience 全量进入 TaskFrame、Planner 和 Synthesis，不按 query 召回；同 kind/title 的明确长期新偏好覆盖旧值，容量在写入时治理。TaskFrame 只看 Learned Skill 短索引，Planner 只看被选中 Skill 的完整步骤。当前 HTTP 删除接口只处理单部署默认 principal；Service 层虽有 tenant/user 隔离，多租户上线前仍必须接入身份系统而不是信任客户端自报 tenant。
+实体与指代只由 LLM TaskFrame 结合当前问题、按时间排列的原子事实尾部、摘要和最近 run 解析；代码只验证历史实体引用了真实 atomic_fact event ID，歧义时要求澄清，不再维护规则式焦点、关键词事实召回或实体关系表。原子事实完整保存在账本，Prompt Manifest 记录总数、纳入数、省略数和 32K 默认预算。个人 profile/preference/experience 作为低权限上下文，在总 token 上限内按当前问题相关性和近期性选择；同 kind/title 的明确长期新偏好覆盖旧值，容量在写入时治理。TaskFrame 只看 Learned Skill 短索引，Planner 只看被选中 Skill 的完整步骤。当前 HTTP 删除接口只处理服务端配置的单部署 owner Principal；多租户上线前仍必须接入身份系统而不是信任客户端自报 tenant。
 
 ### 10. 上线门槛
 
@@ -321,7 +332,7 @@ Evidence 按 `entity × source_type × domain/provider origin` 分组轮询；�
 | 部分完成 | append-only 审计、OpenTelemetry、成本/token/provider 配额 | ledger/span/token 分账已有；真实价格与 provider 配额待配置 |
 | 部分完成 | principal-to-ACL、hybrid corpus、索引 manifest、删除传播 | 个人库已有 owner ACL/manifest/持久向量；组 ACL 与跨系统删除待补 |
 | P1 | schema drift/录制响应/时区/币种/重述/拆股专项回归 | 当前为 deterministic fake-provider 契约测试 |
-| P2 | tokenizer 预算、semantic entailment、人工抽检 | 当前字符预算与 literal quote 仅是保守门 |
+| P2 | semantic entailment、人工抽检 | literal quote 仍只是保守门 |
 | P2 | 压测、并发、长时间 soak 与灾难恢复演练 | 当前没有容量认证 |
 
 ### 11. 验收命令
@@ -342,6 +353,19 @@ CI 应把黑盒评测、两个测试 runner 和 80% 总覆盖率都设为阻断�
 ---
 
 ## 3. 真实 LLM、Harness 回退与 Checkpoint 恢复验证
+
+### 2026-09-01 聊天式输入重构后的 DeepSeek 契约复测
+
+新增 `tests/test_live_deepseek.py`，仅在 `MAS_RUN_LIVE_LLM_TESTS=1` 时执行，且主动禁用搜索、SEC、FRED、OCR、
+行情、embedding 与 MCP，避免真实模型测试误耗其他 provider 配额。真实 `deepseek-v4-pro` 结果：
+
+- 概念题完整经过 `llm.task_frame → llm.plan(finish) → llm.synthesize`，0 requirement、0 evidence、2 条 inferred claim，成功结束；
+- CAGR 题由模型建立 calculation requirement、选择 `finance.calculate`、生成 function 参数，并由确定性函数计算后合成 supported claim；修复后测试通过；
+- 真实路径首次暴露运行日志从错误层级读取 claim/source/budget，导致 2 条 claim 被记录为 0；现统一从 `result.bundle` 与 `budget_usage` 读取并增加回归断言；
+- 首次计算失败暴露 Planner 只看到顶层 `requests`，看不到数组内部契约。现 `ToolSpec.input_schema` 可携带完整、有限 JSON Schema，`finance.calculate` 暴露每个 operation 的精确字段；模型参数不由规则改写；
+- 工具成功后仍 degraded 暴露 calculation coverage 错把展示 label 当业务身份，且空 request ID 排除了所有候选。现有 request ID 时精确匹配，无 request ID 时按 canonical operation/field 验收。
+
+默认单元测试仍使用脚本模型，因为非法 JSON、超时、重复动作、预算和引用伪造必须可重复注入；真实测试验证模型是否真正遵守 prompt 与工具协议，两者不能互相替代。
 
 状态：已执行（历史记录，2026-08-12）
 日期：2026-08-12
@@ -386,15 +410,15 @@ CI 应把黑盒评测、两个测试 runner 和 80% 总覆盖率都设为阻断�
 
 初次十项计算中，所有函数和 Evidence 均正确，但模型响应在 3173 字符处停在 JSON 字符串中间，触发 `JSONDecodeError`。Harness/合成层正确拒绝半截 JSON并使用确定性报告，证明了回退有效；同时暴露固定 `max_tokens=1400` 对批量结果不足。
 
-当时的最小修正是把证据合成输出上限提高到 3000。它是最大值而非最低消费，简单问题仍会提前结束。修正后相同十项计算得到 10/10 supported claim，无 fallback。2.1 又将输出上限配置化并默认设为 4096，同时把输入 evidence 上下文独立扩为规划 24K/生成 48K 字符；输出 token 不再被误写成输入上下文上限。
+当时的最小修正是把证据合成输出上限提高到 3000。它是最大值而非最低消费，简单问题仍会提前结束。修正后相同十项计算得到 10/10 supported claim，无 fallback。后续将输出上限配置化并默认设为 4096，再将输入 evidence 独立改为规划 48K/生成 96K token；输出 token 不再被误写成输入上下文上限。
 
 #### 3.2 文档收入问题被错误追加 SEC requirement
 
 “根据内部文档概括收入”已经明确限定来源，但查询分析器看到“收入”仍自动创建 `regulatory:entity`，导致文档证据充分时仍 degraded。修正后：
 
-- `require_documents=true` 默认只建立 document requirement；
-- 调用方显式 `require_regulatory_data=true` 时才同时建立 regulatory requirement；
-- 普通非文档基本面问题仍自动走 SEC。
+- 当前 API 已删除 `require_documents/require_regulatory_data` 等意图覆盖字段；
+- TaskFrame 模型根据当前消息与可用资源建立 document 或 regulatory requirement；
+- Validation 只验收模型已经声明的 requirement，不再从问句反推意图。
 
 真实主备 RAG 复测从 degraded 变为 `succeeded/coverage_satisfied`。
 
@@ -430,8 +454,8 @@ retry、预算耗尽、side-effect 拒绝、秘密脱敏等精确边界由自动
 ### 5. Checkpoint 恢复语义
 
 2.0 已删除自建 checkpoint，使用 LangGraph InMemorySaver/SqliteSaver 作为唯一恢复运行时。一个 planning node
-最多执行一个工具，节点提交后持久化 observation、EvidenceBundle 和 audit；恢复要求 tenant/thread/run 哈希定位的
-thread 与完整 `ResearchRequest` 一致。Harness 从 durable audit 恢复预算及 call sequence。
+最多执行一个工具，节点提交后持久化 observation、EvidenceBundle 和 audit；恢复要求 tenant/user/thread/run 哈希定位的
+thread 与完整 `ChatTurn + RuntimePolicy + AgentContext` 一致。Harness 从 durable audit 恢复预算及 call sequence。
 
 本次真实恢复序列：
 

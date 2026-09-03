@@ -14,18 +14,27 @@ __all__ = [
     "McpServerConfig",
     "PDFDocumentParser",
     "PaddleOCRClient",
-    "ResearchRequest",
+    "AgentContext",
+    "ChatAttachment",
+    "ChatTurn",
+    "RuntimePolicy",
     "RetrievalSource",
     "create_app",
 ]
 
 
 def __getattr__(name: str) -> Any:
-    if name in {"FinancialResearchAgent", "ResearchRequest"}:
-        from .agent import ResearchRequest
+    if name in {"AgentContext", "ChatAttachment", "ChatTurn", "FinancialResearchAgent", "RuntimePolicy"}:
+        from .agent import AgentContext, ChatAttachment, ChatTurn, RuntimePolicy
         from .graph import FinancialResearchAgent
 
-        return {"FinancialResearchAgent": FinancialResearchAgent, "ResearchRequest": ResearchRequest}[name]
+        return {
+            "AgentContext": AgentContext,
+            "ChatAttachment": ChatAttachment,
+            "ChatTurn": ChatTurn,
+            "FinancialResearchAgent": FinancialResearchAgent,
+            "RuntimePolicy": RuntimePolicy,
+        }[name]
     if name == "create_app":
         from .api.app import create_app
 

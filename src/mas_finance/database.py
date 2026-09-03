@@ -112,8 +112,8 @@ class JobRepository:
         thread_id: str,
         query: str,
         *,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str,
+        user_id: str,
     ) -> None:
         now = utc_now()
         with Session(self.engine) as session:
@@ -144,8 +144,8 @@ class JobRepository:
         payload: dict[str, Any],
         idempotency_key: str,
         max_attempts: int,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str,
+        user_id: str,
     ) -> tuple[dict[str, Any], bool]:
         if not idempotency_key.strip() or len(idempotency_key) > 200:
             raise ValueError("job idempotency key is invalid")

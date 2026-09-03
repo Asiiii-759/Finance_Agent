@@ -30,15 +30,17 @@ LLM 是研究链路的必需依赖：未配置模型或模型计划违反契约�
 - 工具输入/输出契约、run identity、capability、网络、副作用、分账预算、重试、超时和审计控制
 - 主/备数据源重规划、模型 `finish` 证据校验与明确停止原因
 - LangGraph SQLite checkpointer、状态历史和跨 Agent 实例恢复，以及 tenant/user/thread 隔离记忆
-- 持久对话事件账本、“LLM 旧摘要 + 最近 20K token 完整 run”、不可被摘要吞并的全历史原子事实、可更新的个人长期记忆、渐进披露 Skill 和持久 PDF 知识库
-- 按 entity/source/domain 平衡、按研究意图可选 document 分散、保留 provenance 的 Prompt ContextAssembler；规划 24K、生成 48K evidence 字符预算可调，并输出逐阶段 manifest
+- 持久对话事件账本、“LLM 旧摘要 + 最近 20K token 完整 run”、全量持久且按最新 32K token 时间尾部注入的原子事实、可更新的个人长期记忆、渐进披露 Skill 和持久 PDF 知识库
+- 按 entity/source/domain 平衡、按研究意图可选 document 分散、保留 provenance 的 Prompt ContextAssembler；规划 48K、生成 96K evidence token 预算可调，完整 passage 不做逐条字符截断，并输出逐阶段 manifest
 - 只读 canonical-evidence 工具注入边界，可接企业 RAG、MCP gateway 或 licensed feed；未注入时不启用
 - 带逐字 evidence quote 验证的 LLM 合成；非法输出快速失败
-- FastAPI、后台作业、CLI、报告与审计产物
+- 同服务可用 Web 工作台：对话、PDF、任务进度、run/log、长期记忆、Skill、个人知识库和受鉴权产物下载
+- 服务端固定 Principal（`MAS_LOCAL_TENANT_ID/MAS_LOCAL_USER_ID`）贯穿 API、Job、checkpoint、记忆、知识库、日志与产物；请求体不能自报身份
+- FastAPI、数据库 lease 后台作业、CLI、报告与审计产物
 - 7 个可独立运行的黑盒验收场景和自动化测试（以 `unittest` / `pytest` 当前结果为准）
 
-文档已经按用途收敛，先看 [文档地图](docs/README.md)。现行架构、运行机制及所有子系统契约统一见
-[完整系统设计](docs/AGENT_DETAILED_GUIDE.md)，实现状态和验证快照见
+文档已经按稳定职责拆分，先看 [文档地图](docs/README.md)。系统全貌见
+[总体架构](docs/ARCHITECTURE.md)，实现状态和验证快照见
 [实施状态与验证记录](docs/VALIDATION_AND_STATUS.md)。
 
 ## 环境
@@ -55,6 +57,13 @@ ruff check src tests run_demo.py start_api.py start_worker.py
 mypy src
 ```
 
+默认测试使用脚本模型做可重复的故障注入。需要验证真实模型对 TaskFrame、规划和合成协议的遵守情况时，显式运行
+少量 DeepSeek 端到端契约测试；它会读取 `.env`，产生真实费用，但不会调用搜索、SEC、FRED、OCR 或行情接口：
+
+```bash
+MAS_RUN_LIVE_LLM_TESTS=1 pytest -q tests/test_live_deepseek.py
+```
+
 ## CLI
 
 分析本地 PDF：
@@ -62,8 +71,6 @@ mypy src
 ```bash
 mas-finance \
   --query "分析 ACME 的需求、现金流和估值" \
-  --entity ACME \
-  --symbol ACME=ACME \
   --pdf ./acme-report.pdf
 ```
 
@@ -79,7 +86,6 @@ python run_demo.py --query "分析这份财报" --pdf ./report.pdf
 set -a; source .env; set +a
 MAS_ALLOW_NETWORK=true mas-finance \
   --query "分析扫描财报中的流动性风险" \
-  --entity ACME \
   --pdf ./scanned-report.pdf \
   --allow-network
 ```
@@ -90,8 +96,7 @@ MAS_ALLOW_NETWORK=true mas-finance \
 
 ```bash
 mas-finance \
-  --query "计算三年 CAGR" \
-  --calculate '{"operation":"cagr","inputs":{"beginning_value":100,"ending_value":150,"years":3}}'
+  --query "期初 100、期末 150、三年，计算 CAGR"
 ```
 
 ## API
@@ -100,6 +105,15 @@ mas-finance \
 python start_api.py
 ```
 
+浏览器打开 `http://127.0.0.1:8000/` 即进入工作台。生产或需要进程重启后自动接管任务时，另启：
+
+```bash
+python start_worker.py
+```
+
+本地 API 会为新任务启动隔离子进程；任务、lease、重试和取消状态先写数据库，独立 worker 可接管待处理或租约过期任务。
+`api.app` 仅导出 `create_app`，导入模块不会读取真实密钥或启动 MCP。
+
 JSON 请求：
 
 ```bash
@@ -107,8 +121,6 @@ curl -X POST http://127.0.0.1:8000/api/v1/analyze \
   -H 'Content-Type: application/json' \
   -d '{
     "query": "分析 Apple 当前估值",
-    "entities": ["Apple"],
-    "symbols": {"Apple": "AAPL"},
     "allow_network": true,
     "export_artifacts": false
   }'
@@ -119,14 +131,13 @@ curl -X POST http://127.0.0.1:8000/api/v1/analyze \
 ```bash
 curl -X POST http://127.0.0.1:8000/api/v1/analyze-upload \
   -F 'query=分析这份 Apple 财报的风险' \
-  -F 'entities=Apple' \
   -F 'files=@./apple-report.pdf'
 ```
 
 临时上传默认只用于当前请求；需要同一线程连续追问时，首次上传增加
 `retain_for_session=true`，后续 JSON 请求增加 `use_session_documents=true`。
-原 PDF 仍会在上传请求结束后删除，会话中只保留解析页文本并受短 TTL 控制。
-完整边界见 [完整系统设计](docs/AGENT_DETAILED_GUIDE.md) 第 25.7 节。
+原 PDF 仍会在上传请求结束后删除，会话中只保留 PaddleOCR 的页级 Markdown 与结构化 block，并受短 TTL 控制。
+完整边界见 [RAG、PDF 与文档生命周期](docs/architecture/rag-and-documents.md)。
 
 用户仍可明确保存、覆盖或删除个人偏好：
 
@@ -194,6 +205,7 @@ MAS_EMBEDDING_ENDPOINT=
 MAS_EMBEDDING_MODEL=
 MAS_EMBEDDING_API_KEY=
 MAS_EMBEDDING_TIMEOUT_SECONDS=30
+MAS_DOCUMENT_TOKENIZER_PATH=.runtime/models/bge-m3/tokenizer.json
 MAS_CONVERSATION_MEMORY_ENABLED=true
 MAS_CONVERSATION_CONTEXT_TOKENS=300000
 MAS_CONVERSATION_RECENT_TOKENS=20000
@@ -206,8 +218,8 @@ MAS_MAX_PERSONAL_KNOWLEDGE_DOCUMENTS=100
 MAS_SESSION_DOCUMENT_TTL_SECONDS=3600
 MAS_MAX_SESSION_DOCUMENT_SESSIONS=100
 MAS_MAX_PDF_TEXT_CHARACTERS=5000000
-MAS_PLANNING_EVIDENCE_CHARACTERS=24000
-MAS_SYNTHESIS_EVIDENCE_CHARACTERS=48000
+MAS_PLANNING_EVIDENCE_TOKENS=48000
+MAS_SYNTHESIS_EVIDENCE_TOKENS=96000
 MAS_SYNTHESIS_OUTPUT_TOKENS=4096
 MAS_API_KEY=
 
@@ -227,8 +239,8 @@ PADDLEOCR_MODEL=PaddleOCR-VL-1.6
 `BRAVE_SEARCH_API_KEY` 只启用 `web.search`；两者同时存在时显式优先 Bocha，
 模型仍不能构造任意 HTTP 请求。网页搜索结果只是发现层，不会冒充 SEC/FRED/行情等结构化一手数据。
 PDF 不再走本地 PyMuPDF 文本提取。运行时必须配置 PaddleOCR，或通过 `create_app` / `FinanceAnalysisService`
-注入实现 `PDFDocumentParser` 契约的成熟 PDF 解析 MCP adapter；两者都返回从 1 开始、连续的页级文本。
-PaddleOCR 只消费页级 Markdown，不下载远端图片资源。未配置解析器时上传快速失败。
+注入实现 `PDFDocumentParser` 契约的成熟 PDF 解析 MCP adapter；两者都返回从 1 开始、连续的页级文本和结构化 block。
+PaddleOCR 消费页级 Markdown 与版面结构，不下载远端图片资源。未配置解析器时上传快速失败。
 未配置 LLM 时研究请求快速失败，不进入工具或记忆写入。
 embedding 未配置时只注册 BM25 工具；配置 OpenAI-compatible HTTPS endpoint 后额外注册 hybrid/RRF 工具，
 模型可自主选择，远程调用继续要求双重网络授权。系统不会把 DeepSeek 对话接口误作 embedding 接口。
@@ -242,7 +254,7 @@ embedding 未配置时只注册 BM25 工具；配置 OpenAI-compatible HTTPS end
 - `failed`：无证据，或最终报告未通过硬校验。
 
 报告会显示迭代数、工具调用数、停止原因、数据缺口、来源脚注和非投资建议声明；API 结果中的
-`context_manifests` 记录每次规划/生成实际纳入和省略的证据、来源类型、分组及字符预算。
+`context_manifests` 记录每次规划/生成实际纳入和省略的证据、来源类型、分组及 token 预算。
 
 ## 对话与后台任务
 

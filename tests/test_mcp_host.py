@@ -16,13 +16,15 @@ from mas_finance import MCPHost as PublicMCPHost
 from mas_finance import McpServerConfig as PublicMcpServerConfig
 from mas_finance.config import AppConfig
 from mas_finance.contracts import Evidence, EvidenceBundle, SourceRef, SourceType
-from mas_finance.harness import ToolExecutionError
+from mas_finance.harness import ExecutionPolicy, ToolContext, ToolExecutionError, ToolHarness
 from mas_finance.llm import LLMSettings
 from mas_finance.mcp import (
     HttpMCPClient,
     MCPHost,
     McpServerConfig,
+    _jsonrpc_execution_error,
     _parse_call_payload,
+    mcp_discovery_tools,
     parse_mcp_servers_json,
 )
 from mas_finance.service import FinanceAnalysisService
@@ -106,6 +108,60 @@ class FakeMCPClient:
 
 
 class MCPHostTests(unittest.TestCase):
+    def test_progressive_mcp_call_validates_remote_nested_schema_before_provider_call(self) -> None:
+        client = FakeMCPClient(listed=(_read_only_tool(),), results={"policy_search": _policy_bundle()})
+        host = MCPHost(
+            (
+                McpServerConfig(
+                    name="portfolio",
+                    transport="stdio",
+                    default_capability="document.search",
+                    network_access=False,
+                    command=sys.executable,
+                    args=("-c", "pass"),
+                ),
+            ),
+            client_factory=lambda _config: client,
+        )
+        host.connect()
+        try:
+            harness = ToolHarness()
+            for tool in mcp_discovery_tools(host):
+                harness.register(tool)
+            result = harness.invoke(
+                "mcp.call_tool",
+                {
+                    "name": "portfolio.policy_search",
+                    "arguments": {"query": "policy", "top_k": "five"},
+                },
+                ToolContext(
+                    run_id="nested-schema",
+                    thread_id="thread",
+                    policy=ExecutionPolicy(allowed_capabilities=frozenset({"mcp.invoke"})),
+                ),
+            )
+        finally:
+            host.close()
+
+        self.assertEqual(result.error_code, "mcp_invalid_arguments")
+        self.assertEqual(result.error_details["field"], "top_k")
+        self.assertEqual(result.error_details["expected_type"], "integer")
+        self.assertEqual(result.error_details["model_action"], "change_arguments")
+        self.assertEqual(client.calls, [])
+
+    def test_jsonrpc_invalid_params_preserves_code_data_and_replan_action(self) -> None:
+        error = _jsonrpc_execution_error(
+            {
+                "code": -32602,
+                "message": "interval is unsupported",
+                "data": {"field": "interval", "allowed_values": ["1d", "1wk"]},
+            }
+        )
+        self.assertEqual(error.code, "mcp_invalid_arguments")
+        self.assertEqual(error.details["jsonrpc_code"], -32602)
+        self.assertEqual(error.details["data"]["field"], "interval")
+        self.assertEqual(error.details["model_action"], "change_arguments")
+
     def test_structured_tool_error_preserves_retry_guidance(self) -> None:
         with self.assertRaises(ToolExecutionError) as raised:
             _parse_call_payload(
@@ -124,6 +180,7 @@ class MCPHostTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "unknown_symbol")
         self.assertEqual(raised.exception.details["field"], "symbol")
         self.assertTrue(raised.exception.details["retryable"])
+        self.assertEqual(raised.exception.details["model_action"], "change_arguments")
 
     def test_verified_mcp_arguments_are_stored_outside_personal_memory(self) -> None:
         client = FakeMCPClient(listed=(_read_only_tool("snapshot"),))
@@ -143,7 +200,7 @@ class MCPHostTests(unittest.TestCase):
             service = FinanceAnalysisService(_config(Path(directory)), mcp_host=host)
             try:
                 service._record_tool_usage_memory(
-                    "default",
+                    "local",
                     "alice",
                     (
                         {
@@ -154,7 +211,7 @@ class MCPHostTests(unittest.TestCase):
                         },
                     ),
                 )
-                recalled = service._recall_tool_usage_memory("default", "alice", "Berkshire")
+                recalled = service._recall_tool_usage_memory("local", "alice", "Berkshire")
                 self.assertEqual(recalled[0]["tool_name"], "provider.snapshot")
                 self.assertEqual(recalled[0]["success_count"], 1)
                 self.assertEqual(service.list_personal_memories(user_id="alice"), [])
@@ -257,7 +314,6 @@ class MCPHostTests(unittest.TestCase):
                 self.assertEqual(catalog["portfolio.policy_search"]["availability"], "mcp_connected")
                 result = service.analyze(
                     "根据组合政策说明单一发行人限额",
-                    require_documents=True,
                     export_artifacts=False,
                 )["result"]
                 self.assertEqual(result["status"], "succeeded")
@@ -290,11 +346,10 @@ class MCPHostTests(unittest.TestCase):
             try:
                 result = service.analyze(
                     "根据组合政策说明单一发行人限额",
-                    require_documents=True,
                     export_artifacts=False,
                 )["result"]
                 self.assertNotEqual(result["status"], "succeeded")
-                self.assertTrue(any(gap["code"] == "valueerror" for gap in result["gaps"]))
+                self.assertTrue(any(gap["code"] == "tool_internal_error" for gap in result["gaps"]))
             finally:
                 service.close()
 
@@ -337,7 +392,6 @@ class MCPHostTests(unittest.TestCase):
                 self.assertTrue(any(item.tool_name == "write_note" for item in service.mcp_host.rejections()))
                 result = service.analyze(
                     "根据组合政策说明单一发行人限额",
-                    require_documents=True,
                     export_artifacts=False,
                 )["result"]
                 self.assertEqual(result["status"], "succeeded")
@@ -416,7 +470,6 @@ class MCPHostTests(unittest.TestCase):
             try:
                 result = service.analyze(
                     "根据组合政策说明单一发行人限额",
-                    require_documents=True,
                     export_artifacts=False,
                 )["result"]
                 self.assertEqual(result["status"], "succeeded")

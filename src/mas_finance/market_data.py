@@ -8,16 +8,6 @@ import httpx
 
 from .rate_limit import RateLimit, RateLimiter
 
-DEFAULT_TICKER_MAP = {
-    "Apple": "AAPL",
-    "Microsoft": "MSFT",
-    "Tesla": "TSLA",
-    "Amazon": "AMZN",
-    "Alphabet": "GOOGL",
-    "Meta": "META",
-    "NVIDIA": "NVDA",
-}
-
 
 class MarketDataClient:
     def __init__(
@@ -42,15 +32,9 @@ class MarketDataClient:
         if self.provider == "alphavantage":
             if not self.alphavantage_api_key:
                 return self._unavailable_snapshot(company, ticker, ["alphavantage_api_key_missing"])
-            try:
-                return self._fetch_from_alphavantage(company, ticker)
-            except Exception as exc:
-                return self._unavailable_snapshot(company, ticker, [type(exc).__name__])
+            return self._fetch_from_alphavantage(company, ticker)
         if self.provider == "yahoo":
-            try:
-                return self._fetch_from_yahoo(company, ticker)
-            except Exception as exc:
-                return self._unavailable_snapshot(company, ticker, [type(exc).__name__])
+            return self._fetch_from_yahoo(company, ticker)
         return self._unavailable_snapshot(company, ticker, ["unsupported_provider"])
 
     def fetch_price_history(
@@ -79,15 +63,9 @@ class MarketDataClient:
                     interval,
                     ["alphavantage_api_key_missing"],
                 )
-            try:
-                return self._history_from_alphavantage(company, ticker, range_name, interval)
-            except Exception as exc:
-                return self._unavailable_history(company, ticker, range_name, interval, [type(exc).__name__])
+            return self._history_from_alphavantage(company, ticker, range_name, interval)
         if self.provider == "yahoo":
-            try:
-                return self._history_from_yahoo(company, ticker, range_name, interval)
-            except Exception as exc:
-                return self._unavailable_history(company, ticker, range_name, interval, [type(exc).__name__])
+            return self._history_from_yahoo(company, ticker, range_name, interval)
         return self._unavailable_history(company, ticker, range_name, interval, ["unsupported_provider"])
 
     def _unavailable_snapshot(self, company: str, ticker: str, errors: list[str]) -> dict[str, Any]:
@@ -316,9 +294,8 @@ def _safe_float(value: Any) -> float | None:
 
 
 def _resolve_ticker(company: str, symbol: str | None) -> str:
-    candidate = (symbol or DEFAULT_TICKER_MAP.get(company) or "").strip()
-    if not candidate and re.fullmatch(r"[A-Za-z0-9.^=_:-]{1,32}", company):
-        candidate = company
+    del company
+    candidate = (symbol or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9.^=_:-]{1,64}", candidate):
         raise ValueError("a valid market symbol is required for this company")
     return candidate

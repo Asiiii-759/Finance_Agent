@@ -21,8 +21,6 @@ class EvaluationCase:
     expected_status: str
     expected_tools: tuple[str, ...] = ()
     expected_gaps: tuple[str, ...] = ()
-    entities: tuple[str, ...] = ()
-    calculations: tuple[dict[str, Any], ...] = ()
     market_provider: str = "offline"
     request_network: bool = False
 
@@ -64,19 +62,9 @@ ENTERPRISE_CASES: tuple[EvaluationCase, ...] = (
     ),
     EvaluationCase(
         name="structured_sharpe_ratio",
-        query="根据给定收益率计算年化夏普比率",
+        query="根据收益率 [0.01,-0.005,0.02,0.004]、年化因子252和年化无风险利率0.03计算夏普比率",
         expected_status="succeeded",
         expected_tools=("finance.calculate",),
-        calculations=(
-            {
-                "operation": "sharpe_ratio",
-                "inputs": {
-                    "returns": [0.01, -0.005, 0.02, 0.004],
-                    "annualization_factor": 252,
-                    "annual_risk_free_rate": 0.03,
-                },
-            },
-        ),
     ),
     EvaluationCase(
         name="model_interest_rate_transmission",
@@ -93,7 +81,6 @@ ENTERPRISE_CASES: tuple[EvaluationCase, ...] = (
     EvaluationCase(
         name="offline_market_fails_closed",
         query="Apple 当前股价是多少？",
-        entities=("Apple",),
         expected_status="failed",
         expected_tools=("market.snapshot",),
         expected_gaps=("market_provider_unavailable",),
@@ -101,7 +88,6 @@ ENTERPRISE_CASES: tuple[EvaluationCase, ...] = (
     EvaluationCase(
         name="network_requires_server_and_request_consent",
         query="Apple 当前股价是多少？",
-        entities=("Apple",),
         market_provider="yahoo",
         request_network=False,
         expected_status="failed",
@@ -125,8 +111,6 @@ def run_enterprise_evaluation(*, llm_client: BaseLLMClient | None = None) -> dic
             )
             response = service.analyze(
                 case.query,
-                entities=list(case.entities),
-                calculations=[dict(item) for item in case.calculations],
                 allow_network=case.request_network,
                 export_artifacts=False,
             )
@@ -176,7 +160,6 @@ def _evaluate_thread_entity_switch(root: Path, llm_client: BaseLLMClient) -> Eva
     service = FinanceAnalysisService(_evaluation_config(root, "offline"), llm_client=llm_client)
     service.analyze(
         "解释 Apple 的市盈率",
-        entities=["Apple"],
         thread_id="entity-switch",
         export_artifacts=False,
     )
@@ -240,7 +223,6 @@ def _evaluate_injected_rag(root: Path, llm_client: BaseLLMClient) -> EvaluationR
     )
     response = service.analyze(
         "根据内部文档说明 ACME 的 covenant 风险",
-        entities=["ACME"],
         export_artifacts=False,
     )["result"]
     tools = _research_tools(response)

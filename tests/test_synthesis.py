@@ -5,9 +5,9 @@ import unittest
 
 import httpx
 
-from mas_finance.agent import ResearchRequest
+from mas_finance.agent import AgentContext, ChatTurn, RuntimePolicy
 from mas_finance.contracts import Evidence, EvidenceBundle, SourceRef, SourceType
-from mas_finance.harness import ToolHarness
+from mas_finance.harness import ExecutionPolicy, ToolContext, ToolHarness
 from mas_finance.llm import DeepSeekChatClient, LLMSettings
 from mas_finance.synthesis import EvidenceBoundLLMSynthesizer, llm_synthesis_harness_tool
 
@@ -28,6 +28,15 @@ def evidence_bundle() -> EvidenceBundle:
         )
     )
     return bundle
+
+
+def synthesize(synthesizer, message: str, bundle: EvidenceBundle, *, run_id: str = "run"):
+    return synthesizer.synthesize(
+        ChatTurn(message=message, run_id=run_id),
+        RuntimePolicy(),
+        AgentContext(),
+        bundle,
+    )
 
 
 class GoodLLM:
@@ -70,8 +79,8 @@ class CapturingLLM(GoodLLM):
 class SynthesisTests(unittest.TestCase):
     def test_synthesis_budget_supports_batched_financial_results(self) -> None:
         client = CapturingLLM()
-        synthesizer = EvidenceBoundLLMSynthesizer(client)
-        self.assertTrue(synthesizer.synthesize(ResearchRequest(query="demand"), evidence_bundle()))
+        synthesizer = EvidenceBoundLLMSynthesizer(client, count_tokens=len)
+        self.assertTrue(synthesize(synthesizer, "demand", evidence_bundle()))
         self.assertEqual(client.max_tokens, 4096)
         self.assertIn("中文金融研究撰稿人", client.system_prompt)
 
@@ -92,8 +101,8 @@ class SynthesisTests(unittest.TestCase):
         bundle.add_evidence(
             Evidence.create(source=source, content="ACME reported resilient demand in the quarter.")
         )
-        synthesizer = EvidenceBoundLLMSynthesizer(GoodLLM())
-        claims = synthesizer.synthesize(ResearchRequest(query="ACME demand"), bundle)
+        synthesizer = EvidenceBoundLLMSynthesizer(GoodLLM(), count_tokens=len)
+        claims = synthesize(synthesizer, "ACME demand", bundle)
         self.assertEqual(len(claims), 1)
         self.assertEqual(claims[0].status.value, "inferred")
         self.assertIn("search snippets", claims[0].caveat)
@@ -142,6 +151,53 @@ class SynthesisTests(unittest.TestCase):
         with self.assertRaises(httpx.HTTPStatusError):
             redirect.chat("system", "user", max_tokens=8)
 
+    def test_deepseek_transient_failures_are_retryable_but_client_errors_are_not(self) -> None:
+        settings = LLMSettings("secret", "https://api.deepseek.com/v1", "deepseek-v4-flash", 10)
+        attempts = 0
+
+        def transient_then_success(_request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(500, json={"error": "temporary"})
+            return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+
+        harness = ToolHarness()
+        client = DeepSeekChatClient(settings, transport=httpx.MockTransport(transient_then_success))
+        harness.register(llm_synthesis_harness_tool(client, network_access=True))
+        result = harness.invoke(
+            "llm.synthesize",
+            {"system_prompt": "system", "user_prompt": "user", "max_tokens": 8},
+            ToolContext(
+                run_id="retry-model",
+                thread_id="thread-model",
+                policy=ExecutionPolicy(
+                    allowed_capabilities=frozenset({"model.generate"}),
+                    allow_network=True,
+                ),
+            ),
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.attempts, 2)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(harness.budget_usage("retry-model").model_calls, 1)
+
+        bad_request = DeepSeekChatClient(
+            settings,
+            transport=httpx.MockTransport(lambda _request: httpx.Response(400, json={"error": "bad request"})),
+        )
+        with self.assertRaises(httpx.HTTPStatusError):
+            bad_request.chat("system", "user", max_tokens=8)
+
+        transport_failure = DeepSeekChatClient(
+            settings,
+            transport=httpx.MockTransport(
+                lambda request: (_ for _ in ()).throw(httpx.ConnectError("offline", request=request))
+            ),
+        )
+        with self.assertRaisesRegex(ConnectionError, "transport failed"):
+            transport_failure.chat("system", "user", max_tokens=8)
+
     def test_parametric_claim_allowed_without_evidence(self) -> None:
         class ConceptLLM:
             backend_name = "concept"
@@ -160,8 +216,8 @@ class SynthesisTests(unittest.TestCase):
                     }
                 )
 
-        synthesizer = EvidenceBoundLLMSynthesizer(ConceptLLM())
-        claims = synthesizer.synthesize(ResearchRequest(query="什么是市盈率？"), EvidenceBundle())
+        synthesizer = EvidenceBoundLLMSynthesizer(ConceptLLM(), count_tokens=len)
+        claims = synthesize(synthesizer, "什么是市盈率？", EvidenceBundle())
         self.assertEqual(len(claims), 1)
         self.assertEqual(claims[0].status.value, "inferred")
         self.assertEqual(claims[0].evidence_ids, ())
@@ -186,27 +242,24 @@ class SynthesisTests(unittest.TestCase):
                     }
                 )
 
-        synthesizer = EvidenceBoundLLMSynthesizer(FakeCiteLLM())
+        synthesizer = EvidenceBoundLLMSynthesizer(FakeCiteLLM(), count_tokens=len)
         with self.assertRaisesRegex(RuntimeError, "LLM synthesis was unusable"):
-            synthesizer.synthesize(ResearchRequest(query="demand"), evidence_bundle())
-        synthesizer = EvidenceBoundLLMSynthesizer(GoodLLM())
-        claims = synthesizer.synthesize(ResearchRequest(query="demand"), evidence_bundle())
+            synthesize(synthesizer, "demand", evidence_bundle())
+        synthesizer = EvidenceBoundLLMSynthesizer(GoodLLM(), count_tokens=len)
+        claims = synthesize(synthesizer, "demand", evidence_bundle())
         self.assertEqual(claims[0].text, "ACME described demand as resilient.")
         self.assertEqual(synthesizer.diagnostics(), ())
 
     def test_invalid_model_output_fails_fast(self) -> None:
-        synthesizer = EvidenceBoundLLMSynthesizer(BadLLM())
+        synthesizer = EvidenceBoundLLMSynthesizer(BadLLM(), count_tokens=len)
         with self.assertRaisesRegex(RuntimeError, "LLM synthesis was unusable"):
-            synthesizer.synthesize(ResearchRequest(query="demand"), evidence_bundle())
+            synthesize(synthesizer, "demand", evidence_bundle())
 
     def test_llm_call_uses_harness_and_omits_prompts_from_audit(self) -> None:
         harness = ToolHarness()
         harness.register(llm_synthesis_harness_tool(GoodLLM(), network_access=False))
-        synthesizer = EvidenceBoundLLMSynthesizer(GoodLLM(), harness=harness)
-        claims = synthesizer.synthesize(
-            ResearchRequest(query="demand", run_id="llm-audit"),
-            evidence_bundle(),
-        )
+        synthesizer = EvidenceBoundLLMSynthesizer(GoodLLM(), harness=harness, count_tokens=len)
+        claims = synthesize(synthesizer, "demand", evidence_bundle(), run_id="llm-audit")
         self.assertTrue(claims)
         event = harness.audit_events("llm-audit")[0]
         self.assertEqual(event["tool_name"], "llm.synthesize")

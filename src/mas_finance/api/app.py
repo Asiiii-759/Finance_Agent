@@ -1,21 +1,21 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from starlette.concurrency import run_in_threadpool
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import HTMLResponse, Response
 
+from .. import __version__
 from ..config import AppConfig
 from ..documents import PDFDocumentParser
 from ..embeddings import EmbeddingProvider
 from ..harness import Tool
 from ..llm import BaseLLMClient
-from ..logging_utils import configure_logging, request_logging_middleware
+from ..logging_utils import RequestLoggingMiddleware, configure_logging
 from ..memory_store import ConversationSummarizer, PersonalMemoryKind, TokenCounter
 from ..retrieval import RetrievalSource
 from ..service import FinanceAnalysisService
@@ -67,6 +67,14 @@ def create_app(
 
         process_one_isolated_job(service, f"api-background-{uuid4().hex[:12]}", job_id=job_id)
 
+    def start_job(job_id: str) -> None:
+        threading.Thread(
+            target=run_job_in_process,
+            args=(job_id,),
+            name=f"mas-job-{job_id[:12]}",
+            daemon=True,
+        ).start()
+
     async def persist_uploads(files: list[UploadFile]) -> list[str]:
         if not 1 <= len(files) <= app_config.max_upload_files:
             raise HTTPException(status_code=413, detail="Too many uploaded files.")
@@ -85,7 +93,7 @@ def create_app(
         result = response["result"]
         return AnalyzeResponse(
             thread_id=response["thread_id"],
-            run_id=result["request"]["run_id"],
+            run_id=result["turn"]["run_id"],
             llm_backend=response["llm_backend"],
             status=result["status"],
             stop_reason=result["stop_reason"],
@@ -103,19 +111,35 @@ def create_app(
             session_document_count=response.get("session_document_count", 0),
         )
 
+    def job_response(job: dict, *, include_result: bool = True) -> JobResponse:
+        payload = dict(job)
+        if not include_result:
+            payload["result"] = None
+        payload["artifacts"] = {
+            name: f"/api/v1/jobs/{job['job_id']}/artifacts/{name}" for name in job.get("artifacts", {})
+        }
+        return JobResponse(**payload)
+
     app = FastAPI(
         title="MAS Finance API",
-        version="2.1.0",
+        version=__version__,
         description="Evidence-first financial research API with a LangGraph planning agent.",
     )
-    app.middleware("http")(request_logging_middleware)
+    app.add_middleware(RequestLoggingMiddleware)
     app.router.add_event_handler("shutdown", service.close)
     web_dir = Path(__file__).resolve().parents[1] / "web"
-    app.mount("/static", StaticFiles(directory=web_dir), name="static")
 
     @app.get("/", include_in_schema=False)
-    async def web_app() -> FileResponse:
-        return FileResponse(web_dir / "index.html")
+    async def web_app() -> HTMLResponse:
+        return HTMLResponse((web_dir / "index.html").read_text(encoding="utf-8"))
+
+    @app.get("/static/app.css", include_in_schema=False)
+    async def web_styles() -> Response:
+        return Response((web_dir / "app.css").read_bytes(), media_type="text/css")
+
+    @app.get("/static/app.js", include_in_schema=False)
+    async def web_script() -> Response:
+        return Response((web_dir / "app.js").read_bytes(), media_type="text/javascript")
 
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
@@ -145,6 +169,7 @@ def create_app(
             "personal_knowledge_enabled": app_config.personal_knowledge_enabled,
             "conversation_context_tokens": app_config.conversation_context_tokens,
             "conversation_recent_tokens": app_config.conversation_recent_tokens,
+            "conversation_atomic_fact_tokens": app_config.conversation_atomic_fact_tokens,
             "model_input_token_budget": app_config.model_input_token_budget,
             "model_output_token_budget": app_config.model_output_token_budget,
             "job_queue_backend": "database_lease",
@@ -154,6 +179,7 @@ def create_app(
             "operational_retention_days": app_config.operational_retention_days,
             "completed_job_retention_days": app_config.completed_job_retention_days,
             "session_document_ttl_seconds": app_config.session_document_ttl_seconds,
+            "approval_state": "not_required_read_only_tools",
             "max_session_document_sessions": app_config.max_session_document_sessions,
             "max_pdf_pages": app_config.max_pdf_pages,
             "max_pdf_text_characters": app_config.max_pdf_text_characters,
@@ -162,8 +188,8 @@ def create_app(
             "web_search_enabled": bool(app_config.bocha_search_api_key or app_config.brave_search_api_key),
             "embedding_enabled": service.embedding_provider is not None,
             "embedding_model": service.embedding_provider.model_name if service.embedding_provider else None,
-            "planning_evidence_characters": app_config.planning_evidence_characters,
-            "synthesis_evidence_characters": app_config.synthesis_evidence_characters,
+            "planning_evidence_tokens": app_config.planning_evidence_tokens,
+            "synthesis_evidence_tokens": app_config.synthesis_evidence_tokens,
             "synthesis_output_tokens": app_config.synthesis_output_tokens,
         }
 
@@ -377,6 +403,18 @@ def create_app(
             )
         }
 
+    @app.post("/api/v1/knowledge/reindex")
+    async def reindex_personal_documents(
+        principal: Principal = Depends(auth_dependency),  # noqa: B008
+    ) -> dict:
+        try:
+            return service.reindex_personal_documents(
+                tenant_id=principal.tenant_id,
+                user_id=principal.user_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.delete("/api/v1/knowledge/documents/{document_id}")
     async def delete_personal_document(
         document_id: str,
@@ -431,22 +469,11 @@ def create_app(
         principal: Principal = Depends(auth_dependency),  # noqa: B008
     ) -> AnalyzeResponse:
         try:
-            response = await run_in_threadpool(
-                service.analyze,
+            response = service.analyze(
                 query=payload.query,
                 thread_id=payload.thread_id,
                 export_artifacts=payload.export_artifacts,
-                entities=payload.entities,
-                symbols=payload.symbols,
                 allow_network=payload.allow_network,
-                macro_series=payload.macro_series,
-                calculations=[item.model_dump(mode="json", exclude_none=True) for item in payload.calculations],
-                require_documents=payload.require_documents,
-                require_market_data=payload.require_market_data,
-                require_market_history=payload.require_market_history,
-                require_regulatory_data=payload.require_regulatory_data,
-                market_history_range=payload.market_history_range,
-                market_history_interval=payload.market_history_interval,
                 use_session_documents=payload.use_session_documents,
                 use_personal_memory=payload.use_personal_memory,
                 use_personal_knowledge=payload.use_personal_knowledge,
@@ -469,7 +496,6 @@ def create_app(
             pattern=r"^[^\x00-\x1f\x7f]+$",
         ),
         export_artifacts: bool = Form(default=True),
-        entities: str = Form(default="", max_length=5_000),
         allow_network: bool = Form(default=False),
         use_session_documents: bool = Form(default=False),
         retain_for_session: bool = Form(default=False),
@@ -481,13 +507,11 @@ def create_app(
         saved_paths = await persist_uploads(files)
         try:
             try:
-                response = await run_in_threadpool(
-                    service.analyze,
+                response = service.analyze(
                     query=query,
                     thread_id=thread_id,
                     export_artifacts=export_artifacts,
                     document_paths=saved_paths,
-                    entities=[item.strip() for item in entities.split(",") if item.strip()],
                     allow_network=allow_network,
                     use_session_documents=use_session_documents,
                     retain_documents_for_session=retain_for_session,
@@ -508,7 +532,6 @@ def create_app(
     @app.post("/api/v1/jobs", response_model=SubmitJobResponse, status_code=202)
     async def submit_job(
         payload: SubmitJobRequest,
-        background_tasks: BackgroundTasks,
         principal: Principal = Depends(auth_dependency),  # noqa: B008
     ) -> SubmitJobResponse:
         created = service.submit_job(
@@ -524,12 +547,11 @@ def create_app(
             use_personal_knowledge=payload.use_personal_knowledge,
         )
         if created["created"]:
-            background_tasks.add_task(run_job_in_process, created["job_id"])
+            start_job(created["job_id"])
         return SubmitJobResponse(**created, queue_backend="database-lease")
 
     @app.post("/api/v1/jobs/upload", response_model=SubmitJobResponse, status_code=202)
     async def submit_upload_job(
-        background_tasks: BackgroundTasks,
         query: str = Form(..., min_length=1, max_length=8_000, pattern=r".*\S.*"),
         thread_id: str | None = Form(
             default=None,
@@ -565,7 +587,7 @@ def create_app(
                 Path(saved_path).unlink(missing_ok=True)
             raise
         if created["created"]:
-            background_tasks.add_task(run_job_in_process, created["job_id"])
+            start_job(created["job_id"])
         else:
             for saved_path in saved_paths:
                 Path(saved_path).unlink(missing_ok=True)
@@ -583,7 +605,37 @@ def create_app(
         )
         if job is None:
             raise HTTPException(status_code=404, detail="Job not found.")
-        return JobResponse(**job)
+        return job_response(job)
+
+    @app.get("/api/v1/jobs/{job_id}/artifacts/{artifact_name}")
+    async def get_job_artifact(
+        job_id: str,
+        artifact_name: str,
+        principal: Principal = Depends(auth_dependency),  # noqa: B008
+    ) -> Response:
+        job = service.get_job(
+            job_id,
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+        )
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found.")
+        raw_path = job["artifacts"].get(artifact_name)
+        if raw_path is None:
+            raise HTTPException(status_code=404, detail="Artifact not found.")
+        artifact_path = Path(raw_path).resolve()
+        try:
+            artifact_path.relative_to(app_config.output_dir.resolve())
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="Artifact not found.") from exc
+        if not artifact_path.is_file():
+            raise HTTPException(status_code=404, detail="Artifact not found.")
+        media_type = "text/markdown" if artifact_path.suffix == ".md" else "application/json"
+        return Response(
+            content=artifact_path.read_bytes(),
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{artifact_path.name}"'},
+        )
 
     @app.delete("/api/v1/jobs/{job_id}")
     async def cancel_job(
@@ -609,9 +661,6 @@ def create_app(
             tenant_id=principal.tenant_id,
             user_id=principal.user_id,
         )
-        return [JobResponse(**job) for job in jobs]
+        return [job_response(job, include_result=False) for job in jobs]
 
     return app
-
-
-app = create_app()

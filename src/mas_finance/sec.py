@@ -315,6 +315,21 @@ def sec_company_facts_harness_tool(adapter: SECCompanyFactsAdapter) -> Tool:
                 required=frozenset({"company", "symbol"}),
                 optional=frozenset({"required_fields"}),
             ),
+            input_schema={
+                "type": "object",
+                "required": ["company", "symbol"],
+                "additionalProperties": False,
+                "properties": {
+                    "company": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "symbol": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "required_fields": {
+                        "type": "array",
+                        "uniqueItems": True,
+                        "maxItems": 50,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 100},
+                    },
+                },
+            },
         ),
         invoke,
     )
@@ -354,6 +369,23 @@ def sec_recent_filings_harness_tool(adapter: SECRecentFilingsAdapter) -> Tool:
                 required=frozenset({"company", "symbol"}),
                 optional=frozenset({"forms", "limit"}),
             ),
+            input_schema={
+                "type": "object",
+                "required": ["company", "symbol"],
+                "additionalProperties": False,
+                "properties": {
+                    "company": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "symbol": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "forms": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "uniqueItems": True,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 20},
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+            },
         ),
         invoke,
     )

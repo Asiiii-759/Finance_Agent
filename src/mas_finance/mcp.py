@@ -33,6 +33,7 @@ from .harness import (
     ToolResultKind,
     ToolSpec,
     function_tool,
+    validate_tool_arguments,
 )
 from .rate_limit import RateLimit, RateLimiter
 
@@ -325,7 +326,7 @@ class StdioMCPClient:
             suffix = f" stderr={detail}" if detail else ""
             raise TimeoutError(f"MCP stdio request timed out: {method}{suffix}") from exc
         if "error" in message:
-            raise RuntimeError(_jsonrpc_error_message(message["error"]))
+            raise _jsonrpc_execution_error(message["error"])
         result = message.get("result")
         if not isinstance(result, Mapping):
             raise ValueError(f"MCP {method} result must be an object")
@@ -447,7 +448,7 @@ class HttpMCPClient:
             session_id=session_id,
         )
         if "error" in message:
-            raise RuntimeError(_jsonrpc_error_message(message["error"]))
+            raise _jsonrpc_execution_error(message["error"])
         result = message.get("result")
         if not isinstance(result, Mapping):
             raise ValueError(f"MCP {method} result must be an object")
@@ -655,10 +656,18 @@ def mcp_discovery_tools(host: MCPHost) -> tuple[Tool, ...]:
     def search(arguments: Mapping[str, Any], _context: ToolContext) -> dict[str, Any]:
         query = str(arguments["query"]).strip()
         if not query or len(query) > 500:
-            raise ValueError("MCP search query is invalid")
+            raise ToolExecutionError(
+                "mcp_discovery_invalid_arguments",
+                "MCP search query must contain 1-500 characters",
+                details={"field": "query", "model_action": "change_arguments"},
+            )
         limit = int(arguments.get("limit") or 8)
         if not 1 <= limit <= MAX_DISCOVERY_MATCHES:
-            raise ValueError(f"MCP search limit must be between 1 and {MAX_DISCOVERY_MATCHES}")
+            raise ToolExecutionError(
+                "mcp_discovery_invalid_arguments",
+                f"MCP search limit must be between 1 and {MAX_DISCOVERY_MATCHES}",
+                details={"field": "limit", "model_action": "change_arguments"},
+            )
         matches = _rank_mcp_catalog(host.catalog_index(), query)[:limit]
         return {"query": query, "matches": matches}
 
@@ -667,19 +676,42 @@ def mcp_discovery_tools(host: MCPHost) -> tuple[Tool, ...]:
         for item in host.catalog_index():
             if item["name"] == name:
                 return dict(item)
-        raise ValueError("unknown or unauthorized MCP tool")
+        raise ToolExecutionError(
+            "mcp_tool_not_found",
+            "unknown or unauthorized MCP tool",
+            details={"field": "name", "model_action": "search_tools"},
+        )
 
     def call(arguments: Mapping[str, Any], context: ToolContext) -> dict[str, Any]:
         name = str(arguments["name"])
         inner_arguments = arguments.get("arguments")
         if not isinstance(inner_arguments, Mapping):
-            raise ValueError("MCP call arguments must be an object")
+            raise ToolExecutionError(
+                "mcp_invalid_arguments",
+                "MCP call arguments must be an object",
+                details={"field": "arguments", "model_action": "change_arguments"},
+            )
         tool = host.tool_by_name(name)
         if tool is None:
-            raise ValueError("unknown or unauthorized MCP tool")
+            raise ToolExecutionError(
+                "mcp_tool_not_found",
+                "unknown or unauthorized MCP tool",
+                details={"field": "name", "model_action": "search_tools"},
+            )
         if tool.spec.network_access and not context.policy.allow_network:
-            raise RuntimeError("network access is not allowed for this run")
-        tool.spec.arguments.validate(inner_arguments)
+            raise ToolExecutionError(
+                "network_denied",
+                "network access is not allowed for this run",
+                details={"model_action": "request_network_authorization"},
+            )
+        try:
+            validate_tool_arguments(tool.spec, inner_arguments)
+        except ToolExecutionError as exc:
+            raise ToolExecutionError(
+                "mcp_invalid_arguments",
+                str(exc),
+                details={**exc.details, "model_action": "change_arguments"},
+            ) from exc
         payload = tool(inner_arguments, context)
         if not isinstance(payload, Mapping) or not isinstance(payload.get("bundle"), Mapping):
             raise ValueError("MCP tool did not return an evidence bundle")
@@ -700,6 +732,15 @@ def mcp_discovery_tools(host: MCPHost) -> tuple[Tool, ...]:
                     required=frozenset({"query"}),
                     optional=frozenset({"limit"}),
                 ),
+                input_schema={
+                    "type": "object",
+                    "required": ["query"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "query": {"type": "string", "minLength": 1, "maxLength": 500},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": MAX_DISCOVERY_MATCHES},
+                    },
+                },
             ),
             search,
         ),
@@ -713,6 +754,12 @@ def mcp_discovery_tools(host: MCPHost) -> tuple[Tool, ...]:
                 timeout_seconds=5.0,
                 result_kind=ToolResultKind.CATALOG,
                 arguments=ToolArgumentContract(required=frozenset({"name"})),
+                input_schema={
+                    "type": "object",
+                    "required": ["name"],
+                    "additionalProperties": False,
+                    "properties": {"name": {"type": "string", "minLength": 1, "maxLength": 100}},
+                },
             ),
             describe,
         ),
@@ -728,6 +775,15 @@ def mcp_discovery_tools(host: MCPHost) -> tuple[Tool, ...]:
                 arguments=ToolArgumentContract(
                     required=frozenset({"name", "arguments"}),
                 ),
+                input_schema={
+                    "type": "object",
+                    "required": ["name", "arguments"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "name": {"type": "string", "minLength": 1, "maxLength": 100},
+                        "arguments": {"type": "object"},
+                    },
+                },
             ),
             call,
         ),
@@ -854,6 +910,7 @@ def _bind_harness_tool(client: MCPClient, accepted: _AcceptedRemoteTool) -> Tool
             timeout_seconds=30.0,
             result_kind=ToolResultKind.EVIDENCE_BUNDLE,
             arguments=accepted.arguments,
+            input_schema=accepted.input_schema,
         ),
         invoke,
     )
@@ -959,6 +1016,13 @@ def _call_error_details(result: Mapping[str, Any]) -> dict[str, Any]:
         code = "mcp_tool_error"
     payload["error_code"] = code[:64]
     payload["message"] = str(payload.get("message") or _call_error_message(result))[:1_000]
+    if not isinstance(payload.get("model_action"), str):
+        if any(term in code for term in ("invalid", "unknown", "unresolved")):
+            payload["model_action"] = "change_arguments"
+        elif payload.get("retryable") is True:
+            payload["model_action"] = "retry_same_arguments_or_choose_alternative"
+        else:
+            payload["model_action"] = "choose_alternative_tool"
     return payload
 
 
@@ -967,6 +1031,23 @@ def _jsonrpc_error_message(error: Any) -> str:
         message = str(error.get("message") or "MCP JSON-RPC error")
         return message[:1_000]
     return "MCP JSON-RPC error"
+
+
+def _jsonrpc_execution_error(error: Any) -> ToolExecutionError:
+    if not isinstance(error, Mapping):
+        return ToolExecutionError("mcp_jsonrpc_error", _jsonrpc_error_message(error))
+    raw_code = error.get("code")
+    details: dict[str, Any] = {}
+    if isinstance(raw_code, int) and not isinstance(raw_code, bool):
+        details["jsonrpc_code"] = raw_code
+    data = error.get("data")
+    if isinstance(data, Mapping):
+        details["data"] = dict(data)
+    if raw_code == -32602:
+        details["model_action"] = "change_arguments"
+        return ToolExecutionError("mcp_invalid_arguments", _jsonrpc_error_message(error), details=details)
+    details["model_action"] = "choose_alternative_tool"
+    return ToolExecutionError("mcp_jsonrpc_error", _jsonrpc_error_message(error), details=details)
 
 
 def _sanitize_remote_name(name: str) -> str:

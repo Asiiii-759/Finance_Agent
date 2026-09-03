@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import queue as queue_module
 import socket
@@ -7,9 +8,11 @@ import time
 from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .config import AppConfig
 from .queueing import ReliableJobQueue
+from .security import safe_child
 from .service import FinanceAnalysisService
 
 
@@ -74,11 +77,32 @@ def _run_claimed_job(
             use_personal_knowledge=payload.get("use_personal_knowledge", True),
             retain_documents_for_session=payload.get("retain_documents_for_session", False),
             resume=payload["attempt_count"] > 1,
+            finalize_status=False,
         )
+        session_documents_path: str | None = None
+        if payload.get("retain_documents_for_session"):
+            documents = service._load_session_documents(
+                payload["tenant_id"],
+                payload["user_id"],
+                payload["thread_id"],
+            )
+            if not documents:
+                raise RuntimeError("retained session documents disappeared before transfer")
+            transfer_path = safe_child(
+                config.upload_dir,
+                f"session-{payload['job_id']}-{uuid4().hex[:8]}.json",
+            )
+            transfer_path.write_text(json.dumps(documents, ensure_ascii=False), encoding="utf-8")
+            session_documents_path = str(transfer_path)
     except Exception as exc:
         result_queue.put({"error_type": type(exc).__name__})
     else:
-        result_queue.put({"completed": True})
+        result_queue.put(
+            {
+                "completed": True,
+                "session_documents_path": session_documents_path,
+            }
+        )
     finally:
         service.close()
 
@@ -142,9 +166,28 @@ def process_one_isolated_job(
             result = result_queue.get(timeout=5)
         except queue_module.Empty:
             result = {"error_type": f"WorkerExit{process.exitcode}"}
+        session_documents_path = result.get("session_documents_path")
+        if result.get("completed") and session_documents_path:
+            transfer_path = Path(str(session_documents_path)).resolve()
+            try:
+                transfer_path.relative_to(service.config.upload_dir.resolve())
+                documents = json.loads(transfer_path.read_text(encoding="utf-8"))
+                if not isinstance(documents, list):
+                    raise ValueError("session document transfer must be a list")
+                service._retain_session_documents(
+                    payload["tenant_id"],
+                    payload["user_id"],
+                    payload["thread_id"],
+                    documents,
+                )
+            except (OSError, ValueError) as exc:
+                result = {"error_type": type(exc).__name__}
+            finally:
+                transfer_path.unlink(missing_ok=True)
         if result.get("completed"):
             if not queue.complete(payload["job_id"], payload["lease_token"]):
                 raise RuntimeError("analysis completed after its job lease expired")
+            service.repository.update_job_status(job_id=payload["job_id"], status="completed")
         else:
             result["queue_status"] = queue.fail(
                 payload["job_id"], payload["lease_token"], str(result["error_type"])

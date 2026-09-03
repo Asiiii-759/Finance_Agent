@@ -348,6 +348,28 @@ def retrieval_harness_tool(
                 if fixed_search_mode is not None
                 else frozenset({"top_k", "filters", "search_mode", "rerank", "diversify_documents"}),
             ),
+            input_schema={
+                "type": "object",
+                "required": ["query"],
+                "additionalProperties": False,
+                "properties": {
+                    "query": {"type": "string", "minLength": 1, "maxLength": 8000},
+                    "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
+                    "filters": {"type": "object", "maxProperties": 50},
+                    "diversify_documents": {"type": "boolean"},
+                    **(
+                        {}
+                        if fixed_search_mode is not None
+                        else {
+                            "search_mode": {
+                                "type": "string",
+                                "enum": ["lexical", "vector", "hybrid", "rrf"],
+                            },
+                            "rerank": {"type": "boolean"},
+                        }
+                    ),
+                },
+            },
         ),
         invoke,
     )
@@ -477,11 +499,16 @@ def _safe_trace_metadata(trace: Mapping[str, Any]) -> dict[str, Any]:
         "index_version",
         "request_id",
         "search_mode",
+        "selected_chunk_count",
         "trace_id",
         "document_diversification",
         "embedding_backend",
+        "embedding_batch_count",
         "embedding_model",
         "fusion",
+        "minimum_vector_similarity",
+        "vector_candidate_count",
+        "vector_candidate_count_before_threshold",
     }
     result: dict[str, Any] = {}
     for key in allowed:

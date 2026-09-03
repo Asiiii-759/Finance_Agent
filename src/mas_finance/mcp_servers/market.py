@@ -207,16 +207,15 @@ class ExternalMarketClient:
         self.rate_limit = RateLimit(max_calls_per_minute, 60.0)
 
     def fetch_company_snapshot(self, company: str, symbol: str | None = None) -> Mapping[str, Any]:
-        ticker = (symbol or company).strip()
+        if symbol is None or not symbol.strip():
+            raise ValueError("explicit market symbol is required")
+        ticker = symbol.strip()
         self._acquire(ticker)
-        try:
-            if is_ashare_symbol(ticker) and self.biying_licence:
-                return self._biying_snapshot(company, ticker)
-            if self.alltick_token:
-                return self._alltick_snapshot(company, ticker)
-            return self._fallback_snapshot(company, ticker, ["primary_provider_missing"])
-        except Exception as exc:
-            return self._fallback_snapshot(company, ticker, [type(exc).__name__])
+        if is_ashare_symbol(ticker) and self.biying_licence:
+            return self._biying_snapshot(company, ticker)
+        if self.alltick_token:
+            return self._alltick_snapshot(company, ticker)
+        return self._fallback_snapshot(company, ticker, ["primary_provider_missing"])
 
     def fetch_price_history(
         self,
@@ -226,16 +225,15 @@ class ExternalMarketClient:
         range_name: str = "1y",
         interval: str = "1d",
     ) -> Mapping[str, Any]:
-        ticker = (symbol or company).strip()
+        if symbol is None or not symbol.strip():
+            raise ValueError("explicit market symbol is required")
+        ticker = symbol.strip()
         self._acquire(ticker)
-        try:
-            if is_ashare_symbol(ticker) and self.biying_licence:
-                return self._biying_history(company, ticker, range_name, interval)
-            if self.alltick_token:
-                return self._alltick_history(company, ticker, range_name, interval)
-            return self._fallback_history(company, ticker, range_name, interval, ["primary_provider_missing"])
-        except Exception as exc:
-            return self._fallback_history(company, ticker, range_name, interval, [type(exc).__name__])
+        if is_ashare_symbol(ticker) and self.biying_licence:
+            return self._biying_history(company, ticker, range_name, interval)
+        if self.alltick_token:
+            return self._alltick_history(company, ticker, range_name, interval)
+        return self._fallback_history(company, ticker, range_name, interval, ["primary_provider_missing"])
 
     def _acquire(self, ticker: str) -> None:
         key = "biying" if is_ashare_symbol(ticker) else "alltick"
@@ -317,15 +315,9 @@ class ExternalMarketClient:
 
     def _fallback_snapshot(self, company: str, ticker: str, errors: list[str]) -> dict[str, Any]:
         if self.enable_yfinance and not is_ashare_symbol(ticker):
-            try:
-                return _yfinance_snapshot(company, ticker)
-            except Exception as exc:
-                errors.append(type(exc).__name__)
+            return _yfinance_snapshot(company, ticker)
         if self.enable_akshare and is_ashare_symbol(ticker):
-            try:
-                return _akshare_snapshot(company, ticker)
-            except Exception as exc:
-                errors.append(type(exc).__name__)
+            return _akshare_snapshot(company, ticker)
         return {
             "provider": "extmarket",
             "symbol": ticker,
@@ -355,15 +347,9 @@ class ExternalMarketClient:
         errors: list[str],
     ) -> dict[str, Any]:
         if self.enable_yfinance and not is_ashare_symbol(ticker):
-            try:
-                return _yfinance_history(company, ticker, range_name, interval)
-            except Exception as exc:
-                errors.append(type(exc).__name__)
+            return _yfinance_history(company, ticker, range_name, interval)
         if self.enable_akshare and is_ashare_symbol(ticker):
-            try:
-                return _akshare_history(company, ticker, range_name, interval)
-            except Exception as exc:
-                errors.append(type(exc).__name__)
+            return _akshare_history(company, ticker, range_name, interval)
         return {
             "provider": "extmarket",
             "symbol": ticker,
@@ -390,8 +376,11 @@ class ExternalMarketClient:
             raise ConnectionError(f"market provider transient HTTP status: {response.status_code}")
         response.raise_for_status()
         if len(response.content) > 2_000_000:
-            raise ValueError("market provider response exceeds the byte limit")
-        return response.json()
+            raise RuntimeError("market provider response exceeds the byte limit")
+        try:
+            return response.json()
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("market provider returned invalid JSON") from exc
 
 
 def snapshot_bundle(client: ExternalMarketClient, arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -599,29 +588,45 @@ def _tools() -> list[dict[str, Any]]:
         "properties": {
             "company": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
                 "description": "公司或资产的规范展示名称，例如 贵州茅台、Apple。不要在此字段传供应商代码。",
                 "examples": ["贵州茅台", "Apple"],
             },
             "symbol": {
                 "type": "string",
-                "description": "可选证券代码。A 股使用 600519.SH/000001.SZ，美股使用 AAPL；不确定时省略。",
+                "minLength": 1,
+                "maxLength": 64,
+                "description": "明确证券代码。A 股使用 600519.SH/000001.SZ，美股使用 AAPL；未知时先检索确认。",
                 "examples": ["600519.SH", "AAPL"],
             },
             "required_fields": {
                 "type": "array",
                 "description": "本次必须返回的规范字段名列表。",
-                "items": {"type": "string"},
+                "maxItems": 20,
+                "uniqueItems": True,
+                "items": {"type": "string", "minLength": 1, "maxLength": 100},
                 "examples": [["price", "market_cap"]],
             },
         },
-        "required": ["company"],
+        "required": ["company", "symbol"],
         "additionalProperties": False,
     }
     history_schema = {
         "type": "object",
         "properties": {
-            "company": {"type": "string", "description": "公司或资产的规范展示名称。"},
-            "symbol": {"type": "string", "description": "可选证券代码；不确定时省略。"},
+            "company": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "公司或资产的规范展示名称。",
+            },
+            "symbol": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "description": "明确证券代码；未知时先检索确认。",
+            },
             "range": {
                 "type": "string",
                 "description": "历史区间。",
@@ -635,13 +640,13 @@ def _tools() -> list[dict[str, Any]]:
                 "default": "1d",
             },
         },
-        "required": ["company"],
+        "required": ["company", "symbol"],
         "additionalProperties": False,
     }
     return [
         {
             "name": "snapshot",
-            "description": "通过 AllTick 或必盈读取实时行情。传规范公司名；只有确定证券代码时才传 symbol。",
+            "description": "通过 AllTick 或必盈读取实时行情。company 与明确的 symbol 都必须提供。",
             "inputSchema": snapshot_schema,
             "annotations": {"readOnlyHint": True},
             "_meta": {
@@ -654,7 +659,7 @@ def _tools() -> list[dict[str, Any]]:
         },
         {
             "name": "history",
-            "description": "通过 AllTick 或必盈读取历史行情。range 和 interval 必须使用契约枚举值。",
+            "description": "通过 AllTick 或必盈读取历史行情。必须提供明确 symbol；range 和 interval 使用契约枚举值。",
             "inputSchema": history_schema,
             "annotations": {"readOnlyHint": True},
             "_meta": {
@@ -733,15 +738,33 @@ def main() -> None:
                 if isinstance(exc, (TimeoutError, ConnectionError, httpx.TransportError)):
                     error_code = "provider_transient_error"
                     retryable = True
+                    model_action = "retry_same_arguments_or_choose_alternative"
                     hint = "保持实体不变，稍后重试；不要通过猜测其他代码规避网络错误。"
-                elif "missing" in str(exc).casefold():
+                elif isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in {401, 403}:
                     error_code = "provider_configuration_error"
                     retryable = False
+                    model_action = "report_unavailable"
+                    hint = "供应商拒绝了服务端凭据，停止修改参数并报告配置问题。"
+                elif isinstance(exc, httpx.HTTPStatusError):
+                    error_code = "provider_rejected_request"
+                    retryable = True
+                    model_action = "change_arguments"
+                    hint = "核对 symbol 的交易所后缀与供应商支持范围后重试。"
+                elif isinstance(exc, RuntimeError) and "missing" in str(exc).casefold():
+                    error_code = "provider_configuration_error"
+                    retryable = False
+                    model_action = "report_unavailable"
                     hint = "服务端缺少供应商凭据，停止修改参数并报告配置问题。"
+                elif isinstance(exc, RuntimeError):
+                    error_code = "provider_invalid_response"
+                    retryable = False
+                    model_action = "choose_alternative_tool"
+                    hint = "供应商返回无效响应；改用其他已授权行情工具或报告数据不可用。"
                 else:
                     error_code = "invalid_or_unresolved_arguments"
                     retryable = True
-                    hint = "检查 symbol 的市场后缀和 range/interval 枚举；不确定 symbol 时省略该字段。"
+                    model_action = "change_arguments"
+                    hint = "检查 symbol 的市场后缀和 range/interval 枚举；未知 symbol 时先检索确认。"
                 _write_message(
                     {
                         "jsonrpc": "2.0",
@@ -752,6 +775,7 @@ def main() -> None:
                                 "error_code": error_code,
                                 "message": str(exc)[:1_000],
                                 "retryable": retryable,
+                                "model_action": model_action,
                                 "received_arguments": dict(arguments),
                                 "suggested_action": hint,
                             },

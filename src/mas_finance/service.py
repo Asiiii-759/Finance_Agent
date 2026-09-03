@@ -12,12 +12,13 @@ from uuid import uuid4
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from .agent import ResearchRequest
+from .adequacy import LLMEvidenceAdequacyChecker, llm_evidence_adequacy_harness_tool
+from .agent import AgentContext, ChatAttachment, ChatTurn, RuntimePolicy
 from .atomic_facts import AtomicFactExtractor, LLMAtomicFactExtractor
 from .config import AppConfig
 from .contracts import stable_id
 from .conversation import LLMConversationSummarizer
-from .corpus import CorpusDocument, InMemoryCorpus
+from .corpus import DocumentTokenizer, InMemoryCorpus
 from .documents import PDFDocumentParser, parse_pdf_document
 from .embeddings import EmbeddingProvider, HTTPEmbeddingClient
 from .formula import formula_harness_tool
@@ -31,7 +32,7 @@ from .market import (
     market_data_harness_tool,
     market_history_harness_tool,
 )
-from .market_data import DEFAULT_TICKER_MAP, MarketDataClient
+from .market_data import MarketDataClient
 from .mcp import MCPHost, builtin_extmarket_server_config, mcp_discovery_tools
 from .memory_consolidation import (
     LLMLongTermMemoryExtractor,
@@ -49,7 +50,7 @@ from .memory_store import (
     TokenCounter,
     build_conversation_window,
 )
-from .metrics import describe_metric_operations, financial_calculation_harness_tool
+from .metrics import describe_metric_operations, financial_calculation_harness_tool, metric_tool_input_schema
 from .ocr import PaddleOCRClient
 from .personal_knowledge import PersonalKnowledgeClient, SQLitePersonalKnowledgeBase
 from .planning import ModelPlanner, llm_planning_harness_tool
@@ -94,6 +95,7 @@ class FinanceAnalysisService:
         llm_client: BaseLLMClient | None = None,
     ) -> None:
         self.config = config
+        self.document_tokenizer = DocumentTokenizer(config.document_tokenizer_path)
         self.llm_client = llm_client
         self.retrieval_sources = tuple(retrieval_sources)
         self.evidence_tools = tuple(evidence_tools)
@@ -155,6 +157,7 @@ class FinanceAnalysisService:
             "web.search",
             "llm.task_frame",
             "llm.plan",
+            "llm.validate_evidence",
             "llm.synthesize",
             "mcp.search_tools",
             "mcp.describe_tool",
@@ -271,6 +274,7 @@ class FinanceAnalysisService:
         if self._personal_knowledge_store is None:
             self._personal_knowledge_store = SQLitePersonalKnowledgeBase(
                 self.config.db_path,
+                tokenizer=self.document_tokenizer,
                 max_documents_per_user=self.config.max_personal_knowledge_documents,
             )
         return self._personal_knowledge_store
@@ -299,6 +303,7 @@ class FinanceAnalysisService:
                 "network_access": False,
                 "availability": "always",
                 "operation_contract": describe_metric_operations(),
+                "input_schema": metric_tool_input_schema(),
                 **interface(("requests",)),
             },
             {
@@ -478,6 +483,20 @@ class FinanceAnalysisService:
                 "result_contract": "model_response",
                 "visibility": "internal_synthesis_only",
             },
+            {
+                "name": "llm.validate_evidence",
+                "capability": "model.generate",
+                "description": "Judge whether retrieved document or web evidence can answer each requirement.",
+                "network_access": self._llm_configured(),
+                "availability": "required" if self._llm_configured() else "missing_llm_configuration",
+                "input_contract": {
+                    "required": ["system_prompt", "user_prompt"],
+                    "optional": ["temperature", "max_tokens"],
+                    "allow_extra": False,
+                },
+                "result_contract": "model_response",
+                "visibility": "internal_validation_only",
+            },
         ]
         tools.extend(
             {
@@ -546,26 +565,17 @@ class FinanceAnalysisService:
         thread_id: str | None = None,
         export_artifacts: bool = True,
         document_paths: list[str] | None = None,
-        entities: list[str] | None = None,
-        symbols: dict[str, str] | None = None,
         allow_network: bool | None = None,
-        macro_series: list[str] | None = None,
-        calculations: list[dict] | None = None,
-        require_documents: bool | None = None,
-        require_market_data: bool | None = None,
-        require_market_history: bool | None = None,
-        require_regulatory_data: bool | None = None,
-        market_history_range: str = "1y",
-        market_history_interval: str = "1d",
         use_session_documents: bool = False,
         use_personal_memory: bool = True,
         use_personal_knowledge: bool = True,
         retain_documents_for_session: bool = False,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
         run_id: str | None = None,
         resume: bool = False,
     ) -> dict:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         if thread_id is not None:
             _validate_thread_id(thread_id)
         if use_session_documents and thread_id is None:
@@ -595,9 +605,7 @@ class FinanceAnalysisService:
         llm_client = self._require_llm_client()
         conversation_summarizer = self.conversation_summarizer or LLMConversationSummarizer(llm_client)
         memory_extractor = self.long_term_memory_extractor or (
-            LLMLongTermMemoryExtractor(llm_client)
-            if self.config.automatic_memory_consolidation_enabled
-            else None
+            LLMLongTermMemoryExtractor(llm_client) if self.config.automatic_memory_consolidation_enabled else None
         )
         skill_extractor = self.skill_extractor or (
             LLMSkillExtractor(llm_client) if self.config.automatic_skill_learning_enabled else None
@@ -647,6 +655,7 @@ class FinanceAnalysisService:
             harness.register(tool)
         harness.register(llm_task_frame_harness_tool(llm_client, network_access=True))
         harness.register(llm_planning_harness_tool(llm_client, network_access=True))
+        harness.register(llm_evidence_adequacy_harness_tool(llm_client, network_access=True))
         harness.register(llm_synthesis_harness_tool(llm_client, network_access=True))
         if self.config.bocha_search_api_key:
             harness.register(
@@ -673,7 +682,6 @@ class FinanceAnalysisService:
                 )
             )
 
-        explicit_document_entities = _normalized_entities(entities or [])
         if document_paths and self.pdf_document_parser is None:
             raise ValueError("a PaddleOCR or MCP PDF document parser is required for PDF analysis")
         if document_paths and self.pdf_parser_network_access and not network_allowed:
@@ -721,37 +729,28 @@ class FinanceAnalysisService:
         )
         document_tool_names.extend(self._mcp_planner_names("document"))
         if document_contexts:
-            corpus = InMemoryCorpus(embedding_provider=self.embedding_provider)
+            corpus = InMemoryCorpus(
+                tokenizer=self.document_tokenizer,
+                embedding_provider=self.embedding_provider,
+                minimum_vector_similarity=self.config.embedding_min_similarity,
+            )
             ingested_chunks = 0
             for document in document_contexts:
-                detected = document.get("detected_companies") or []
                 base_metadata = {
                     "file_name": document["filename"],
                     "document_title": document["filename"],
                     "document_id": document["document_id"],
                     "page_count": document["page_count"],
+                    "extraction_method": document["parser_kind"],
+                    "parser_name": document["parser_name"],
+                    "parser_version": document["parser_version"],
                 }
-                if len(detected) == 1:
-                    base_metadata["company"] = detected[0]
-                elif not detected and len(explicit_document_entities) == 1:
-                    # An explicit single entity is a user assertion about the
-                    # uploaded document's scope.  It is safer and more useful
-                    # than guessing arbitrary companies from an allowlist.
-                    base_metadata["company"] = explicit_document_entities[0]
-                for page in document.get("pages") or ():
-                    ingested_chunks += corpus.ingest(
-                        CorpusDocument.create(
-                            title=f"{document['filename']}#page={page['page_number']}",
-                            text=page["text"],
-                            metadata={
-                                **base_metadata,
-                                "source_page": page["page_number"],
-                                "span_basis": "page",
-                                "extraction_method": page["extraction_method"],
-                                "page_text_characters": page["text_characters"],
-                            },
-                        )
-                    )
+                ingested_chunks += corpus.ingest_blocks(
+                    document_id=str(document["document_id"]),
+                    title=str(document["filename"]),
+                    blocks=tuple(block for page in document.get("pages") or () for block in page.get("blocks") or ()),
+                    metadata=base_metadata,
+                )
             if not ingested_chunks:
                 raise ValueError("PDF document parser returned no extractable text")
             corpus_adapter = RetrievalEvidenceAdapter(corpus)
@@ -794,11 +793,20 @@ class FinanceAnalysisService:
             else []
         )
         if use_personal_knowledge and self.config.personal_knowledge_enabled and personal_documents:
+            vector_index_ready = bool(
+                self.embedding_provider
+                and self.personal_knowledge_store.vector_index_ready(
+                    personal_tenant,
+                    personal_user,
+                    self.embedding_provider.model_name,
+                )
+            )
             personal_client = PersonalKnowledgeClient(
                 self.personal_knowledge_store,
                 personal_tenant,
                 personal_user,
-                embedding_provider=self.embedding_provider,
+                embedding_provider=self.embedding_provider if vector_index_ready else None,
+                minimum_vector_similarity=self.config.embedding_min_similarity,
             )
             personal_adapter = RetrievalEvidenceAdapter(
                 personal_client,
@@ -815,7 +823,7 @@ class FinanceAnalysisService:
                     ),
                 )
             )
-            if self.embedding_provider is not None:
+            if self.embedding_provider is not None and vector_index_ready:
                 harness.register(
                     retrieval_harness_tool(
                         personal_adapter,
@@ -835,10 +843,6 @@ class FinanceAnalysisService:
             else:
                 document_tool_names.append("personal.search")
 
-        # Explicit API entities remain request parameters. Natural-language entity
-        # extraction and reference resolution belong to the LLM TaskFrame.
-        requested_entities = _normalized_entities(entities or [])
-        request_thread_context = dict(thread_context)
         market_client = MarketDataClient(
             provider=self.config.market_data_provider,
             alphavantage_api_key=self.config.alphavantage_api_key,
@@ -858,13 +862,6 @@ class FinanceAnalysisService:
             )
         )
 
-        resolved_symbols: dict[str, str] = {}
-        for entity in requested_entities:
-            candidate = (symbols or {}).get(entity) or DEFAULT_TICKER_MAP.get(entity)
-            if candidate:
-                resolved_symbols[entity] = str(candidate).strip()
-            elif re.fullmatch(r"[A-Za-z0-9.^=_:-]{1,32}", entity):
-                resolved_symbols[entity] = entity
         if self.config.sec_user_agent:
             sec_client = SECCompanyFactsClient(self.config.sec_user_agent)
             harness.register(sec_company_facts_harness_tool(SECCompanyFactsAdapter(sec_client)))
@@ -883,37 +880,32 @@ class FinanceAnalysisService:
                 )
             )
 
-        document_research_required = (
-            bool(document_contexts)
-            or require_documents is True
-            or (bool(document_tool_names) and require_documents is None and _requests_document_research(query))
-        )
-        request = ResearchRequest(
-            query=query,
-            entities=requested_entities,
-            symbols=resolved_symbols,
+        turn = ChatTurn(
+            message=query,
             tenant_id=tenant_id,
             user_id=user_id,
             thread_id=actual_thread_id,
             run_id=actual_run_id,
             allow_network=network_allowed,
+            attachments=tuple(
+                ChatAttachment(
+                    document_id=str(document["document_id"]),
+                    title=str(document["filename"]),
+                )
+                for document in current_document_contexts
+            ),
+        )
+        runtime_policy = RuntimePolicy(
             max_iterations=6,
-            max_model_calls=8,
+            max_model_calls=12,
             max_model_input_tokens=self.config.model_input_token_budget,
             max_model_output_tokens=self.config.model_output_token_budget,
             max_parallel_tool_calls=4,
-            require_documents=document_research_required,
-            require_market_data=require_market_data,
-            require_market_history=require_market_history,
-            require_regulatory_data=require_regulatory_data,
-            market_history_range=market_history_range,
-            market_history_interval=market_history_interval,
-            macro_series=tuple(macro_series or ()),
-            calculations=tuple(dict(item) for item in (calculations or ())),
-            thread_context=request_thread_context,
+        )
+        agent_context = AgentContext(
+            thread_context=dict(thread_context),
             personal_context=personal_context,
             skill_index=skill_index,
-            available_document_count=len(document_contexts) + len(personal_documents),
         )
         if self.config.conversation_memory_enabled:
             self.memory_store.append_conversation_event(
@@ -922,16 +914,19 @@ class FinanceAnalysisService:
                 kind=ConversationEventKind.USER_MESSAGE,
                 content=query,
                 run_id=actual_run_id,
-                entities=requested_entities,
-                payload={"entity_symbols": resolved_symbols},
+                entities=(),
+                payload={},
             )
         agent_failure: Exception | None = None
+        run_entities: tuple[str, ...] = ()
         try:
             outcome = FinancialResearchAgent(
                 harness,
                 planner=ModelPlanner(
                     harness,
-                    max_evidence_chars=self.config.planning_evidence_characters,
+                    max_evidence_tokens=self.config.planning_evidence_tokens,
+                    max_context_tokens=self.config.model_input_token_budget,
+                    count_tokens=self.document_tokenizer.count_tokens,
                     mcp_tool_index=self._mcp_tool_index(),
                     tool_usage_context=tool_usage_context,
                     learned_skills=learned_skills,
@@ -939,13 +934,30 @@ class FinanceAnalysisService:
                 synthesizer=EvidenceBoundLLMSynthesizer(
                     llm_client,
                     harness=harness,
-                    max_evidence_chars=self.config.synthesis_evidence_characters,
+                    max_evidence_tokens=self.config.synthesis_evidence_tokens,
+                    max_context_tokens=self.config.model_input_token_budget,
+                    count_tokens=self.document_tokenizer.count_tokens,
                     max_output_tokens=self.config.synthesis_output_tokens,
                 ),
+                adequacy_checker=LLMEvidenceAdequacyChecker(
+                    harness,
+                    max_evidence_tokens=self.config.planning_evidence_tokens,
+                    max_context_tokens=self.config.model_input_token_budget,
+                    count_tokens=self.document_tokenizer.count_tokens,
+                ),
                 checkpointer=self._open_graph_checkpointer(),
-                task_interpreter=LLMTaskInterpreter(harness),
+                task_interpreter=LLMTaskInterpreter(
+                    harness,
+                    max_context_tokens=self.config.model_input_token_budget,
+                    count_tokens=self.document_tokenizer.count_tokens,
+                ),
                 planner_hidden_tool_names=frozenset(tool.spec.name for tool in self.mcp_tools),
-            ).run(request, resume=resume)
+            ).run(turn, runtime_policy, agent_context, resume=resume)
+            run_entities = tuple(
+                str(item.get("name"))
+                for item in (outcome.state.task_frame or {}).get("entities") or ()
+                if item.get("name")
+            )
         except Exception as exc:
             agent_failure = exc
             raise
@@ -961,7 +973,7 @@ class FinanceAnalysisService:
                         content=f"{audit['tool_name']}: {audit['result_status']}",
                         occurred_at=str(audit["timestamp"]),
                         run_id=actual_run_id,
-                        entities=requested_entities,
+                        entities=run_entities,
                         payload={
                             key: audit.get(key)
                             for key in (
@@ -1015,6 +1027,7 @@ class FinanceAnalysisService:
             result.get("budget_usage") or {},
         )
         assistant_reply = _assistant_reply(result)
+        bundle = result["bundle"]
         self.memory_store.append_run_log(
             conversation_namespace,
             run_id=actual_run_id,
@@ -1024,14 +1037,14 @@ class FinanceAnalysisService:
             details={
                 "status": result["status"],
                 "stop_reason": result.get("stop_reason"),
-                "claim_count": len(result.get("claims") or ()),
-                "source_count": len(result.get("sources") or ()),
+                "claim_count": len(bundle["claims"]),
+                "source_count": len(bundle["sources"]),
                 "unresolved_gap_codes": [
                     str(item.get("code") or "data_gap")
                     for item in result.get("gaps") or ()
                     if not item.get("resolved", False)
                 ][:20],
-                "budget": result.get("budget"),
+                "budget": result["budget_usage"],
             },
         )
         if self.config.conversation_memory_enabled:
@@ -1058,11 +1071,11 @@ class FinanceAnalysisService:
                 kind=ConversationEventKind.ASSISTANT_MESSAGE,
                 content=assistant_reply,
                 run_id=actual_run_id,
-                entities=requested_entities,
+                entities=run_entities,
                 payload={
                     "status": result["status"],
-                    "claim_count": len(result.get("claims") or ()),
-                    "source_count": len(result.get("sources") or ()),
+                    "claim_count": len(bundle["claims"]),
+                    "source_count": len(bundle["sources"]),
                     "gap_codes": [
                         str(item.get("code") or "data_gap")
                         for item in result.get("gaps") or ()
@@ -1088,7 +1101,7 @@ class FinanceAnalysisService:
                         content=fact.text,
                         run_id=actual_run_id,
                         entities=fact.entities,
-                        payload={"source_event_ids": list(fact.source_event_ids), "status": fact.status},
+                        payload={"source_event_ids": list(fact.source_event_ids)},
                     )
                 self.memory_store.append_run_log(
                     conversation_namespace,
@@ -1111,8 +1124,9 @@ class FinanceAnalysisService:
                 build_conversation_window(
                     self.memory_store,
                     namespace,
-                    max_tokens=self.config.conversation_context_tokens,
+                    max_tokens=self._conversation_prompt_budget(),
                     recent_tokens=self.config.conversation_recent_tokens,
+                    atomic_fact_tokens=self.config.conversation_atomic_fact_tokens,
                     summarizer=conversation_summarizer,
                     token_counter=self.conversation_token_counter,
                 )
@@ -1288,9 +1302,10 @@ class FinanceAnalysisService:
         self,
         thread_id: str,
         *,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> list[dict]:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         _validate_thread_id(thread_id)
         documents = self._load_session_documents(tenant_id, user_id, thread_id)
         namespace = self._session_document_namespace(tenant_id, user_id, thread_id)
@@ -1314,9 +1329,10 @@ class FinanceAnalysisService:
         self,
         thread_id: str,
         *,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> int:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         _validate_thread_id(thread_id)
         namespace = self._session_document_namespace(tenant_id, user_id, thread_id)
         with self._session_documents_lock:
@@ -1333,6 +1349,12 @@ class FinanceAnalysisService:
             return None
         match = re.fullmatch(r"[0-9a-f]{8}_(.+)", path.name)
         return match.group(1) if match else path.name
+
+    def _resolve_principal(self, tenant_id: str | None, user_id: str | None) -> tuple[str, str]:
+        return (
+            tenant_id if tenant_id is not None else self.config.local_tenant_id,
+            user_id if user_id is not None else self.config.local_user_id,
+        )
 
     def _conversation_namespace(self, tenant_id: str, user_id: str, thread_id: str) -> MemoryNamespace:
         return MemoryNamespace(
@@ -1372,19 +1394,29 @@ class FinanceAnalysisService:
         return build_conversation_window(
             self.memory_store,
             self._conversation_namespace(tenant_id, user_id, thread_id),
-            max_tokens=self.config.conversation_context_tokens,
+            max_tokens=self._conversation_prompt_budget(),
             recent_tokens=self.config.conversation_recent_tokens,
+            atomic_fact_tokens=self.config.conversation_atomic_fact_tokens,
             summarizer=summarizer,
             token_counter=self.conversation_token_counter,
         )
+
+    def _conversation_prompt_budget(self) -> int:
+        available = (
+            self.config.model_input_token_budget
+            - max(self.config.planning_evidence_tokens, self.config.synthesis_evidence_tokens)
+            - self.config.context_control_reserve_tokens
+        )
+        return min(self.config.conversation_context_tokens, available)
 
     def delete_conversation(
         self,
         thread_id: str,
         *,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> dict[str, int]:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         _validate_thread_id(thread_id)
         namespace = self._conversation_namespace(tenant_id, user_id, thread_id)
         run_ids = self.memory_store.conversation_run_ids(namespace)
@@ -1399,7 +1431,12 @@ class FinanceAnalysisService:
             for stored_run_id in run_ids:
                 checkpoint_thread_id = stable_id(
                     "run",
-                    {"tenant_id": tenant_id, "thread_id": thread_id, "run_id": stored_run_id},
+                    {
+                        "tenant_id": tenant_id,
+                        "user_id": user_id,
+                        "thread_id": thread_id,
+                        "run_id": stored_run_id,
+                    },
                 )
                 checkpointer.delete_thread(checkpoint_thread_id)
         finally:
@@ -1411,9 +1448,10 @@ class FinanceAnalysisService:
         thread_id: str,
         run_id: str,
         *,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> list[dict]:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         _validate_thread_id(thread_id)
         return [
             event.to_dict()
@@ -1429,9 +1467,10 @@ class FinanceAnalysisService:
         *,
         after_sequence: int = 0,
         limit: int = 200,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> list[dict]:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         _validate_thread_id(thread_id)
         events = self.memory_store.list_conversation_messages(
             self._conversation_namespace(tenant_id, user_id, thread_id),
@@ -1455,9 +1494,10 @@ class FinanceAnalysisService:
         self,
         *,
         limit: int = 100,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> list[dict[str, str]]:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         tenant_key, user_key = _personal_principal_ids(tenant_id, user_id)
         return self.memory_store.list_conversation_threads(tenant_key, user_key, limit=limit)
 
@@ -1466,9 +1506,10 @@ class FinanceAnalysisService:
         thread_id: str,
         *,
         limit: int = 100,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> list[dict]:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         _validate_thread_id(thread_id)
         return self.memory_store.list_conversation_runs(
             self._conversation_namespace(tenant_id, user_id, thread_id),
@@ -1480,9 +1521,10 @@ class FinanceAnalysisService:
         thread_id: str,
         run_id: str,
         *,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> dict | None:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         _validate_thread_id(thread_id)
         return self.memory_store.get_conversation_run(
             self._conversation_namespace(tenant_id, user_id, thread_id),
@@ -1512,9 +1554,10 @@ class FinanceAnalysisService:
     def list_learned_skills(
         self,
         *,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> list[dict]:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         return [
             {
                 "skill_id": record.key,
@@ -1529,9 +1572,10 @@ class FinanceAnalysisService:
         self,
         skill_id: str,
         *,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> bool:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         return self.memory_store.delete(self._learned_skill_namespace(tenant_id, user_id), skill_id)
 
     def _save_learned_skill(
@@ -1565,9 +1609,10 @@ class FinanceAnalysisService:
         title: str,
         content: str,
         tags: Sequence[str] = (),
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> dict:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         if not self.config.personal_memory_enabled:
             raise ValueError("personal memory is disabled")
         memory = PersonalMemory(kind=kind, title=title, content=content, tags=tuple(tags))
@@ -1605,9 +1650,10 @@ class FinanceAnalysisService:
         self,
         *,
         kind: PersonalMemoryKind | None = None,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> list[dict]:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         records = self.memory_store.list(self._personal_memory_namespace(tenant_id, user_id), limit=500)
         result = []
         for record in records:
@@ -1628,9 +1674,10 @@ class FinanceAnalysisService:
         self,
         memory_id: str,
         *,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> bool:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         return self.memory_store.delete(self._personal_memory_namespace(tenant_id, user_id), memory_id)
 
     def _personal_memory_context(self, tenant_id: str, user_id: str) -> tuple[dict, ...]:
@@ -1736,10 +1783,7 @@ class FinanceAnalysisService:
             value = PersonalMemory.from_dict(
                 {key: matched[key] for key in ("kind", "title", "content", "tags")}
             ).to_dict()
-            if (
-                candidate.explicitness == "explicit"
-                and candidate.operation == "update"
-            ):
+            if candidate.explicitness == "explicit" and candidate.operation == "update":
                 value = PersonalMemory(
                     candidate.kind,
                     candidate.title,
@@ -1885,9 +1929,10 @@ class FinanceAnalysisService:
         document_paths: Sequence[str],
         *,
         allow_network: bool = False,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> list[dict]:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         if not self.config.personal_knowledge_enabled:
             raise ValueError("personal knowledge is disabled")
         if not 1 <= len(document_paths) <= self.config.max_upload_files:
@@ -1925,19 +1970,37 @@ class FinanceAnalysisService:
     def list_personal_documents(
         self,
         *,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> list[dict]:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         tenant_key, user_key = _personal_principal_ids(tenant_id, user_id)
         return self.personal_knowledge_store.list_documents(tenant_key, user_key)
+
+    def reindex_personal_documents(
+        self,
+        *,
+        tenant_id: str | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, int | str]:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
+        if self.embedding_provider is None:
+            raise ValueError("an embedding provider is required to rebuild the personal vector index")
+        tenant_key, user_key = _personal_principal_ids(tenant_id, user_id)
+        return self.personal_knowledge_store.reindex_documents(
+            tenant_key,
+            user_key,
+            self.embedding_provider,
+        )
 
     def delete_personal_document(
         self,
         document_id: str,
         *,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> bool:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         tenant_key, user_key = _personal_principal_ids(tenant_id, user_id)
         return self.personal_knowledge_store.delete_document(tenant_key, user_key, document_id)
 
@@ -1950,14 +2013,15 @@ class FinanceAnalysisService:
         document_paths: list[str] | None = None,
         cleanup_documents: bool = False,
         idempotency_key: str | None = None,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
         allow_network: bool = False,
         use_session_documents: bool = False,
         use_personal_memory: bool = True,
         use_personal_knowledge: bool = True,
         retain_documents_for_session: bool = False,
     ) -> dict:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         actual_thread_id = thread_id or f"run-{uuid4().hex[:8]}"
         job_id = f"job-{uuid4().hex[:10]}"
         key = idempotency_key or job_id
@@ -2027,6 +2091,7 @@ class FinanceAnalysisService:
                 use_personal_knowledge=payload.get("use_personal_knowledge", True),
                 retain_documents_for_session=payload.get("retain_documents_for_session", False),
                 resume=payload["attempt_count"] > 1,
+                finalize_status=False,
             )
         except Exception as exc:
             heartbeat_stop.set()
@@ -2040,6 +2105,7 @@ class FinanceAnalysisService:
         heartbeat.join(timeout=1)
         if not queue.complete(payload["job_id"], payload["lease_token"]):
             raise RuntimeError("analysis completed after its job lease expired")
+        self.repository.update_job_status(job_id=payload["job_id"], status="completed")
         if payload.get("cleanup_documents"):
             for document_path in payload.get("document_paths") or []:
                 Path(document_path).unlink(missing_ok=True)
@@ -2053,16 +2119,18 @@ class FinanceAnalysisService:
         export_artifacts: bool = True,
         document_paths: list[str] | None = None,
         *,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
         allow_network: bool = False,
         use_session_documents: bool = False,
         use_personal_memory: bool = True,
         use_personal_knowledge: bool = True,
         retain_documents_for_session: bool = False,
         resume: bool = False,
+        finalize_status: bool = True,
     ) -> None:
-        existing = self.repository.get_job(job_id)
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
+        existing = self.repository.get_job_for_principal(job_id, tenant_id, user_id)
         if existing is None:
             raise ValueError("analysis job does not exist")
         self.repository.update_job_status(job_id=job_id, status="running")
@@ -2103,7 +2171,7 @@ class FinanceAnalysisService:
                 )
             self.repository.update_job_status(
                 job_id=job_id,
-                status="completed",
+                status="completed" if finalize_status else "running",
                 llm_backend=response["llm_backend"],
                 result=response["result"],
                 artifacts=response["artifacts"],
@@ -2124,18 +2192,20 @@ class FinanceAnalysisService:
         self,
         job_id: str,
         *,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> dict | None:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         return self.repository.get_job_for_principal(job_id, tenant_id, user_id)
 
     def cancel_job(
         self,
         job_id: str,
         *,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> str | None:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         from .queueing import ReliableJobQueue
 
         if self.repository.get_job_for_principal(job_id, tenant_id, user_id) is None:
@@ -2146,9 +2216,10 @@ class FinanceAnalysisService:
         self,
         limit: int = 20,
         *,
-        tenant_id: str = "default",
-        user_id: str = "anonymous",
+        tenant_id: str | None = None,
+        user_id: str | None = None,
     ) -> list[dict]:
+        tenant_id, user_id = self._resolve_principal(tenant_id, user_id)
         return self.repository.list_jobs(tenant_id, user_id, limit=limit)
 
     def run_retention(self, *, now: datetime | None = None) -> dict[str, int]:
@@ -2203,10 +2274,6 @@ def _validate_thread_id(thread_id: str) -> None:
         raise ValueError("thread_id is invalid")
 
 
-def _normalized_entities(values: Sequence[object]) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(text for item in values if (text := str(item).strip()) and len(text) <= 200))[:50]
-
-
 def _assistant_reply(result: dict) -> str:
     if result.get("status") == "needs_clarification":
         return str(result["report"]).strip()
@@ -2216,36 +2283,6 @@ def _assistant_reply(result: dict) -> str:
         if str(item.get("text") or "").strip()
     ]
     return "\n\n".join(claims) if claims else str(result["report"]).strip()
-
-
-def _requests_document_research(query: str) -> bool:
-    normalized = f" {query.casefold()} "
-    return any(
-        marker in normalized
-        for marker in (
-            " document ",
-            " report ",
-            " filing text ",
-            " internal ",
-            " knowledge base ",
-            " news ",
-            " web search ",
-            " search for ",
-            " source material ",
-            "文档",
-            "报告",
-            "财报原文",
-            "内部资料",
-            "外部资料",
-            "知识库",
-            "新闻",
-            "网页",
-            "联网搜索",
-            "检索",
-            "搜索",
-            "查找资料",
-        )
-    )
 
 
 def _memory_terms(text: str) -> set[str]:

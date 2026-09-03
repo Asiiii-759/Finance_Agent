@@ -4,9 +4,9 @@ import math
 import statistics
 import unittest
 
-from llm_fixtures import llm_backed_agent, llm_research_request
+from llm_fixtures import agent_run_input, llm_backed_agent
 
-from mas_finance.agent import CoverageAssessor, ResearchRequest
+from mas_finance.agent import AgentContext, ChatTurn, CoverageAssessor
 from mas_finance.context import FinancialContextAssembler
 from mas_finance.contracts import Evidence, EvidenceBundle, SourceRef, SourceType
 from mas_finance.harness import ToolHarness
@@ -159,11 +159,8 @@ class MetricToolTests(unittest.TestCase):
         harness = ToolHarness()
         harness.register(financial_calculation_harness_tool())
         outcome = llm_backed_agent(harness).run(
-            llm_research_request(
+            *agent_run_input(
                 query="计算 CAGR，beginning=100, ending=150, years=3",
-                require_documents=False,
-                require_market_data=False,
-                require_regulatory_data=False,
                 run_id="natural-cagr",
             )
         )
@@ -177,11 +174,8 @@ class MetricToolTests(unittest.TestCase):
 class AdaptiveScopeTests(unittest.TestCase):
     def test_finance_definition_answers_without_curated_knowledge_tool(self) -> None:
         outcome = llm_backed_agent(ToolHarness()).run(
-            llm_research_request(
+            *agent_run_input(
                 query="什么是市盈率，应该如何理解？",
-                require_documents=False,
-                require_market_data=False,
-                require_regulatory_data=False,
                 run_id="pe-concept",
             )
         )
@@ -271,6 +265,41 @@ class DataAdapterTests(unittest.TestCase):
 
 
 class ContextAndMemoryTests(unittest.TestCase):
+    def test_calculation_coverage_uses_canonical_operation_not_display_label(self) -> None:
+        bundle = EvidenceBundle()
+        source = SourceRef.create(
+            source_type=SourceType.CALCULATION,
+            title="Calculated metric: annual growth",
+            locator="formula://cagr/v1/request-1",
+            provider="test",
+            metadata={
+                "request_id": "request-1",
+                "operation": "cagr",
+                "input_evidence_ids": ["input-1"],
+            },
+        )
+        bundle.add_evidence(
+            Evidence.create(
+                source=source,
+                content="annual growth = 0.1447",
+                field_name="annual growth",
+                value=0.1447,
+                tags=("calculation", "cagr", "request-1"),
+            )
+        )
+        scope = ResearchScope(
+            intents=(FinancialIntent.CALCULATION,),
+            requirements=(
+                ResearchRequirement(
+                    "calculation:query:1",
+                    "calculation",
+                    "Calculate CAGR.",
+                    fields=("CAGR",),
+                ),
+            ),
+        )
+        self.assertTrue(CoverageAssessor().assess(ChatTurn(message="计算 CAGR"), bundle, scope).complete)
+
     def test_multi_document_intent_requires_at_least_two_documents_but_focused_question_does_not(self) -> None:
         bundle = EvidenceBundle()
         first_source = SourceRef.create(
@@ -281,15 +310,26 @@ class ContextAndMemoryTests(unittest.TestCase):
             metadata={"document_id": "first"},
         )
         bundle.add_evidence(Evidence.create(source=first_source, content="ACME covenant headroom is 20%."))
-        focused = ResearchRequest(query="根据文档回答 covenant headroom 是多少？")
-        scope = ResearchScope(
+        focused = ChatTurn(message="根据文档回答 covenant headroom 是多少？")
+        focused_scope = ResearchScope(
             intents=(FinancialIntent.DOCUMENT_RESEARCH,),
             requirements=(ResearchRequirement("document:query:1", "document", "Search supplied documents."),),
         )
-        self.assertTrue(CoverageAssessor().assess(focused, bundle, scope).complete)
+        self.assertTrue(CoverageAssessor().assess(focused, bundle, focused_scope).complete)
 
-        comparison = ResearchRequest(query="对比这些 PDF 的 covenant 风险。", available_document_count=2)
-        self.assertFalse(CoverageAssessor().assess(comparison, bundle, scope).complete)
+        comparison = ChatTurn(message="对比这些 PDF 的 covenant 风险。")
+        comparison_scope = ResearchScope(
+            intents=(FinancialIntent.DOCUMENT_RESEARCH,),
+            requirements=(
+                ResearchRequirement(
+                    "document:query:1",
+                    "document",
+                    "Compare supplied documents.",
+                    parameters={"minimum_documents": 2},
+                ),
+            ),
+        )
+        self.assertFalse(CoverageAssessor().assess(comparison, bundle, comparison_scope).complete)
         second_source = SourceRef.create(
             source_type=SourceType.DOCUMENT,
             title="second.pdf",
@@ -298,7 +338,7 @@ class ContextAndMemoryTests(unittest.TestCase):
             metadata={"document_id": "second"},
         )
         bundle.add_evidence(Evidence.create(source=second_source, content="ACME covenant risk increased."))
-        self.assertTrue(CoverageAssessor().assess(comparison, bundle, scope).complete)
+        self.assertTrue(CoverageAssessor().assess(comparison, bundle, comparison_scope).complete)
 
     def test_context_balances_documents_not_only_entities(self) -> None:
         bundle = EvidenceBundle()
@@ -321,9 +361,9 @@ class ContextAndMemoryTests(unittest.TestCase):
                 )
             )
         payload, manifest = FinancialContextAssembler(
-            max_evidence_chars=1_400,
-            max_item_chars=400,
-        ).build(ResearchRequest(query="ACME liquidity", require_documents=False), bundle)
+            max_evidence_tokens=1_400,
+            count_tokens=len,
+        ).build(ChatTurn(message="ACME liquidity"), AgentContext(), bundle)
         locators = {item["source"]["locator"].split(".pdf", maxsplit=1)[0] for item in payload["evidence"]}
         self.assertEqual(locators, {"document-a", "document-b"})
         self.assertEqual(len(manifest.groups), 2)
@@ -344,23 +384,40 @@ class ContextAndMemoryTests(unittest.TestCase):
                     entity=entity,
                 )
             )
-        request = ResearchRequest(
-            query="Compare Alpha and Beta",
-            entities=("Alpha", "Beta"),
-            require_documents=False,
+        turn = ChatTurn(message="Compare Alpha and Beta")
+        agent_context = AgentContext(
             thread_context={
                 "manifest": {"memory_is_evidence": False},
                 "forbidden": "drop me",
             },
         )
         payload, manifest = FinancialContextAssembler(
-            max_evidence_chars=1_600,
-            max_item_chars=500,
-        ).build(request, bundle)
+            max_evidence_tokens=1_600,
+            count_tokens=len,
+        ).build(turn, agent_context, bundle)
         self.assertEqual({item["entity"] for item in payload["evidence"]}, {"Alpha", "Beta"})
         self.assertTrue(all("provider" in item["source"] for item in payload["evidence"]))
         self.assertNotIn("forbidden", payload["thread_context"])
         self.assertEqual(manifest.omitted_evidence_count, 0)
+
+    def test_context_keeps_complete_retrieved_passage_without_per_item_character_window(self) -> None:
+        content = "prefix " + ("long financial passage " * 200) + "semantic conclusion at the end"
+        source = SourceRef.create(
+            source_type=SourceType.DOCUMENT,
+            title="Long report",
+            locator="long.pdf#page=1",
+            provider="test",
+        )
+        bundle = EvidenceBundle()
+        bundle.add_evidence(Evidence.create(source=source, content=content))
+
+        payload, _manifest = FinancialContextAssembler(
+            max_evidence_tokens=10_000,
+            count_tokens=len,
+        ).build(ChatTurn(message="What is the conclusion?"), AgentContext(), bundle)
+
+        self.assertEqual(payload["evidence"][0]["content"], content)
+        self.assertTrue(payload["evidence"][0]["content"].endswith("semantic conclusion at the end"))
 
 
 if __name__ == "__main__":

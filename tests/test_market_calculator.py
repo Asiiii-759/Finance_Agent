@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import unittest
 
-from mas_finance.agent import DeterministicSynthesizer, ResearchRequest, reconcile_conflicts
+import httpx
+
+from mas_finance.agent import reconcile_conflicts
 from mas_finance.calculator import CalculationError, calculate_ratio, derive_standard_ratios
 from mas_finance.contracts import Evidence, EvidenceBundle, SourceRef, SourceType
 from mas_finance.market import MarketEvidenceAdapter
 from mas_finance.market_data import MarketDataClient
+from mas_finance.mcp_servers.market import ExternalMarketClient, _tools
+from mas_finance.metrics import financial_calculation_harness_tool
 
 
 class FakeMarketClient:
@@ -25,6 +29,32 @@ class FakeMarketClient:
 
 
 class MarketAdapterTests(unittest.TestCase):
+    def test_external_market_mcp_requires_explicit_symbol_and_propagates_network_failure(self) -> None:
+        schemas = {tool["name"]: tool["inputSchema"] for tool in _tools()}
+        self.assertEqual(schemas["snapshot"]["required"], ["company", "symbol"])
+        self.assertEqual(schemas["history"]["required"], ["company", "symbol"])
+
+        client = ExternalMarketClient(
+            alltick_token="configured",
+            transport=httpx.MockTransport(
+                lambda request: (_ for _ in ()).throw(httpx.ConnectError("offline", request=request))
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "explicit market symbol"):
+            client.fetch_company_snapshot("ACME")
+        with self.assertRaises(httpx.ConnectError):
+            client.fetch_company_snapshot("ACME", "ACME")
+
+    def test_calculation_tool_exposes_operation_specific_nested_schema(self) -> None:
+        schema = financial_calculation_harness_tool().spec.input_schema
+        self.assertIsNotNone(schema)
+        variants = schema["properties"]["requests"]["items"]["oneOf"]
+        cagr = next(item for item in variants if item["properties"]["operation"]["const"] == "cagr")
+        self.assertEqual(
+            cagr["properties"]["inputs"]["required"],
+            ["beginning_value", "ending_value", "years"],
+        )
+
     def test_alphavantage_configuration_never_silently_falls_back_to_yahoo(self) -> None:
         class SpyClient(MarketDataClient):
             yahoo_called = False
@@ -49,14 +79,10 @@ class MarketAdapterTests(unittest.TestCase):
                 raise ConnectionError("provider unavailable")
 
         failed = FailingAlphaVantage(provider="alphavantage", alphavantage_api_key="configured")
-        self.assertEqual(
-            failed.fetch_company_snapshot("ACME", "ACME")["error_codes"],
-            ["ConnectionError"],
-        )
-        self.assertEqual(
-            failed.fetch_price_history("ACME", "ACME")["error_codes"],
-            ["ConnectionError"],
-        )
+        with self.assertRaises(ConnectionError):
+            failed.fetch_company_snapshot("ACME", "ACME")
+        with self.assertRaises(ConnectionError):
+            failed.fetch_price_history("ACME", "ACME")
         self.assertFalse(failed.yahoo_called)
 
     def test_market_fields_become_individual_evidence(self) -> None:
@@ -156,8 +182,7 @@ class CalculatorTests(unittest.TestCase):
         self.make_input(bundle, "net_income", 30.0)
         self.make_input(bundle, "revenue", 100.0)
         self.assertEqual(derive_standard_ratios(bundle), [])
-        claims = DeterministicSynthesizer().synthesize(ResearchRequest(query="margin"), bundle)
-        reconciled = reconcile_conflicts(bundle, claims)
+        reconciled = reconcile_conflicts(bundle, ())
         conflict = next(claim for claim in reconciled if claim.status.value == "conflicted")
         self.assertEqual(len(conflict.evidence_ids), 2)
 

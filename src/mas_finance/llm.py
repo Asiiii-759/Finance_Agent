@@ -102,25 +102,30 @@ class DeepSeekChatClient(BaseLLMClient):
             # output budget without producing final content.
             "thinking": {"type": "disabled"},
         }
-        with (
-            httpx.Client(
-                timeout=self.settings.timeout_seconds,
-                follow_redirects=False,
-                transport=self.transport,
-            ) as client,
-            client.stream("POST", url, headers=headers, json=payload) as response,
-        ):
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "").casefold()
-            if content_type and "json" not in content_type:
-                raise ValueError("DeepSeek response must use a JSON content type")
-            chunks: list[bytes] = []
-            total = 0
-            for chunk in response.iter_bytes():
-                total += len(chunk)
-                if total > 2_000_000:
-                    raise ValueError("DeepSeek response exceeds the byte limit")
-                chunks.append(chunk)
+        try:
+            with (
+                httpx.Client(
+                    timeout=self.settings.timeout_seconds,
+                    follow_redirects=False,
+                    transport=self.transport,
+                ) as client,
+                client.stream("POST", url, headers=headers, json=payload) as response,
+            ):
+                if response.status_code == 429 or response.status_code >= 500:
+                    raise ConnectionError(f"DeepSeek transient HTTP status: {response.status_code}")
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "").casefold()
+                if content_type and "json" not in content_type:
+                    raise ValueError("DeepSeek response must use a JSON content type")
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > 2_000_000:
+                        raise ValueError("DeepSeek response exceeds the byte limit")
+                    chunks.append(chunk)
+        except httpx.TransportError as exc:
+            raise ConnectionError("DeepSeek transport failed") from exc
         try:
             data = json.loads(b"".join(chunks), parse_constant=_reject_json_constant)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:

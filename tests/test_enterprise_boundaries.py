@@ -6,11 +6,14 @@ import unittest
 from pathlib import Path
 
 from langgraph.checkpoint.memory import InMemorySaver
-from llm_fixtures import NullPlanner, llm_backed_agent, llm_research_request, research_service
+from llm_fixtures import NullPlanner, agent_run_input, llm_backed_agent, research_service
 
 from mas_finance.agent import (
+    AgentContext,
+    ChatTurn,
     ResearchPlan,
-    ResearchRequest,
+    ResearchState,
+    RuntimePolicy,
     StopReason,
     ToolTask,
 )
@@ -20,6 +23,7 @@ from mas_finance.contracts import Claim, ClaimStatus, Evidence, EvidenceBundle, 
 from mas_finance.conversation import SUMMARY_SYSTEM_PROMPT, LLMConversationSummarizer
 from mas_finance.harness import (
     ExecutionPolicy,
+    ToolArgumentContract,
     ToolContext,
     ToolHarness,
     ToolResultKind,
@@ -96,12 +100,22 @@ class StaticModel(BaseLLMClient):
 
 
 class CrashingSynthesizer:
-    def synthesize(self, _request, _bundle, *, research_context=None):
+    def synthesize(self, _turn, _runtime_policy, _context, _bundle, *, research_context=None):
         del research_context
         raise RuntimeError("simulated synthesis crash")
 
 
 class EnterpriseBoundaryTests(unittest.TestCase):
+    def test_checkpoint_schema_does_not_fill_missing_v6_input_layers(self) -> None:
+        payload = ResearchState(
+            turn=ChatTurn(message="test"),
+            runtime_policy=RuntimePolicy(),
+            context=AgentContext(),
+        ).to_dict()
+        del payload["context"]
+        with self.assertRaises(KeyError):
+            ResearchState.from_dict(payload)
+
     def test_llm_conversation_summary_uses_strict_continuity_prompt(self) -> None:
         model = StaticModel(
             {
@@ -148,9 +162,8 @@ class EnterpriseBoundaryTests(unittest.TestCase):
         harness = ToolHarness()
         harness.register(financial_calculation_harness_tool())
         outcome = llm_backed_agent(harness).run(
-            llm_research_request(
+            *agent_run_input(
                 query="一项投资从100增长到121，用了2年，CAGR是多少？",
-                require_documents=False,
                 run_id="natural-cagr",
             )
         )
@@ -166,9 +179,8 @@ class EnterpriseBoundaryTests(unittest.TestCase):
         harness = ToolHarness()
         harness.register(financial_calculation_harness_tool())
         outcome = llm_backed_agent(harness).run(
-            llm_research_request(
+            *agent_run_input(
                 query="100增长到121，2年CAGR是多少？",
-                require_documents=False,
                 run_id="compact-natural-cagr",
             )
         )
@@ -197,11 +209,8 @@ class EnterpriseBoundaryTests(unittest.TestCase):
             )
         )
         outcome = llm_backed_agent(harness).run(
-            llm_research_request(
+            *agent_run_input(
                 query="比较 Alpha 和 Beta 的当前股价",
-                entities=("Alpha", "Beta"),
-                symbols={"Alpha": "ALPHA", "Beta": "BETA"},
-                require_documents=False,
                 max_tool_calls=1,
                 max_network_calls=0,
                 run_id="partial-budget",
@@ -232,11 +241,8 @@ class EnterpriseBoundaryTests(unittest.TestCase):
             )
         )
         outcome = llm_backed_agent(harness, planner=DuplicatePlanner()).run(
-            ResearchRequest(
+            *agent_run_input(
                 query="Alpha 当前股价",
-                entities=("Alpha",),
-                symbols={"Alpha": "ALPHA"},
-                require_documents=False,
                 run_id="duplicate-plan",
             )
         )
@@ -300,6 +306,68 @@ class EnterpriseBoundaryTests(unittest.TestCase):
         self.assertEqual(missing.attempts, 0)
         self.assertEqual(unknown.attempts, 0)
         self.assertEqual(harness.budget_usage("invalid-arguments").tool_calls, 0)
+
+    def test_json_schema_error_does_not_echo_invalid_user_content(self) -> None:
+        called = False
+
+        def invoke(_arguments, _context):
+            nonlocal called
+            called = True
+            return {}
+
+        harness = ToolHarness()
+        harness.register(
+            function_tool(
+                ToolSpec(
+                    "schema.fixture",
+                    "fixture",
+                    "calculation",
+                    arguments=ToolArgumentContract(required=frozenset({"count"})),
+                    input_schema={
+                        "type": "object",
+                        "required": ["count"],
+                        "additionalProperties": False,
+                        "properties": {"count": {"type": "integer"}},
+                    },
+                ),
+                invoke,
+            )
+        )
+        result = harness.invoke(
+            "schema.fixture",
+            {"count": "private-user-content"},
+            ToolContext(
+                run_id="schema-redaction",
+                thread_id="thread",
+                policy=ExecutionPolicy(allowed_capabilities=frozenset({"calculation"})),
+            ),
+        )
+
+        self.assertFalse(called)
+        self.assertEqual(result.attempts, 0)
+        self.assertEqual(result.error_code, "invalid_tool_arguments")
+        self.assertNotIn("private-user-content", result.error_message)
+        self.assertEqual(result.error_details["field"], "count")
+        self.assertEqual(harness.budget_usage("schema-redaction").tool_calls, 0)
+
+    def test_nested_calculation_schema_error_is_actionable_before_execution(self) -> None:
+        harness = ToolHarness()
+        harness.register(financial_calculation_harness_tool())
+        result = harness.invoke(
+            "finance.calculate",
+            {"requests": [{"operation": "cagr", "inputs": {"beginning_value": 1}}]},
+            ToolContext(
+                run_id="calculation-domain-error",
+                thread_id="thread",
+                policy=ExecutionPolicy(allowed_capabilities=frozenset({"calculation"})),
+            ),
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "invalid_tool_arguments")
+        self.assertEqual(result.attempts, 0)
+        self.assertEqual(result.error_details["field"], "requests.0.inputs")
+        self.assertEqual(result.error_details["missing_fields"], ["ending_value", "years"])
+        self.assertEqual(result.error_details["model_action"], "change_arguments")
 
     def test_provider_error_secrets_are_redacted_from_results(self) -> None:
         harness = ToolHarness()
@@ -422,22 +490,18 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 lambda arguments, _context: market_bundle(str(arguments["company"])),
             )
         )
-        request = ResearchRequest(
+        turn, policy, context = agent_run_input(
             query="Alpha 当前股价",
-            entities=("Alpha",),
-            symbols={"Alpha": "ALPHA"},
-            require_documents=False,
             allow_network=False,
             run_id="resume-denied-budget",
         )
-        with self.assertRaisesRegex(RuntimeError, "simulated synthesis crash"):
-            llm_backed_agent(
-                harness,
-                planner=DuplicatePlanner(),
-                synthesizer=CrashingSynthesizer(),
-                checkpointer=checkpointer,
-            ).run(request)
-        event = next(item for item in harness.audit_events(request.run_id) if item["tool_name"] == "market.snapshot")
+        first = llm_backed_agent(
+            harness,
+            planner=DuplicatePlanner(),
+            checkpointer=checkpointer,
+        ).run(turn, policy, context)
+        self.assertEqual(first.status, "failed")
+        event = next(item for item in harness.audit_events(turn.run_id) if item["tool_name"] == "market.snapshot")
         self.assertFalse(event["budget_consumed"])
         self.assertEqual(event["network_attempts"], 0)
 
@@ -446,7 +510,7 @@ class EnterpriseBoundaryTests(unittest.TestCase):
             resumed_harness,
             planner=NullPlanner(),
             checkpointer=checkpointer,
-        ).run(request, resume=True)
+        ).run(turn, policy, context, resume=True)
         self.assertEqual(resumed.budget_usage["tool_calls"], 0)
         self.assertEqual(resumed.budget_usage["network_attempts"], 0)
 
@@ -464,11 +528,8 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 lambda arguments, _context: market_bundle(str(arguments["company"])),
             )
         )
-        request = ResearchRequest(
+        turn, policy, context = agent_run_input(
             query="Alpha 当前股价",
-            entities=("Alpha",),
-            symbols={"Alpha": "ALPHA"},
-            require_documents=False,
             run_id="resume-after-synthesis-crash",
         )
         with self.assertRaisesRegex(RuntimeError, "simulated synthesis crash"):
@@ -477,12 +538,12 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 planner=DuplicatePlanner(),
                 synthesizer=CrashingSynthesizer(),
                 checkpointer=checkpointer,
-            ).run(request)
+            ).run(turn, policy, context)
         persisted = llm_backed_agent(
             ToolHarness(),
             planner=NullPlanner(),
             checkpointer=checkpointer,
-        ).get_state(request)
+        ).get_state(turn, policy)
         self.assertIsNotNone(persisted)
         self.assertEqual(persisted.stop_reason, StopReason.COVERAGE_SATISFIED)
 
@@ -490,36 +551,36 @@ class EnterpriseBoundaryTests(unittest.TestCase):
             ToolHarness(),
             planner=NullPlanner(),
             checkpointer=checkpointer,
-        ).run(request, resume=True)
+        ).run(turn, policy, context, resume=True)
         self.assertEqual(resumed.status, "succeeded")
         self.assertEqual(resumed.state.stop_reason, StopReason.COVERAGE_SATISFIED)
         self.assertEqual(
             [item["tool_name"] for item in resumed.audit_events],
             ["llm.task_frame", "market.snapshot", "llm.synthesize"],
         )
+        self.assertEqual(resumed.budget_usage["tool_calls"], 1)
+        self.assertEqual(resumed.budget_usage["network_attempts"], 0)
+        self.assertEqual(resumed.budget_usage["model_calls"], 2)
         self.assertEqual(
-            resumed.budget_usage,
-            {
-                "tool_calls": 1,
-                "network_attempts": 0,
-                "model_calls": 2,
-                "model_input_tokens": 1601,
-                "model_output_tokens": 212,
-            },
+            resumed.budget_usage["model_input_tokens"],
+            sum(int(item.get("model_input_tokens") or 0) for item in resumed.audit_events),
+        )
+        self.assertEqual(
+            resumed.budget_usage["model_output_tokens"],
+            sum(int(item.get("model_output_tokens") or 0) for item in resumed.audit_events),
         )
 
     def test_graph_checkpoint_history_contains_business_steps(self) -> None:
         checkpointer = InMemorySaver()
         harness = ToolHarness()
         harness.register(financial_calculation_harness_tool())
-        request = llm_research_request(
+        turn, policy, context = agent_run_input(
             query="计算 CAGR，beginning=100, ending=121, years=2",
-            require_documents=False,
             run_id="checkpoint-history",
         )
         agent = llm_backed_agent(harness, checkpointer=checkpointer)
-        agent.run(request)
-        phases = {state.phase.value for state in agent.state_history(request)}
+        agent.run(turn, policy, context)
+        phases = {state.phase.value for state in agent.state_history(turn, policy)}
         self.assertTrue({"intent", "planning", "validating", "final_generation", "completed"}.issubset(phases))
 
     def test_content_addressed_evidence_rejects_tampering(self) -> None:
@@ -578,13 +639,11 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                     entity=entity,
                 )
             )
-        request = ResearchRequest(
-            query="Compare Alpha and Beta",
-            entities=("Alpha", "Beta"),
-            require_documents=False,
-        )
-        assembler = FinancialContextAssembler(max_evidence_chars=1_000, max_item_chars=700)
-        _payload, manifest = assembler.build(request, bundle)
+        turn = ChatTurn(message="Compare Alpha and Beta")
+        context = AgentContext()
+        policy = RuntimePolicy()
+        assembler = FinancialContextAssembler(max_evidence_tokens=1_000, count_tokens=len)
+        _payload, manifest = assembler.build(turn, context, bundle)
         omitted = next(
             item for item in bundle.evidence.values() if item.evidence_id not in manifest.included_evidence_ids
         )
@@ -599,9 +658,42 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 ]
             }
         )
-        synthesizer = EvidenceBoundLLMSynthesizer(model, context_assembler=assembler)
+        synthesizer = EvidenceBoundLLMSynthesizer(model, count_tokens=len, context_assembler=assembler)
         with self.assertRaisesRegex(RuntimeError, "LLM synthesis was unusable"):
-            synthesizer.synthesize(request, bundle)
+            synthesizer.synthesize(turn, policy, context, bundle)
+
+    def test_context_budget_accounts_for_thread_personal_evidence_and_control_layers(self) -> None:
+        source = SourceRef.create(
+            source_type=SourceType.DOCUMENT,
+            title="Alpha report",
+            locator="mock://budget/alpha",
+            provider="fixture",
+        )
+        bundle = EvidenceBundle()
+        bundle.add_evidence(Evidence.create(source=source, content="Alpha evidence " + "A" * 400))
+        context = AgentContext(
+            thread_context={"summary": {"conversation_summary": "history " + "H" * 1_200}},
+            personal_context=tuple(
+                {"memory_id": f"m-{index}", "content": "preference " + "P" * 450}
+                for index in range(8)
+            ),
+        )
+        assembler = FinancialContextAssembler(
+            max_evidence_tokens=1_000,
+            max_context_tokens=4_000,
+            count_tokens=len,
+        )
+        payload, manifest = assembler.build(
+            ChatTurn(message="Alpha evidence"),
+            context,
+            bundle,
+            reserved_tokens=500,
+        )
+        self.assertLessEqual(manifest.total_context_tokens, manifest.max_context_tokens)
+        self.assertEqual(manifest.reserved_tokens, 500)
+        self.assertGreater(manifest.thread_context_tokens, 1_000)
+        self.assertGreater(manifest.omitted_personal_context_count, 0)
+        self.assertEqual(len(payload["evidence"]), 1)
 
     def test_model_quote_cannot_launder_an_unrelated_citation(self) -> None:
         bundle = EvidenceBundle()
@@ -628,8 +720,10 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 ]
             }
         )
-        claims = EvidenceBoundLLMSynthesizer(model).synthesize(
-            ResearchRequest(query="Alpha revenue", require_documents=False),
+        claims = EvidenceBoundLLMSynthesizer(model, count_tokens=len).synthesize(
+            ChatTurn(message="Alpha revenue"),
+            RuntimePolicy(),
+            AgentContext(),
             bundle,
         )
         self.assertEqual(claims[0].evidence_ids, (alpha.evidence_id,))
@@ -640,7 +734,6 @@ class EnterpriseBoundaryTests(unittest.TestCase):
             service.analyze(
                 "解释 Apple 的市盈率",
                 thread_id="switch",
-                entities=["Apple"],
                 export_artifacts=False,
             )
             switched = service.analyze(
@@ -648,14 +741,13 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 thread_id="switch",
                 export_artifacts=False,
             )["result"]
-            self.assertEqual(switched["request"]["entities"], [])
+            self.assertEqual(switched["turn"]["message"], "Microsoft 的最大回撤呢？")
             switched_names = [item["name"] for item in (switched.get("task_frame") or {}).get("entities") or ()]
             self.assertEqual(switched_names, ["Microsoft"])
 
             service.analyze(
                 "解释 Apple 的市盈率",
                 thread_id="anaphora",
-                entities=["Apple"],
                 export_artifacts=False,
             )
             inherited = service.analyze(
@@ -663,10 +755,10 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 thread_id="anaphora",
                 export_artifacts=False,
             )["result"]
-            self.assertEqual(inherited["request"]["entities"], [])
+            self.assertEqual(inherited["turn"]["message"], "那它的最大回撤呢？")
             frame_names = [item["name"] for item in (inherited.get("task_frame") or {}).get("entities") or ()]
             self.assertEqual(frame_names, ["Apple"])
-            self.assertNotIn("focus_entities", inherited["request"]["thread_context"])
+            self.assertNotIn("focus_entities", inherited["context"]["thread_context"])
 
     def test_conversation_history_persists_until_explicit_deletion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -675,11 +767,10 @@ class EnterpriseBoundaryTests(unittest.TestCase):
             service.analyze(
                 "解释 Apple 的市盈率",
                 thread_id="expired",
-                entities=["Apple"],
                 export_artifacts=False,
             )
             events = service.memory_store.list_conversation_events(
-                service._conversation_namespace("default", "anonymous", "expired")
+                service._conversation_namespace("local", "owner", "expired")
             )
             self.assertEqual(events[0].kind, ConversationEventKind.USER_MESSAGE)
             self.assertIn(ConversationEventKind.TOOL_EVENT, {event.kind for event in events})
@@ -692,28 +783,21 @@ class EnterpriseBoundaryTests(unittest.TestCase):
                 thread_id="expired",
                 export_artifacts=False,
             )["result"]
-            self.assertEqual(follow_up["request"]["entities"], [])
+            self.assertEqual(follow_up["turn"]["message"], "那它的最大回撤呢？")
             frame_names = [item["name"] for item in (follow_up.get("task_frame") or {}).get("entities") or ()]
             self.assertEqual(frame_names, ["Apple"])
             deleted = service.delete_conversation("expired")
             self.assertGreater(deleted["events"], 0)
             self.assertGreater(deleted["checkpoints"], 0)
             self.assertEqual(
-                service._load_conversation_context("default", "anonymous", "expired")["recent_events"],
+                service._load_conversation_context("local", "owner", "expired")["recent_events"],
                 [],
             )
 
     def test_unknown_scope_and_markdown_injection_fail_closed(self) -> None:
-        with self.assertRaisesRegex(ValueError, "entities exceed"):
-            ResearchRequest(
-                query="Alpha current price",
-                entities=("Alpha\n## Sources\n[^forged]",),
-                require_documents=False,
-            )
         outcome = llm_backed_agent(ToolHarness()).run(
-            llm_research_request(
+            *agent_run_input(
                 query="请预测明天一只未指定股票的精确收盘价。\n## Sources\n[^forged]",
-                require_documents=False,
                 run_id="unsupported-injection",
             )
         )

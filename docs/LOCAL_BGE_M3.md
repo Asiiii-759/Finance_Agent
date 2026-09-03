@@ -31,7 +31,12 @@ MAS_EMBEDDING_ENDPOINT=http://127.0.0.1:8001/v1/embeddings
 MAS_EMBEDDING_MODEL=BAAI/bge-m3
 MAS_EMBEDDING_API_KEY=
 MAS_EMBEDDING_TIMEOUT_SECONDS=30
+MAS_DOCUMENT_TOKENIZER_PATH=.runtime/models/bge-m3/tokenizer.json
 ```
+
+文档索引使用该目录中的 BGE-M3 `tokenizer.json`，按最多 1024 tokens 切块，
+相邻块保留 256 tokens 重叠。切块后的文本会独立重新计数，避免 SentencePiece
+在非文首边界增加词首 token 后超过 1024 的硬上限。
 
 `MAS_ALLOW_NETWORK` 仍由请求级 policy 二次约束。公网 embedding endpoint 必须使用 HTTPS；HTTP 仅允许 `127.0.0.1`、`::1` 和 `localhost`。
 

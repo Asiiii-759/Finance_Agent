@@ -241,7 +241,9 @@ class MemoryTests(unittest.TestCase):
                 connection.close()
             self.assertNotIn("relations_json", columns)
 
-    def test_conversation_window_replays_every_atomic_fact_without_top_k_clipping(self) -> None:
+    def test_conversation_window_keeps_full_atomic_ledger_but_projects_a_bounded_chronological_tail(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SQLiteMemoryStore(Path(directory) / "memory.db")
             namespace = MemoryNamespace("tenant", "user", "conversation_history", "thread")
@@ -250,9 +252,10 @@ class MemoryTests(unittest.TestCase):
                     namespace,
                     event_id=f"fact-{index}",
                     kind=ConversationEventKind.ATOMIC_FACT,
-                    content=f"原子事实 {index}。",
+                    content=f"原子事实 {index}。" + "详细记录" * 80,
                     occurred_at=f"2026-08-26T12:{index:02d}:00+08:00",
                     run_id=f"run-{index}",
+                    entities=("Alpha",) if index == 0 else (f"Entity-{index}",),
                     payload={"source_event_ids": [f"source-{index}"], "status": "completed"},
                 )
 
@@ -261,11 +264,20 @@ class MemoryTests(unittest.TestCase):
                 namespace,
                 max_tokens=16_000,
                 recent_tokens=4_000,
+                atomic_fact_tokens=4_000,
                 token_counter=CharacterTokenCounter(),
             )
-            self.assertEqual(len(context["atomic_facts"]), 25)
-            self.assertEqual(context["atomic_facts"][0]["event_id"], "fact-0")
-            self.assertEqual(context["atomic_facts"][-1]["event_id"], "fact-24")
+            projected_ids = [item["event_id"] for item in context["atomic_facts"]]
+            self.assertLess(len(projected_ids), 25)
+            self.assertNotIn("fact-0", projected_ids)
+            self.assertIn("fact-24", projected_ids)
+            self.assertEqual(projected_ids, [f"fact-{index}" for index in range(25 - len(projected_ids), 25)])
+            self.assertEqual(context["manifest"]["atomic_fact_count"], 25)
+            self.assertEqual(context["manifest"]["included_atomic_fact_count"], len(projected_ids))
+            self.assertEqual(context["manifest"]["omitted_atomic_fact_count"], 25 - len(projected_ids))
+            self.assertEqual(context["manifest"]["atomic_fact_selection"], "chronological_tail")
+            self.assertEqual(context["manifest"]["max_atomic_fact_context_tokens"], 4_000)
+            self.assertEqual(len(store.list_conversation_events(namespace)), 25)
 
     def test_memory_record_can_be_deleted_without_deleting_namespace(self) -> None:
         namespace = MemoryNamespace("tenant", "user", "personal_memory")

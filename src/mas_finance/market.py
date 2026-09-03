@@ -10,6 +10,8 @@ from datetime import date as date_type
 from hashlib import sha256
 from typing import Any, Protocol
 
+import httpx
+
 from .contracts import Evidence, EvidenceBundle, SourceRef, SourceType
 from .harness import (
     RetryPolicy,
@@ -388,12 +390,36 @@ def market_data_harness_tool(
             capability="market.read",
             network_access=network_access,
             timeout_seconds=35,
-            retry=RetryPolicy(max_attempts=1),
+            retry=RetryPolicy(
+                max_attempts=2,
+                initial_backoff_seconds=0.25,
+                retryable_exceptions=(
+                    TimeoutError,
+                    ConnectionError,
+                    httpx.TimeoutException,
+                    httpx.NetworkError,
+                ),
+            ),
             result_kind=ToolResultKind.EVIDENCE_BUNDLE,
             arguments=ToolArgumentContract(
-                required=frozenset({"company"}),
-                optional=frozenset({"symbol", "required_fields"}),
+                required=frozenset({"company", "symbol"}),
+                optional=frozenset({"required_fields"}),
             ),
+            input_schema={
+                "type": "object",
+                "required": ["company", "symbol"],
+                "additionalProperties": False,
+                "properties": {
+                    "company": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "symbol": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "required_fields": {
+                        "type": "array",
+                        "uniqueItems": True,
+                        "maxItems": len(_MARKET_FIELDS),
+                        "items": {"type": "string", "enum": sorted(_MARKET_FIELDS)},
+                    },
+                },
+            },
         ),
         invoke,
     )
@@ -421,12 +447,32 @@ def market_history_harness_tool(
             capability="market.read",
             network_access=network_access,
             timeout_seconds=35,
-            retry=RetryPolicy(max_attempts=1),
+            retry=RetryPolicy(
+                max_attempts=2,
+                initial_backoff_seconds=0.25,
+                retryable_exceptions=(
+                    TimeoutError,
+                    ConnectionError,
+                    httpx.TimeoutException,
+                    httpx.NetworkError,
+                ),
+            ),
             result_kind=ToolResultKind.EVIDENCE_BUNDLE,
             arguments=ToolArgumentContract(
-                required=frozenset({"company"}),
-                optional=frozenset({"symbol", "range", "interval"}),
+                required=frozenset({"company", "symbol"}),
+                optional=frozenset({"range", "interval"}),
             ),
+            input_schema={
+                "type": "object",
+                "required": ["company", "symbol"],
+                "additionalProperties": False,
+                "properties": {
+                    "company": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "symbol": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "range": {"type": "string", "enum": ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y"]},
+                    "interval": {"type": "string", "enum": ["1d", "1wk", "1mo"]},
+                },
+            },
         ),
         invoke,
     )

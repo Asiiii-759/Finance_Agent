@@ -81,9 +81,7 @@ class MemoryNamespace:
     thread_id: str | None = None
 
     def __post_init__(self) -> None:
-        values = (self.tenant_id, self.user_id, self.kind) + (
-            (self.thread_id,) if self.thread_id is not None else ()
-        )
+        values = (self.tenant_id, self.user_id, self.kind) + ((self.thread_id,) if self.thread_id is not None else ())
         if any(
             not isinstance(value, str)
             or not value
@@ -211,6 +209,7 @@ def build_conversation_window(
     *,
     max_tokens: int = 300_000,
     recent_tokens: int = 20_000,
+    atomic_fact_tokens: int = 32_000,
     summarizer: ConversationSummarizer | None = None,
     token_counter: TokenCounter | None = None,
 ) -> dict[str, Any]:
@@ -219,15 +218,21 @@ def build_conversation_window(
         raise ValueError("conversation context budget must be between 16000 and 300000 tokens")
     if not 4_000 <= recent_tokens <= 100_000:
         raise ValueError("recent conversation budget must be between 4000 and 100000 tokens")
+    if not 4_000 <= atomic_fact_tokens <= 100_000:
+        raise ValueError("atomic-fact context budget must be between 4000 and 100000 tokens")
     _validate_conversation_namespace(namespace)
     counter = token_counter or DeepSeekV4TokenEstimator()
 
     stored = store.get_conversation_summary(namespace)
     covered = stored.covered_through_sequence if stored is not None else 0
-    summary = deepcopy(stored.summary) if stored is not None else {
-        "semantic_summary": _empty_semantic_summary(),
-        "run_state": {},
-    }
+    summary = (
+        deepcopy(stored.summary)
+        if stored is not None
+        else {
+            "semantic_summary": _empty_semantic_summary(),
+            "run_state": {},
+        }
+    )
     all_events = store.list_conversation_events(namespace, limit=None)
     atomic_facts = [event for event in all_events if event.kind is ConversationEventKind.ATOMIC_FACT]
     pending = [
@@ -236,7 +241,28 @@ def build_conversation_window(
         if event.sequence > covered and event.kind is not ConversationEventKind.ATOMIC_FACT
     ]
 
-    projection = _conversation_projection(summary, pending, covered, atomic_facts)
+    def project(events: list[ConversationEvent], cursor: int) -> dict[str, Any]:
+        without_facts = _conversation_projection(summary, events, cursor)
+        available = max_tokens - _projection_tokens(without_facts, counter) - 1_000
+        selected_facts = _select_recent_atomic_facts(
+            atomic_facts,
+            counter=counter,
+            token_budget=max(0, min(atomic_fact_tokens, available)),
+        )
+        value = _conversation_projection(summary, events, cursor, selected_facts)
+        value["manifest"].update(
+            {
+                "atomic_fact_count": len(atomic_facts),
+                "included_atomic_fact_count": len(selected_facts),
+                "omitted_atomic_fact_count": len(atomic_facts) - len(selected_facts),
+                "atomic_fact_selection": "chronological_tail",
+                "atomic_fact_context_tokens": _events_tokens(selected_facts, counter),
+                "max_atomic_fact_context_tokens": atomic_fact_tokens,
+            }
+        )
+        return value
+
+    projection = project(pending, covered)
     projection_tokens = _projection_tokens(projection, counter)
     compacted, recent = _split_recent_runs(pending, counter, recent_tokens)
     if projection_tokens >= int(max_tokens * 0.85) and compacted:
@@ -245,7 +271,7 @@ def build_conversation_window(
         summary = _merge_conversation_summary(summary, compacted, summarizer)
         covered = compacted[-1].sequence
         pending = recent
-        projection = _conversation_projection(summary, pending, covered, atomic_facts)
+        projection = project(pending, covered)
         projection_tokens = _projection_tokens(projection, counter)
         store.put_conversation_summary(
             namespace,
@@ -465,9 +491,7 @@ class SQLiteMemoryStore:
                 """
             )
             connection.execute("PRAGMA optimize")
-            columns = {
-                str(row[1]) for row in connection.execute("PRAGMA table_info(conversation_events)").fetchall()
-            }
+            columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(conversation_events)").fetchall()}
             if "relations_json" in columns:
                 connection.execute("ALTER TABLE conversation_events DROP COLUMN relations_json")
             connection.execute(
@@ -676,9 +700,7 @@ class SQLiteMemoryStore:
             raise ValueError("conversation events require a thread-scoped conversation_history namespace")
         if isinstance(after_sequence, bool) or not isinstance(after_sequence, int) or after_sequence < 0:
             raise ValueError("conversation event cursor is invalid")
-        if limit is not None and (
-            isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000
-        ):
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000):
             raise ValueError("conversation event limit must be between 1 and 10000")
         with self._lock, self._connection() as connection:
             if limit is None:
@@ -1355,10 +1377,7 @@ def _merge_conversation_summary(
     if not isinstance(previous_summary, dict):
         previous_summary = {
             "conversation_summary": json.dumps(
-                {
-                    key: summary.get(key) or []
-                    for key in ("user_requests", "assistant_outcomes", "tool_activity")
-                },
+                {key: summary.get(key) or [] for key in ("user_requests", "assistant_outcomes", "tool_activity")},
                 ensure_ascii=False,
             )[:12_000],
             "user_goals": [],
@@ -1388,14 +1407,29 @@ def _prompt_event(event: ConversationEvent) -> dict[str, Any]:
         "source_event_ids",
     }
     value = event.to_dict()
-    value["payload"] = {
-        key: item for key, item in value["payload"].items() if key in safe_payload_keys
-    }
+    value["payload"] = {key: item for key, item in value["payload"].items() if key in safe_payload_keys}
     return value
 
 
 def _events_tokens(events: list[ConversationEvent], counter: TokenCounter) -> int:
     return counter.count(json.dumps([_prompt_event(event) for event in events], ensure_ascii=False, sort_keys=True))
+
+
+def _select_recent_atomic_facts(
+    events: list[ConversationEvent],
+    *,
+    counter: TokenCounter,
+    token_budget: int,
+) -> list[ConversationEvent]:
+    if not events or token_budget <= 0:
+        return []
+    selected: list[ConversationEvent] = []
+    for event in reversed(events):
+        candidate = [event, *selected]
+        if _events_tokens(candidate, counter) > token_budget:
+            break
+        selected = candidate
+    return selected
 
 
 def _split_recent_runs(

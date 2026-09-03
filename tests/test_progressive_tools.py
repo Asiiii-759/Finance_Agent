@@ -4,9 +4,8 @@ import json
 import sys
 import unittest
 
-from llm_fixtures import llm_backed_agent
+from llm_fixtures import agent_run_input, llm_backed_agent
 
-from mas_finance.agent import ResearchRequest
 from mas_finance.contracts import Evidence, EvidenceBundle, SourceRef, SourceType
 from mas_finance.harness import ToolHarness
 from mas_finance.llm import BaseLLMClient
@@ -152,6 +151,7 @@ class ProgressiveDiscoveryTests(unittest.TestCase):
                 harness,
                 planner=ModelPlanner(
                     harness,
+                    count_tokens=len,
                     mcp_tool_index=(
                         {
                             "name": "fixture.policy_search",
@@ -164,11 +164,8 @@ class ProgressiveDiscoveryTests(unittest.TestCase):
                 ),
                 planner_hidden_tool_names=frozenset({"fixture.policy_search"}),
             ).run(
-                ResearchRequest(
+                *agent_run_input(
                     query="根据组合政策说明单一发行人限额",
-                    require_documents=True,
-                    require_market_data=False,
-                    require_regulatory_data=False,
                     run_id="progressive-discovery",
                     max_model_calls=5,
                     max_iterations=4,

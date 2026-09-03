@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from mas_finance.corpus import DocumentTokenizer
 from mas_finance.database import JobRepository
 from mas_finance.harness import (
     ExecutionPolicy,
@@ -18,6 +19,8 @@ from mas_finance.harness import (
 from mas_finance.memory_store import MemoryNamespace, SQLiteMemoryStore
 from mas_finance.personal_knowledge import SQLitePersonalKnowledgeBase
 from mas_finance.queueing import ReliableJobQueue
+
+TOKENIZER = DocumentTokenizer(Path(".runtime/models/bge-m3/tokenizer.json"))
 
 
 class EmbeddingFixture:
@@ -34,6 +37,52 @@ class EmbeddingFixture:
 
 
 class InfrastructureTests(unittest.TestCase):
+    def test_legacy_job_database_is_backfilled_to_the_configured_owner_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-jobs.db"
+            with sqlite3.connect(path) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE analysis_jobs (
+                        job_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, query TEXT NOT NULL,
+                        status TEXT NOT NULL, llm_backend TEXT, result_json TEXT, artifacts_json TEXT,
+                        error_message TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE analysis_job_queue (
+                        job_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+                        payload_json TEXT NOT NULL, status TEXT NOT NULL, attempt_count INTEGER NOT NULL,
+                        max_attempts INTEGER NOT NULL, available_at TEXT NOT NULL, lease_owner TEXT,
+                        lease_token TEXT, lease_expires_at TEXT, last_error_type TEXT,
+                        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO analysis_jobs VALUES (
+                        'legacy-job', 'legacy-thread', 'legacy query', 'pending', NULL, NULL, NULL,
+                        NULL, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+                    );
+                    INSERT INTO analysis_job_queue VALUES (
+                        'legacy-job', 'legacy-key', '{}', 'pending', 0, 3,
+                        '2026-01-01T00:00:00+00:00', NULL, NULL, NULL, NULL,
+                        '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+                    );
+                    """
+                )
+
+            repository = JobRepository(f"sqlite:///{path.as_posix()}", db_path=path)
+            migrated = repository.get_job_for_principal("legacy-job", "local", "owner")
+            self.assertIsNotNone(migrated)
+            duplicate, created = repository.submit_job(
+                job_id="replacement-job",
+                tenant_id="local",
+                user_id="owner",
+                thread_id="legacy-thread",
+                query="legacy query",
+                payload={},
+                idempotency_key="legacy-key",
+                max_attempts=3,
+            )
+            self.assertFalse(created)
+            self.assertEqual(duplicate["job_id"], "legacy-job")
+
     def test_reliable_queue_is_idempotent_and_lease_tokens_fence_workers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "jobs.db"
@@ -41,6 +90,8 @@ class InfrastructureTests(unittest.TestCase):
             payload = {"query": "test", "thread_id": "thread"}
             first, created = repository.submit_job(
                 job_id="job-1",
+                tenant_id="default",
+                user_id="owner",
                 thread_id="thread",
                 query="test",
                 payload=payload,
@@ -49,6 +100,8 @@ class InfrastructureTests(unittest.TestCase):
             )
             duplicate, duplicate_created = repository.submit_job(
                 job_id="job-2",
+                tenant_id="default",
+                user_id="owner",
                 thread_id="thread",
                 query="test",
                 payload=payload,
@@ -72,6 +125,8 @@ class InfrastructureTests(unittest.TestCase):
 
             repository.submit_job(
                 job_id="job-cancel",
+                tenant_id="default",
+                user_id="owner",
                 thread_id="thread",
                 query="cancel",
                 payload={"query": "cancel", "thread_id": "thread"},
@@ -83,6 +138,8 @@ class InfrastructureTests(unittest.TestCase):
 
             repository.submit_job(
                 job_id="job-complete",
+                tenant_id="default",
+                user_id="owner",
                 thread_id="thread",
                 query="complete",
                 payload={"query": "complete", "thread_id": "thread"},
@@ -95,6 +152,8 @@ class InfrastructureTests(unittest.TestCase):
 
             repository.submit_job(
                 job_id="job-cancel-running",
+                tenant_id="default",
+                user_id="owner",
                 thread_id="thread",
                 query="cancel running",
                 payload={"query": "cancel running", "thread_id": "thread"},
@@ -132,7 +191,7 @@ class InfrastructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "knowledge.db"
             embedding = EmbeddingFixture()
-            store = SQLitePersonalKnowledgeBase(path)
+            store = SQLitePersonalKnowledgeBase(path, tokenizer=TOKENIZER)
             stored = store.add_document(
                 "tenant",
                 "alice",
@@ -148,15 +207,46 @@ class InfrastructureTests(unittest.TestCase):
             self.assertEqual(stored["index_status"], "vector_ready")
             manifest = store.list_documents("tenant", "alice")[0]
             self.assertEqual(manifest["embedding_model"], "fixture-v1")
+            self.assertEqual(manifest["chunking_version"], "token-1024-overlap-256-structured-v1")
+            self.assertTrue(store.vector_index_ready("tenant", "alice", "fixture-v1"))
             self.assertEqual(store.list_documents("tenant", "bob"), [])
 
-            restored = SQLitePersonalKnowledgeBase(path).corpus(
+            restored = SQLitePersonalKnowledgeBase(path, tokenizer=TOKENIZER).corpus(
                 "tenant", "alice", embedding_provider=embedding
             )
             result = restored.search_json({"query": "cash", "search_mode": "vector"})
             self.assertEqual(result["chunks"][0]["metadata"]["document_id"], "doc-1")
             self.assertEqual(len(embedding.calls), 2)
             self.assertEqual(len(embedding.calls[-1]), 1)
+
+    def test_personal_vectors_require_explicit_reindex_and_are_not_built_during_search(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLitePersonalKnowledgeBase(Path(directory) / "knowledge.db", tokenizer=TOKENIZER)
+            store.add_document(
+                "tenant",
+                "alice",
+                {
+                    "document_id": "doc-lexical",
+                    "filename": "policy.pdf",
+                    "pages": [
+                        {"page_number": 1, "text": "Keep ample cash reserves.", "extraction_method": "mcp"}
+                    ],
+                },
+            )
+            embedding = EmbeddingFixture()
+
+            self.assertFalse(store.vector_index_ready("tenant", "alice", embedding.model_name))
+            with self.assertRaisesRegex(ValueError, "run reindex first"):
+                store.corpus("tenant", "alice", embedding_provider=embedding)
+            self.assertEqual(embedding.calls, [])
+
+            result = store.reindex_documents("tenant", "alice", embedding)
+            self.assertEqual(result["documents"], 1)
+            self.assertEqual(result["chunks"], 1)
+            self.assertTrue(store.vector_index_ready("tenant", "alice", embedding.model_name))
+            corpus = store.corpus("tenant", "alice", embedding_provider=embedding)
+            corpus.search_json({"query": "cash", "search_mode": "vector"})
+            self.assertEqual([len(call) for call in embedding.calls], [1, 1])
 
     def test_audit_ledger_is_append_only_and_model_token_budget_is_enforced(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

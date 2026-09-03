@@ -7,7 +7,7 @@ from pathlib import Path
 from llm_fixtures import ScriptedLLM, research_service
 from test_system import build_test_config
 
-from mas_finance.agent import ResearchRequest, ResearchState
+from mas_finance.agent import AgentContext, ChatAttachment, ChatTurn, ResearchState, RuntimePolicy
 from mas_finance.atomic_facts import LLMAtomicFactExtractor
 from mas_finance.harness import ToolHarness
 from mas_finance.memory_store import ConversationEvent, ConversationEventKind
@@ -34,13 +34,68 @@ class MemoryFoundationTests(unittest.TestCase):
             }
             for index in range(10)
         )
-        request = ResearchRequest(
-            query="解释市盈率",
-            require_documents=False,
+        turn = ChatTurn(message="解释市盈率")
+        agent_context = AgentContext(
             personal_context=personal_context,
         )
-        context = LLMTaskInterpreter._context(request, {})
+        context = LLMTaskInterpreter._context(turn, agent_context, {})
         self.assertEqual(context["personal_context"], list(personal_context))
+
+    def test_task_frame_projects_relevant_personal_context_within_total_budget(self) -> None:
+        personal_context = tuple(
+            {
+                "memory_id": f"memory-{index}",
+                "kind": "experience",
+                "title": f"主题 {index}",
+                "content": ("稳定经验" * 250) + ("Alpha" if index == 0 else ""),
+                "tags": [],
+            }
+            for index in range(8)
+        )
+        interpreter = LLMTaskInterpreter(ToolHarness(), max_context_tokens=5_000, count_tokens=len)
+        raw = interpreter._context(
+            ChatTurn(message="继续分析 Alpha"),
+            AgentContext(personal_context=personal_context),
+            {},
+        )
+        bounded = interpreter._bounded_context(raw, "继续分析 Alpha")
+        manifest = interpreter.context_manifest()
+        assert manifest is not None
+        self.assertLessEqual(manifest["total_context_tokens"], 5_000)
+        self.assertGreater(manifest["omitted_personal_context_count"], 0)
+        self.assertEqual(bounded["personal_context"][0]["memory_id"], "memory-0")
+
+    def test_task_frame_sees_only_current_attachments_not_a_document_catalog(self) -> None:
+        turn = ChatTurn(
+            message="比较我刚上传的两份 PDF",
+            attachments=(
+                ChatAttachment("doc-a", "alpha.pdf"),
+                ChatAttachment("doc-b", "beta.pdf"),
+            ),
+        )
+        context = LLMTaskInterpreter._context(turn, AgentContext(), {})
+
+        self.assertEqual(
+            [item["title"] for item in context["current_request"]["attachments"]],
+            ["alpha.pdf", "beta.pdf"],
+        )
+        self.assertNotIn("available_documents", context["current_request"])
+
+    def test_checkpoint_round_trip_keeps_current_attachments_outside_agent_context(self) -> None:
+        state = ResearchState(
+            turn=ChatTurn(
+                message="分析附件",
+                attachments=(ChatAttachment("doc-a", "alpha.pdf"),),
+            ),
+            runtime_policy=RuntimePolicy(),
+        )
+
+        payload = state.to_dict()
+        restored = ResearchState.from_dict(payload)
+
+        self.assertEqual(payload["schema_version"], 6)
+        self.assertEqual(restored.turn.attachments[0].title, "alpha.pdf")
+        self.assertNotIn("document_index", payload["context"])
 
     def test_skill_context_uses_successful_audit_capabilities_not_planner_categories(self) -> None:
         context = skill_run_context(
@@ -121,18 +176,20 @@ class MemoryFoundationTests(unittest.TestCase):
                 export_artifacts=False,
             )
             self.assertEqual(response["result"]["status"], "succeeded")
-            event_types = [
-                item["event_type"]
-                for item in service.list_run_logs("atomic-failure-thread", "atomic-failure-run")
-            ]
+            logs = service.list_run_logs("atomic-failure-thread", "atomic-failure-run")
+            event_types = [item["event_type"] for item in logs]
             self.assertIn("memory.atomic_facts_failed", event_types)
             self.assertNotIn("memory.atomic_facts_completed", event_types)
+            completed = next(item for item in logs if item["event_type"] == "run.completed")
+            self.assertEqual(completed["details"]["claim_count"], 1)
+            self.assertEqual(completed["details"]["source_count"], 0)
+            self.assertEqual(completed["details"]["budget"]["model_calls"], 3)
             service.close()
 
     def test_run_log_storage_redacts_secrets_and_omits_raw_results(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             service = research_service(build_test_config(Path(directory)))
-            namespace = service._conversation_namespace("default", "anonymous", "log-redaction-thread")
+            namespace = service._conversation_namespace("local", "owner", "log-redaction-thread")
             service.memory_store.append_run_log(
                 namespace,
                 run_id="log-redaction-run",
@@ -172,7 +229,6 @@ class MemoryFoundationTests(unittest.TestCase):
                                 "text": "用户要求比较 Apple 与 Microsoft 的最大回撤。",
                                 "source_event_ids": ["event-user"],
                                 "entities": ["Apple", "Microsoft"],
-                                "status": "requested",
                             }
                         ]
                     }
@@ -182,6 +238,84 @@ class MemoryFoundationTests(unittest.TestCase):
         facts = extractor.extract((event,))
         self.assertEqual(facts[0].text, "用户要求比较 Apple 与 Microsoft 的最大回撤。")
         self.assertEqual(facts[0].source_event_ids, ("event-user",))
+
+    def test_atomic_fact_extractor_never_discloses_tool_or_assistant_content(self) -> None:
+        events = (
+            ConversationEvent(
+                event_id="event-user",
+                sequence=1,
+                kind=ConversationEventKind.USER_MESSAGE,
+                content="它和 Microsoft 相比怎么样？",
+                occurred_at="2026-08-27T12:00:00+08:00",
+                run_id="run-1",
+            ),
+            ConversationEvent(
+                event_id="event-tool",
+                sequence=2,
+                kind=ConversationEventKind.TOOL_EVENT,
+                content="internal provider payload must not enter atomic extraction",
+                occurred_at="2026-08-27T12:00:01+08:00",
+                run_id="run-1",
+                entities=("Apple",),
+            ),
+            ConversationEvent(
+                event_id="event-assistant",
+                sequence=3,
+                kind=ConversationEventKind.ASSISTANT_MESSAGE,
+                content="internal assistant conclusion must not enter atomic extraction",
+                occurred_at="2026-08-27T12:00:02+08:00",
+                run_id="run-1",
+                entities=("Apple", "Microsoft"),
+            ),
+        )
+        client = ScriptedLLM(
+            [
+                {
+                    "facts": [
+                        {
+                            "text": "用户要求比较 Apple 与 Microsoft。",
+                            "source_event_ids": ["event-user"],
+                            "entities": ["Apple", "Microsoft"],
+                        }
+                    ]
+                }
+            ]
+        )
+        facts = LLMAtomicFactExtractor(client).extract(events)
+        prompt = client.user_prompts[0]
+        self.assertNotIn("internal provider payload", prompt)
+        self.assertNotIn("internal assistant conclusion", prompt)
+        self.assertIn('"resolved_entity_candidates": ["Apple", "Microsoft"]', prompt)
+        self.assertEqual(facts[0].source_event_ids, ("event-user",))
+
+    def test_atomic_fact_extractor_rejects_more_than_six_facts_for_one_run(self) -> None:
+        event = ConversationEvent(
+            event_id="event-user",
+            sequence=1,
+            kind=ConversationEventKind.USER_MESSAGE,
+            content="分析 Apple。",
+            occurred_at="2026-08-27T12:00:00+08:00",
+            run_id="run-1",
+            entities=("Apple",),
+        )
+        extractor = LLMAtomicFactExtractor(
+            ScriptedLLM(
+                [
+                    {
+                        "facts": [
+                            {
+                                "text": f"最小事实 {index}。",
+                                "source_event_ids": ["event-user"],
+                                "entities": ["Apple"],
+                            }
+                            for index in range(7)
+                        ]
+                    }
+                ]
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "at most six"):
+            extractor.extract((event,))
 
     def test_skill_index_discloses_full_workflow_only_after_selection(self) -> None:
         skills = [
@@ -206,9 +340,10 @@ class MemoryFoundationTests(unittest.TestCase):
                 ).to_dict(),
             },
         ]
-        planner = ModelPlanner(ToolHarness(), learned_skills=skills)
+        planner = ModelPlanner(ToolHarness(), count_tokens=len, learned_skills=skills)
         state = ResearchState(
-            ResearchRequest(query="核验一项公告", require_documents=False),
+            turn=ChatTurn(message="核验一项公告"),
+            runtime_policy=RuntimePolicy(),
             task_frame={"selected_skill_ids": ["skill-selected"]},
         )
         context = planner._planning_context(state, {})
@@ -225,8 +360,8 @@ class MemoryFoundationTests(unittest.TestCase):
                 ("先查一手来源", "再查独立来源"),
                 ("web.search",),
             )
-            service._save_learned_skill("default", "anonymous", "run-1", skill)
-            service._save_learned_skill("default", "anonymous", "run-2", skill)
+            service._save_learned_skill("local", "owner", "run-1", skill)
+            service._save_learned_skill("local", "owner", "run-2", skill)
             stored = service.list_learned_skills()
             self.assertEqual(len(stored), 1)
             self.assertEqual(stored[0]["success_count"], 2)

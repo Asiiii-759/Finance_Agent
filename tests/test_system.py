@@ -15,6 +15,7 @@ from pdf_fixtures import MCPPDFParserFixture, write_stub_pdf
 
 from mas_finance.api.app import create_app
 from mas_finance.config import AppConfig
+from mas_finance.database import JobRepository
 from mas_finance.llm import LLMSettings
 from mas_finance.memory_store import PersonalMemoryKind
 from mas_finance.service import FinanceAnalysisService
@@ -97,7 +98,7 @@ class FinanceSystemTestCase(unittest.TestCase):
                 export_artifacts=False,
                 user_id="alice",
             )["result"]
-            personal = result["request"]["personal_context"]
+            personal = result["context"]["personal_context"]
             self.assertEqual([item["kind"] for item in personal], ["preference", "experience"])
             self.assertIn("先展示结论", personal[0]["content"])
             self.assertIn("久期", personal[1]["content"])
@@ -166,12 +167,83 @@ class FinanceSystemTestCase(unittest.TestCase):
         self.assertEqual(alice_config.json()["principal"]["user_id"], "alice")
         self.assertEqual(bob_config.json()["principal"]["user_id"], "bob")
 
+    def test_service_defaults_to_configured_owner_and_rejects_cross_owner_job_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = replace(build_test_config(Path(directory)), local_user_id="alice")
+            service = research_service(config)
+            service.save_personal_memory(
+                kind=PersonalMemoryKind.PREFERENCE,
+                title="语言",
+                content="长期使用中文。",
+            )
+            self.assertEqual(len(service.list_personal_memories(user_id="alice", tenant_id="local")), 1)
+            self.assertEqual(service.list_personal_memories(user_id="anonymous", tenant_id="default"), [])
+            created = service.submit_job("分析 Apple")
+            self.assertIsNotNone(service.get_job(created["job_id"], tenant_id="local", user_id="alice"))
+            with self.assertRaisesRegex(ValueError, "analysis job does not exist"):
+                service.run_job(
+                    created["job_id"],
+                    "分析 Apple",
+                    created["thread_id"],
+                    tenant_id="local",
+                    user_id="bob",
+                )
+            service.close()
+
+    def test_job_artifact_download_is_principal_scoped(self) -> None:
+        tmp_root = ROOT / "test_artifacts" / f"artifact-isolation-{uuid4().hex[:8]}"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        base = build_test_config(tmp_root, api_key=None)
+        artifact = base.output_dir / "alice" / "report.md"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text("Alice report", encoding="utf-8")
+        outside = tmp_root / "outside.json"
+        outside.write_text("{}", encoding="utf-8")
+        repository = JobRepository(base.database_url, base.db_path)
+        repository.create_job(
+            "artifact-job",
+            "artifact-thread",
+            "report",
+            tenant_id="local",
+            user_id="alice",
+        )
+        repository.update_job_status(
+            "artifact-job",
+            "completed",
+            artifacts={"report_path": str(artifact), "audit_path": str(outside)},
+        )
+        alice_app = create_app(replace(base, local_user_id="alice"))
+        bob_app = create_app(replace(base, local_user_id="bob"))
+
+        async def scenario():
+            async with (
+                AsyncClient(transport=ASGITransport(app=alice_app), base_url="http://alice") as alice,
+                AsyncClient(transport=ASGITransport(app=bob_app), base_url="http://bob") as bob,
+            ):
+                detail = await alice.get("/api/v1/jobs/artifact-job")
+                listing = await alice.get("/api/v1/jobs")
+                allowed = await alice.get("/api/v1/jobs/artifact-job/artifacts/report_path")
+                escaped = await alice.get("/api/v1/jobs/artifact-job/artifacts/audit_path")
+                denied = await bob.get("/api/v1/jobs/artifact-job/artifacts/report_path")
+                return detail, listing, allowed, escaped, denied
+
+        detail, listing, allowed, escaped, denied = asyncio.run(scenario())
+        self.assertEqual(
+            detail.json()["artifacts"]["report_path"],
+            "/api/v1/jobs/artifact-job/artifacts/report_path",
+        )
+        self.assertNotIn(str(tmp_root), detail.text)
+        self.assertIsNone(listing.json()[0]["result"])
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.text, "Alice report")
+        self.assertIn("report.md", allowed.headers["Content-Disposition"])
+        self.assertEqual(escaped.status_code, 404)
+        self.assertEqual(denied.status_code, 404)
+
     def test_personal_knowledge_api_persists_parsed_pages_and_deletes_document(self) -> None:
         tmp_root = ROOT / "test_artifacts" / f"personal-knowledge-{uuid4().hex[:8]}"
         tmp_root.mkdir(parents=True, exist_ok=True)
-        parser = MCPPDFParserFixture(
-            {"policy.pdf": {1: "Personal policy: review duration and credit spread."}}
-        )
+        parser = MCPPDFParserFixture({"policy.pdf": {1: "Personal policy: review duration and credit spread."}})
         app = create_app(
             build_test_config(tmp_root, api_key=None),
             pdf_document_parser=parser,
@@ -273,12 +345,9 @@ class FinanceSystemTestCase(unittest.TestCase):
             parser = MCPPDFParserFixture(
                 {pdf_path.name: {1: "ACME revenue demand and operating cash flow remained resilient in 2026"}}
             )
-            response = research_service(
-                config, pdf_document_parser=parser, pdf_parser_network_access=False
-            ).analyze(
+            response = research_service(config, pdf_document_parser=parser, pdf_parser_network_access=False).analyze(
                 "Analyze ACME demand and cash flow",
                 thread_id="test-e2e",
-                entities=["ACME"],
                 document_paths=[str(pdf_path)],
             )
             result = response["result"]
@@ -288,7 +357,7 @@ class FinanceSystemTestCase(unittest.TestCase):
             for artifact_path in response["artifacts"].values():
                 self.assertTrue(Path(artifact_path).exists())
             state_payload = json.loads(Path(response["artifacts"]["state_path"]).read_text(encoding="utf-8"))
-            self.assertEqual(state_payload["request"]["thread_id"], "test-e2e")
+            self.assertEqual(state_payload["turn"]["thread_id"], "test-e2e")
 
     def test_analyze_fails_fast_without_llm_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -326,9 +395,10 @@ class FinanceSystemTestCase(unittest.TestCase):
         self.assertTrue(payload["report"])
         self.assertEqual(payload["llm_backend"], "fixture")
         self.assertNotIn("state", payload)
+        self.assertRegex(response.headers["X-Request-Id"], r"^[0-9a-f]{8}$")
         self.assertEqual(invalid.status_code, 422)
 
-    def test_api_structured_financial_calculation(self) -> None:
+    def test_api_chat_calculation_and_rejects_structured_intent_overrides(self) -> None:
         tmp_root = ROOT / "test_artifacts" / f"calculation-test-{uuid4().hex[:8]}"
         tmp_root.mkdir(parents=True, exist_ok=True)
         app = research_app(build_test_config(tmp_root, api_key=None))
@@ -338,25 +408,15 @@ class FinanceSystemTestCase(unittest.TestCase):
                 valid = await client.post(
                     "/api/v1/analyze",
                     json={
-                        "query": "计算三年 CAGR",
-                        "calculations": [
-                            {
-                                "operation": "cagr",
-                                "inputs": {
-                                    "beginning_value": 100,
-                                    "ending_value": 150,
-                                    "years": 3,
-                                },
-                            }
-                        ],
+                        "query": "一项投资从100增长到150，用了3年，CAGR是多少？",
                         "export_artifacts": False,
                     },
                 )
                 invalid = await client.post(
                     "/api/v1/analyze",
                     json={
-                        "query": "bad calculation",
-                        "calculations": [{"operation": "eval", "inputs": {"expression": "1+1"}}],
+                        "query": "计算 1+1",
+                        "entities": ["legacy-override"],
                     },
                 )
                 return valid, invalid
@@ -428,6 +488,7 @@ class FinanceSystemTestCase(unittest.TestCase):
         self.assertIsNone(config_payload["embedding_model"])
         self.assertEqual(config_payload["conversation_context_tokens"], 300_000)
         self.assertEqual(config_payload["conversation_recent_tokens"], 20_000)
+        self.assertEqual(config_payload["conversation_atomic_fact_tokens"], 32_000)
         self.assertEqual(config_payload["principal"], {"tenant_id": "local", "user_id": "owner"})
         self.assertEqual(deleted.status_code, 200)
         self.assertGreaterEqual(deleted.json()["events"], 2)
@@ -528,7 +589,6 @@ class FinanceSystemTestCase(unittest.TestCase):
                     json={
                         "query": "这份文档中的到期时间是什么？",
                         "thread_id": "retained-upload",
-                        "entities": ["ACME"],
                         "use_session_documents": True,
                         "export_artifacts": False,
                     },
@@ -583,7 +643,7 @@ class FinanceSystemTestCase(unittest.TestCase):
                     headers={"X-API-Key": "secret-key"},
                 )
                 job_payload = detail.json()
-                for _ in range(20):
+                for _ in range(100):
                     if job_payload["status"] in {"completed", "failed"}:
                         break
                     await asyncio.sleep(0.05)
@@ -604,6 +664,55 @@ class FinanceSystemTestCase(unittest.TestCase):
         self.assertIn(job_payload["status"], {"completed", "failed"})
         self.assertEqual(listing.status_code, 200)
         self.assertGreaterEqual(len(listing.json()), 1)
+
+    def test_upload_job_transfers_retained_session_documents_back_to_api_process(self) -> None:
+        tmp_root = ROOT / "test_artifacts" / f"job-session-{uuid4().hex[:8]}"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        parser = MCPPDFParserFixture({"maturity.pdf": {1: "ACME refinancing maturity is September 2027."}})
+        app = research_app(
+            build_test_config(tmp_root, api_key=None),
+            pdf_document_parser=parser,
+            pdf_parser_network_access=False,
+        )
+
+        async def scenario():
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                submitted = await client.post(
+                    "/api/v1/jobs/upload",
+                    data={
+                        "query": "分析 ACME 的再融资到期风险",
+                        "thread_id": "job-session-thread",
+                        "export_artifacts": "false",
+                        "retain_for_session": "true",
+                    },
+                    files={"files": ("maturity.pdf", b"%PDF-1.7\n%%EOF\n", "application/pdf")},
+                )
+                job = submitted.json()
+                detail = None
+                for _ in range(100):
+                    detail = await client.get(f"/api/v1/jobs/{job['job_id']}")
+                    if detail.json()["status"] in {"completed", "failed"}:
+                        break
+                    await asyncio.sleep(0.05)
+                retained = await client.get("/api/v1/session-documents/job-session-thread")
+                followup = await client.post(
+                    "/api/v1/analyze",
+                    json={
+                        "query": "刚才文档中的到期时间是什么？",
+                        "thread_id": "job-session-thread",
+                        "use_session_documents": True,
+                        "export_artifacts": False,
+                    },
+                )
+                return submitted, detail, retained, followup
+
+        submitted, detail, retained, followup = asyncio.run(scenario())
+        self.assertEqual(submitted.status_code, 202)
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail.json()["status"], "completed")
+        self.assertEqual(len(retained.json()["documents"]), 1)
+        self.assertEqual(followup.status_code, 200)
+        self.assertIn("September 2027", followup.json()["report"])
 
 
 if __name__ == "__main__":

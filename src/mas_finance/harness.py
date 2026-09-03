@@ -14,6 +14,8 @@ from enum import StrEnum
 from hashlib import sha256
 from typing import Any, Protocol
 
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError, ValidationError
 from opentelemetry import trace
 
 from .contracts import EvidenceBundle, utc_now
@@ -139,6 +141,7 @@ class ToolSpec:
     retry: RetryPolicy = field(default_factory=RetryPolicy)
     result_kind: ToolResultKind = ToolResultKind.ANY
     arguments: ToolArgumentContract = field(default_factory=lambda: ToolArgumentContract(allow_extra=True))
+    input_schema: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,99}", self.name):
@@ -151,6 +154,65 @@ class ToolSpec:
             raise ValueError("tool timeout must be between 0 and 600 seconds")
         if self.side_effect != SideEffect.READ_ONLY and self.retry.max_attempts > 1:
             raise ValueError("side-effecting tools cannot be retried automatically")
+        if self.input_schema is not None:
+            try:
+                encoded_schema = json.dumps(self.input_schema, ensure_ascii=False, allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("tool input schema must be finite JSON") from exc
+            if len(encoded_schema) > 100_000:
+                raise ValueError("tool input schema exceeds length limit")
+            try:
+                Draft202012Validator.check_schema(self.input_schema)
+            except SchemaError as exc:
+                raise ValueError("tool input schema is not valid Draft 2020-12 JSON Schema") from exc
+            if self.input_schema.get("type") != "object":
+                raise ValueError("tool input schema root type must be object")
+            properties = self.input_schema.get("properties")
+            required = self.input_schema.get("required", [])
+            if not isinstance(properties, Mapping) or not isinstance(required, list):
+                raise ValueError("tool input schema must declare properties and required keys")
+            schema_keys = frozenset(str(key) for key in properties)
+            schema_required = frozenset(str(key) for key in required)
+            if schema_required != self.arguments.required:
+                raise ValueError("tool input schema required keys disagree with the argument contract")
+            if not self.arguments.allow_extra and schema_keys != self.arguments.required | self.arguments.optional:
+                raise ValueError("tool input schema properties disagree with the argument contract")
+
+
+def model_tool_input_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "required": ["system_prompt", "user_prompt"],
+        "additionalProperties": False,
+        "properties": {
+            "system_prompt": {"type": "string", "minLength": 1, "maxLength": 1_000_000},
+            "user_prompt": {"type": "string", "minLength": 1, "maxLength": 1_000_000},
+            "temperature": {"type": "number", "minimum": 0, "maximum": 2},
+            "max_tokens": {"type": "integer", "minimum": 1, "maximum": 200_000},
+        },
+    }
+
+
+def model_retry_policy() -> RetryPolicy:
+    return RetryPolicy(max_attempts=2, initial_backoff_seconds=0.25)
+
+
+def validate_tool_arguments(spec: ToolSpec, arguments: Mapping[str, Any]) -> None:
+    try:
+        spec.arguments.validate(arguments)
+    except ToolContractError as exc:
+        raise ToolExecutionError(
+            "invalid_tool_arguments",
+            str(exc),
+            details={"model_action": "change_arguments"},
+        ) from exc
+    if spec.input_schema is None:
+        return
+    try:
+        Draft202012Validator(spec.input_schema).validate(dict(arguments))
+    except ValidationError as exc:
+        message, details = _json_schema_error(exc)
+        raise ToolExecutionError("invalid_tool_arguments", message, details=details) from exc
 
 
 @dataclass(frozen=True)
@@ -418,8 +480,8 @@ class ToolHarness:
             )
 
         try:
-            tool.spec.arguments.validate(arguments)
-        except ToolContractError as exc:
+            validate_tool_arguments(tool.spec, arguments)
+        except ToolExecutionError as exc:
             return self._finish(
                 call_id=call_id,
                 tool=tool,
@@ -429,8 +491,9 @@ class ToolHarness:
                 started_at=started_at,
                 start=start,
                 attempts=0,
-                error_code="invalid_tool_arguments",
+                error_code=exc.code,
                 error_message=str(exc),
+                error_details=exc.details,
             )
 
         with self._lock:
@@ -586,8 +649,12 @@ class ToolHarness:
                         started_at=started_at,
                         start=start,
                         attempts=attempts,
-                        error_code=type(exc).__name__,
+                        error_code="provider_temporarily_unavailable",
                         error_message=str(exc),
+                        error_details={
+                            "exception_type": type(exc).__name__,
+                            "model_action": "choose_alternative_tool",
+                        },
                     )
                 if tool.spec.network_access and tool.spec.capability != "model.generate":
                     with self._lock:
@@ -621,8 +688,12 @@ class ToolHarness:
                     started_at=started_at,
                     start=start,
                     attempts=attempts,
-                    error_code=type(exc).__name__,
+                    error_code="tool_internal_error",
                     error_message=str(exc),
+                    error_details={
+                        "exception_type": type(exc).__name__,
+                        "model_action": "choose_alternative_tool",
+                    },
                 )
 
         raise AssertionError("unreachable")
@@ -795,6 +866,78 @@ class _CallableTool:
 
 def function_tool(spec: ToolSpec, function: Callable[[Mapping[str, Any], ToolContext], Any]) -> Tool:
     return _CallableTool(spec, function)
+
+
+def _json_schema_error(
+    error: ValidationError,
+    *,
+    prefix: tuple[str, ...] = (),
+) -> tuple[str, dict[str, Any]]:
+    path = (*prefix, *(str(item) for item in error.absolute_path))
+    field = ".".join(path) or "$"
+    rule = str(error.validator or "schema")
+    schema: Mapping[str, Any] = error.schema if isinstance(error.schema, Mapping) else {}
+    constraint = schema.get(rule)
+    if rule == "oneOf" and isinstance(error.instance, Mapping) and isinstance(constraint, list):
+        for branch in constraint:
+            if not isinstance(branch, Mapping):
+                continue
+            properties = branch.get("properties")
+            if not isinstance(properties, Mapping):
+                continue
+            discriminators = [
+                (str(key), value.get("const"))
+                for key, value in properties.items()
+                if isinstance(value, Mapping) and "const" in value
+            ]
+            if not discriminators or not all(error.instance.get(key) == value for key, value in discriminators):
+                continue
+            nested = next(Draft202012Validator(branch).iter_errors(error.instance), None)
+            if nested is not None:
+                return _json_schema_error(nested, prefix=path)
+    details: dict[str, Any] = {
+        "field": field,
+        "rule": rule,
+        "model_action": "change_arguments",
+    }
+    if rule == "required" and isinstance(error.instance, Mapping):
+        required = [str(item) for item in constraint] if isinstance(constraint, list) else []
+        missing = [item for item in required if item not in error.instance]
+        details["missing_fields"] = missing
+        return f"{field} is missing required fields: {missing}", details
+    if rule == "additionalProperties" and isinstance(error.instance, Mapping):
+        properties = schema.get("properties")
+        known = set(properties) if isinstance(properties, Mapping) else set()
+        unknown = sorted(str(item) for item in error.instance if item not in known)
+        details["unknown_fields"] = unknown
+        return f"{field} contains unknown fields: {unknown}", details
+    if rule == "type":
+        details["expected_type"] = constraint
+        return f"{field} must match JSON type {constraint}", details
+    if rule in {"enum", "const"}:
+        allowed = constraint if rule == "enum" and isinstance(constraint, list) else [constraint]
+        details["allowed_values"] = allowed[:50]
+        return f"{field} must use an allowed value", details
+    if rule in {
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "minProperties",
+        "maxProperties",
+    }:
+        details["constraint"] = constraint
+        return f"{field} violates the {rule} constraint", details
+    if rule == "pattern":
+        details["pattern"] = str(constraint)
+        return f"{field} does not match the required pattern", details
+    if rule in {"oneOf", "anyOf", "allOf"}:
+        return f"{field} does not match an allowed argument shape", details
+    return f"{field} violates the {rule} input constraint", details
 
 
 _SENSITIVE_CONTENT_KEYS = {"document_content", "raw_document", "system_prompt", "user_prompt"}

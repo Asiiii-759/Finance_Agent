@@ -12,7 +12,7 @@ from enum import StrEnum
 from typing import Any
 
 from .contracts import Evidence, EvidenceBundle, SourceRef, SourceType, stable_id
-from .harness import Tool, ToolArgumentContract, ToolResultKind, ToolSpec, function_tool
+from .harness import Tool, ToolArgumentContract, ToolExecutionError, ToolResultKind, ToolSpec, function_tool
 
 
 class MetricOperation(StrEnum):
@@ -91,6 +91,55 @@ def describe_metric_operations() -> dict[str, dict[str, Any]]:
             "default_unit": _DEFAULT_UNITS[operation],
         }
         for operation in MetricOperation
+    }
+
+
+def metric_tool_input_schema() -> dict[str, Any]:
+    request_fields = {
+        "label": {"type": ["string", "null"], "minLength": 1, "maxLength": 100},
+        "entity": {"type": ["string", "null"], "minLength": 1, "maxLength": 200},
+        "unit": {"type": ["string", "null"], "minLength": 1, "maxLength": 50},
+        "period": {"type": ["string", "null"], "minLength": 1, "maxLength": 100},
+        "request_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 100},
+    }
+    return {
+        "type": "object",
+        "required": ["requests"],
+        "additionalProperties": False,
+        "properties": {
+            "requests": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 20,
+                "items": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "required": ["operation", "inputs"],
+                            "additionalProperties": False,
+                            "properties": {
+                                "operation": {"const": operation.value},
+                                "inputs": {
+                                    "type": "object",
+                                    "required": sorted(_REQUIRED_INPUT_KEYS[operation]),
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        name: (
+                                            {"type": "array", "items": {"type": "number"}}
+                                            if name in {"returns", "values"}
+                                            else {"type": "number"}
+                                        )
+                                        for name in sorted(_INPUT_KEYS[operation])
+                                    },
+                                },
+                                **request_fields,
+                            },
+                        }
+                        for operation in MetricOperation
+                    ]
+                },
+            }
+        },
     }
 
 
@@ -386,13 +435,20 @@ def financial_calculation_harness_tool(adapter: MetricEvidenceAdapter | None = N
     calculator = adapter or MetricEvidenceAdapter()
 
     def invoke(arguments: Mapping[str, Any], _context: Any) -> dict[str, Any]:
-        values = arguments.get("requests")
-        if not isinstance(values, list):
-            raise MetricError("invalid_requests", "requests must be a list")
-        requests = [MetricRequest.from_dict(item) for item in values if isinstance(item, Mapping)]
-        if len(requests) != len(values):
-            raise MetricError("invalid_requests", "every calculation request must be an object")
-        return calculator.calculate(requests).to_dict()
+        try:
+            values = arguments.get("requests")
+            if not isinstance(values, list):
+                raise MetricError("invalid_requests", "requests must be a list")
+            requests = [MetricRequest.from_dict(item) for item in values if isinstance(item, Mapping)]
+            if len(requests) != len(values):
+                raise MetricError("invalid_requests", "every calculation request must be an object")
+            return calculator.calculate(requests).to_dict()
+        except MetricError as exc:
+            raise ToolExecutionError(
+                exc.code,
+                str(exc),
+                details={"model_action": "change_arguments"},
+            ) from exc
 
     return function_tool(
         ToolSpec(
@@ -406,92 +462,10 @@ def financial_calculation_harness_tool(adapter: MetricEvidenceAdapter | None = N
             timeout_seconds=5,
             result_kind=ToolResultKind.EVIDENCE_BUNDLE,
             arguments=ToolArgumentContract(required=frozenset({"requests"})),
+            input_schema=metric_tool_input_schema(),
         ),
         invoke,
     )
-
-
-def infer_metric_requests(query: str) -> tuple[MetricRequest, ...]:
-    """Conservatively infer only unambiguous calculations from natural language."""
-    normalized = query.casefold().replace("，", ",")
-    values = _named_numbers(normalized)
-    inferred: list[MetricRequest] = []
-    from_to = _from_to_numbers(normalized)
-    cagr_requested = any(item in normalized for item in ("cagr", "复合增长率", "年复合增长率"))
-    if cagr_requested:
-        beginning = _first_named(values, "beginning", "begin", "start", "initial", "期初", "初始")
-        ending = _first_named(values, "ending", "end", "final", "期末", "最终")
-        years = _first_named(values, "years", "year", "年数", "年")
-        if from_to is not None:
-            beginning = beginning if beginning is not None else from_to[0]
-            ending = ending if ending is not None else from_to[1]
-            years = years if years is not None else from_to[2]
-        if beginning is not None and ending is not None and years is not None:
-            inferred.append(
-                MetricRequest(
-                    operation=MetricOperation.CAGR,
-                    inputs={"beginning_value": beginning, "ending_value": ending, "years": years},
-                    label="cagr",
-                )
-            )
-    if not cagr_requested and any(
-        item in normalized for item in ("percentage change", "percent change", "增长率", "变化率")
-    ):
-        beginning = _first_named(values, "beginning", "begin", "start", "initial", "期初", "初始")
-        ending = _first_named(values, "ending", "end", "final", "期末", "最终")
-        if from_to is not None:
-            beginning = beginning if beginning is not None else from_to[0]
-            ending = ending if ending is not None else from_to[1]
-        if beginning is not None and ending is not None:
-            inferred.append(
-                MetricRequest(
-                    operation=MetricOperation.PERCENTAGE_CHANGE,
-                    inputs={"beginning_value": beginning, "ending_value": ending},
-                    label="percentage_change",
-                )
-            )
-    return tuple(inferred)
-
-
-def _from_to_numbers(text: str) -> tuple[float, float, float | None] | None:
-    number = r"([-+]?\d+(?:\.\d+)?)"
-    pair_patterns = (
-        rf"from\s*{number}\s*to\s*{number}",
-        rf"从\s*{number}\s*(?:增长|增加|上升|变为|涨)?\s*到\s*{number}",
-        rf"{number}\s*(?:增长|增加|上升|变为|涨)\s*到\s*{number}",
-    )
-    match = next((value for pattern in pair_patterns if (value := re.search(pattern, text))), None)
-    if match is None:
-        return None
-    years_match = re.search(
-        rf"(?:over|during|in|用了|经过|历时)?\s*{number}\s*(?:years?|年)",
-        text,
-        flags=re.IGNORECASE,
-    )
-    return (
-        float(match.group(1)),
-        float(match.group(2)),
-        float(years_match.group(1)) if years_match else None,
-    )
-
-
-def _named_numbers(text: str) -> dict[str, float]:
-    pattern = re.compile(
-        r"([a-z_\u4e00-\u9fff]{1,24})\s*(?:=|:|：)\s*([-+]?\d+(?:\.\d+)?)\s*(%)?",
-        re.IGNORECASE,
-    )
-    result: dict[str, float] = {}
-    for name, raw, percentage in pattern.findall(text):
-        value = float(raw)
-        result[name.casefold()] = value / 100 if percentage else value
-    return result
-
-
-def _first_named(values: Mapping[str, float], *names: str) -> float | None:
-    for name in names:
-        if name in values:
-            return values[name]
-    return None
 
 
 def _scalar(inputs: Mapping[str, Any], name: str, *, default: float | None = None) -> float:

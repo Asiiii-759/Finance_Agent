@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 from collections.abc import Iterator, Mapping, Sequence
@@ -12,17 +13,26 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from .corpus import CorpusDocument, InMemoryCorpus
+from .corpus import CorpusDocument, DocumentTokenizer, InMemoryCorpus
 from .embeddings import EmbeddingProvider
+
+CHUNKING_VERSION = "token-1024-overlap-256-structured-v1"
 
 
 class SQLitePersonalKnowledgeBase:
     """Store parsed page text; raw uploads remain outside this database."""
 
-    def __init__(self, path: Path, *, max_documents_per_user: int = 100) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        tokenizer: DocumentTokenizer,
+        max_documents_per_user: int = 100,
+    ) -> None:
         if not 1 <= max_documents_per_user <= 10_000:
             raise ValueError("personal knowledge document limit is invalid")
         self.path = path
+        self.tokenizer = tokenizer
         self.max_documents_per_user = max_documents_per_user
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -46,6 +56,7 @@ class SQLitePersonalKnowledgeBase:
                     page_number INTEGER NOT NULL,
                     text TEXT NOT NULL,
                     extraction_method TEXT NOT NULL,
+                    blocks_json TEXT NOT NULL DEFAULT '[]',
                     PRIMARY KEY (tenant_id, user_id, document_id, page_number),
                     FOREIGN KEY (tenant_id, user_id, document_id)
                         REFERENCES personal_documents (tenant_id, user_id, document_id)
@@ -66,6 +77,7 @@ class SQLitePersonalKnowledgeBase:
                     document_id TEXT NOT NULL,
                     content_sha256 TEXT NOT NULL,
                     chunk_count INTEGER NOT NULL,
+                    chunking_version TEXT NOT NULL DEFAULT 'legacy',
                     embedding_model TEXT,
                     embedding_dimension INTEGER,
                     index_status TEXT NOT NULL,
@@ -82,10 +94,26 @@ class SQLitePersonalKnowledgeBase:
                 );
                 """
             )
+            page_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(personal_document_pages)").fetchall()
+            }
+            if "blocks_json" not in page_columns:
+                connection.execute(
+                    "ALTER TABLE personal_document_pages ADD COLUMN blocks_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            manifest_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(personal_index_manifests)").fetchall()
+            }
+            if "chunking_version" not in manifest_columns:
+                connection.execute(
+                    "ALTER TABLE personal_index_manifests "
+                    "ADD COLUMN chunking_version TEXT NOT NULL DEFAULT 'legacy'"
+                )
             self._backfill_legacy_documents(connection)
 
-    @staticmethod
-    def _backfill_legacy_documents(connection: sqlite3.Connection) -> None:
+    def _backfill_legacy_documents(self, connection: sqlite3.Connection) -> None:
         documents = connection.execute(
             """
             SELECT d.tenant_id, d.user_id, d.document_id, d.filename, d.created_at
@@ -97,7 +125,7 @@ class SQLitePersonalKnowledgeBase:
         for document in documents:
             pages = connection.execute(
                 """
-                SELECT page_number, text, extraction_method FROM personal_document_pages
+                SELECT page_number, text, extraction_method, blocks_json FROM personal_document_pages
                 WHERE tenant_id = ? AND user_id = ? AND document_id = ? ORDER BY page_number
                 """,
                 (document["tenant_id"], document["user_id"], document["document_id"]),
@@ -108,6 +136,7 @@ class SQLitePersonalKnowledgeBase:
                 str(document["filename"]),
                 normalized_pages,
                 None,
+                self.tokenizer,
             )
             connection.execute(
                 """
@@ -126,8 +155,8 @@ class SQLitePersonalKnowledgeBase:
                 """
                 INSERT INTO personal_index_manifests (
                     tenant_id, user_id, document_id, content_sha256, chunk_count,
-                    embedding_model, embedding_dimension, index_status, indexed_at
-                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, 'lexical_ready', ?)
+                    chunking_version, embedding_model, embedding_dimension, index_status, indexed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 'lexical_ready', ?)
                 """,
                 (
                     document["tenant_id"],
@@ -135,6 +164,7 @@ class SQLitePersonalKnowledgeBase:
                     document["document_id"],
                     sha256("\0".join(str(page["text"]) for page in pages).encode()).hexdigest(),
                     len(corpus.index_records()),
+                    CHUNKING_VERSION,
                     document["created_at"],
                 ),
             )
@@ -166,7 +196,7 @@ class SQLitePersonalKnowledgeBase:
         document_id, filename, pages = _validated_document(document)
         text_characters = sum(len(page["text"]) for page in pages)
         now = datetime.now(UTC).isoformat()
-        corpus = _document_corpus(document_id, filename, pages, embedding_provider)
+        corpus = _document_corpus(document_id, filename, pages, embedding_provider, self.tokenizer)
         vector_count = corpus.index_embeddings()
         records = corpus.index_records()
         embedding_dimension = len(records[0]["embedding"]) if vector_count else None
@@ -197,8 +227,8 @@ class SQLitePersonalKnowledgeBase:
                 connection.executemany(
                     """
                     INSERT INTO personal_document_pages (
-                        tenant_id, user_id, document_id, page_number, text, extraction_method
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        tenant_id, user_id, document_id, page_number, text, extraction_method, blocks_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -208,6 +238,7 @@ class SQLitePersonalKnowledgeBase:
                             page["page_number"],
                             page["text"],
                             page["extraction_method"],
+                            json.dumps(page["blocks"], ensure_ascii=False, separators=(",", ":")),
                         )
                         for page in pages
                     ],
@@ -224,8 +255,8 @@ class SQLitePersonalKnowledgeBase:
                     """
                     INSERT INTO personal_index_manifests (
                         tenant_id, user_id, document_id, content_sha256, chunk_count,
-                        embedding_model, embedding_dimension, index_status, indexed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        chunking_version, embedding_model, embedding_dimension, index_status, indexed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         tenant_id,
@@ -233,6 +264,7 @@ class SQLitePersonalKnowledgeBase:
                         document_id,
                         content_sha256,
                         len(records),
+                        CHUNKING_VERSION,
                         embedding_provider.model_name if embedding_provider else None,
                         embedding_dimension,
                         "vector_ready" if embedding_provider else "lexical_ready",
@@ -285,7 +317,7 @@ class SQLitePersonalKnowledgeBase:
             rows = connection.execute(
                 """
                 SELECT d.document_id, d.filename, d.page_count, d.text_characters, d.created_at,
-                       m.content_sha256, m.chunk_count, m.embedding_model,
+                       m.content_sha256, m.chunk_count, m.chunking_version, m.embedding_model,
                        m.embedding_dimension, m.index_status, m.indexed_at
                 FROM personal_documents d
                 JOIN personal_document_acl a
@@ -322,17 +354,109 @@ class SQLitePersonalKnowledgeBase:
             )
             return cursor.rowcount == 1
 
+    def vector_index_ready(self, tenant_id: str, user_id: str, embedding_model: str) -> bool:
+        documents = self.list_documents(tenant_id, user_id)
+        return bool(documents) and all(
+            document["index_status"] == "vector_ready"
+            and document["chunking_version"] == CHUNKING_VERSION
+            and document["embedding_model"] == embedding_model
+            for document in documents
+        )
+
+    def reindex_documents(
+        self,
+        tenant_id: str,
+        user_id: str,
+        embedding_provider: EmbeddingProvider,
+    ) -> dict[str, int | str]:
+        documents = self.list_documents(tenant_id, user_id)
+        indexed_chunks = 0
+        for document in documents:
+            document_id = str(document["document_id"])
+            with self._lock, self._connection() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT page_number, text, extraction_method, blocks_json FROM personal_document_pages
+                    WHERE tenant_id = ? AND user_id = ? AND document_id = ? ORDER BY page_number
+                    """,
+                    (tenant_id, user_id, document_id),
+                ).fetchall()
+            corpus = _document_corpus(
+                document_id,
+                str(document["filename"]),
+                tuple(dict(row) for row in rows),
+                embedding_provider,
+                self.tokenizer,
+            )
+            corpus.index_embeddings()
+            records = corpus.index_records()
+            dimension = len(records[0]["embedding"]) if records else None
+            if dimension is None or any(record["embedding"] is None for record in records):
+                raise ValueError("personal knowledge vector indexing produced incomplete records")
+            indexed_at = datetime.now(UTC).isoformat()
+            with self._lock, self._connection() as connection:
+                connection.execute(
+                    """
+                    DELETE FROM personal_chunk_embeddings
+                    WHERE tenant_id = ? AND user_id = ? AND document_id = ?
+                    """,
+                    (tenant_id, user_id, document_id),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO personal_chunk_embeddings (
+                        tenant_id, user_id, document_id, chunk_id, vector_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            tenant_id,
+                            user_id,
+                            document_id,
+                            record["chunk_id"],
+                            json.dumps(record["embedding"], separators=(",", ":")),
+                        )
+                        for record in records
+                    ],
+                )
+                connection.execute(
+                    """
+                    UPDATE personal_index_manifests
+                    SET chunk_count = ?, chunking_version = ?, embedding_model = ?, embedding_dimension = ?,
+                        index_status = 'vector_ready', indexed_at = ?
+                    WHERE tenant_id = ? AND user_id = ? AND document_id = ?
+                    """,
+                    (
+                        len(records),
+                        CHUNKING_VERSION,
+                        embedding_provider.model_name,
+                        dimension,
+                        indexed_at,
+                        tenant_id,
+                        user_id,
+                        document_id,
+                    ),
+                )
+            indexed_chunks += len(records)
+        return {
+            "documents": len(documents),
+            "chunks": indexed_chunks,
+            "embedding_model": embedding_provider.model_name,
+        }
+
     def corpus(
         self,
         tenant_id: str,
         user_id: str,
         *,
         embedding_provider: EmbeddingProvider | None = None,
+        minimum_vector_similarity: float = 0.5,
     ) -> InMemoryCorpus:
         with self._lock, self._connection() as connection:
             rows = connection.execute(
                 """
-                SELECT d.document_id, d.filename, p.page_number, p.text, p.extraction_method
+                SELECT d.document_id, d.filename, p.page_number, p.text, p.extraction_method,
+                       p.blocks_json
                 FROM personal_documents d
                 JOIN personal_document_pages p USING (tenant_id, user_id, document_id)
                 JOIN personal_document_acl a
@@ -353,25 +477,66 @@ class SQLitePersonalKnowledgeBase:
                     """,
                     (tenant_id, user_id, embedding_provider.model_name),
                 ).fetchall()
-        corpus = InMemoryCorpus(embedding_provider=embedding_provider)
+        corpus = InMemoryCorpus(
+            tokenizer=self.tokenizer,
+            embedding_provider=embedding_provider,
+            minimum_vector_similarity=minimum_vector_similarity,
+        )
+        documents: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for row in rows:
-            corpus.ingest(
-                CorpusDocument.create(
-                    title=f"{row['filename']}#page={row['page_number']}",
-                    text=str(row["text"]),
+            documents.setdefault((str(row["document_id"]), str(row["filename"])), []).append(
+                {
+                    "page_number": int(row["page_number"]),
+                    "text": str(row["text"]),
+                    "extraction_method": str(row["extraction_method"]),
+                    "blocks_json": str(row["blocks_json"]),
+                }
+            )
+        for (document_id, filename), pages in documents.items():
+            blocks = [
+                block
+                for page in pages
+                for block in json.loads(str(page.get("blocks_json") or "[]"))
+            ]
+            if blocks:
+                corpus.ingest_blocks(
+                    document_id=document_id,
+                    title=filename,
+                    blocks=blocks,
                     metadata={
-                        "document_id": str(row["document_id"]),
-                        "corpus_record_id": f"{row['document_id']}:{row['page_number']}",
-                        "document_title": str(row["filename"]),
-                        "file_name": str(row["filename"]),
-                        "source_page": int(row["page_number"]),
-                        "extraction_method": str(row["extraction_method"]),
+                        "document_id": document_id,
+                        "document_title": filename,
+                        "file_name": filename,
+                        "extraction_method": str(pages[0]["extraction_method"]),
                         "kb_name": "personal_knowledge",
                     },
                 )
-            )
+                continue
+            for page in pages:
+                corpus.ingest(
+                    CorpusDocument.create(
+                        title=f"{filename}#page={page['page_number']}",
+                        text=str(page["text"]),
+                        metadata={
+                            "document_id": document_id,
+                            "corpus_record_id": f"{document_id}:{page['page_number']}",
+                            "document_title": filename,
+                            "file_name": filename,
+                            "source_page": int(page["page_number"]),
+                            "extraction_method": str(page["extraction_method"]),
+                            "kb_name": "personal_knowledge",
+                        },
+                    )
+                )
+        current_chunk_ids = {str(record["chunk_id"]) for record in corpus.index_records()}
         for row in embeddings:
-            corpus.restore_embedding(str(row["chunk_id"]), json.loads(row["vector_json"]))
+            chunk_id = str(row["chunk_id"])
+            if chunk_id in current_chunk_ids:
+                corpus.restore_embedding(chunk_id, json.loads(row["vector_json"]))
+        if embedding_provider is not None and any(
+            record["embedding"] is None for record in corpus.index_records()
+        ):
+            raise ValueError("personal knowledge vector index is not ready; run reindex first")
         return corpus
 
 
@@ -380,8 +545,31 @@ def _document_corpus(
     filename: str,
     pages: Sequence[Mapping[str, Any]],
     embedding_provider: EmbeddingProvider | None,
+    tokenizer: DocumentTokenizer,
 ) -> InMemoryCorpus:
-    corpus = InMemoryCorpus(embedding_provider=embedding_provider)
+    corpus = InMemoryCorpus(tokenizer=tokenizer, embedding_provider=embedding_provider)
+    blocks = [
+        block
+        for page in pages
+        for block in (
+            page.get("blocks")
+            or json.loads(str(page.get("blocks_json") or "[]"))
+        )
+    ]
+    if blocks:
+        corpus.ingest_blocks(
+            document_id=document_id,
+            title=filename,
+            blocks=blocks,
+            metadata={
+                "document_id": document_id,
+                "document_title": filename,
+                "file_name": filename,
+                "extraction_method": str(pages[0]["extraction_method"]),
+                "kb_name": "personal_knowledge",
+            },
+        )
+        return corpus
     for page in pages:
         corpus.ingest(
             CorpusDocument.create(
@@ -409,11 +597,13 @@ class PersonalKnowledgeClient:
         user_id: str,
         *,
         embedding_provider: EmbeddingProvider | None = None,
+        minimum_vector_similarity: float = 0.5,
     ) -> None:
         self.store = store
         self.tenant_id = tenant_id
         self.user_id = user_id
         self.embedding_provider = embedding_provider
+        self.minimum_vector_similarity = minimum_vector_similarity
         self._corpus: InMemoryCorpus | None = None
 
     def search_json(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -422,6 +612,7 @@ class PersonalKnowledgeClient:
                 self.tenant_id,
                 self.user_id,
                 embedding_provider=self.embedding_provider,
+                minimum_vector_similarity=self.minimum_vector_similarity,
             )
         result = self._corpus.search_json(payload)
         trace = dict(result["trace"])
@@ -452,11 +643,55 @@ def _validated_document(document: Mapping[str, Any]) -> tuple[str, str, tuple[di
             raise ValueError("personal knowledge page text is invalid")
         if extraction_method not in {"paddleocr", "mcp"}:
             raise ValueError("personal knowledge extraction method is invalid")
+        raw_blocks = value.get("blocks") or []
+        if isinstance(raw_blocks, (str, bytes)) or not isinstance(raw_blocks, Sequence):
+            raise ValueError("personal knowledge page blocks must be an array")
+        blocks: list[dict[str, Any]] = []
+        for raw_block in raw_blocks:
+            if not isinstance(raw_block, Mapping):
+                raise ValueError("personal knowledge block must be an object")
+            label = raw_block.get("label")
+            content = raw_block.get("content")
+            block_page = raw_block.get("page_number")
+            order = raw_block.get("order")
+            paragraph_title = raw_block.get("paragraph_title")
+            bbox = raw_block.get("bbox")
+            if label not in {"text", "heading", "table", "chart"}:
+                raise ValueError("personal knowledge block label is invalid")
+            if not isinstance(content, str) or not content.strip() or len(content) > 500_000:
+                raise ValueError("personal knowledge block content is invalid")
+            if block_page != page_number:
+                raise ValueError("personal knowledge block page does not match its parent page")
+            if isinstance(order, bool) or not isinstance(order, int) or order < 0:
+                raise ValueError("personal knowledge block order is invalid")
+            if paragraph_title is not None and (
+                not isinstance(paragraph_title, str) or len(paragraph_title) > 1_000
+            ):
+                raise ValueError("personal knowledge block paragraph title is invalid")
+            if bbox is not None and (
+                isinstance(bbox, (str, bytes))
+                or not isinstance(bbox, Sequence)
+                or len(bbox) != 4
+                or any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in bbox)
+                or any(not math.isfinite(float(item)) for item in bbox)
+            ):
+                raise ValueError("personal knowledge block bbox is invalid")
+            blocks.append(
+                {
+                    "label": label,
+                    "content": content.strip(),
+                    "page_number": block_page,
+                    "order": order,
+                    "paragraph_title": paragraph_title,
+                    "bbox": list(bbox) if bbox is not None else None,
+                }
+            )
         pages.append(
             {
                 "page_number": page_number,
                 "text": text.strip(),
                 "extraction_method": extraction_method,
+                "blocks": blocks,
             }
         )
     if len({page["page_number"] for page in pages}) != len(pages):

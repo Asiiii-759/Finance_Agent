@@ -34,6 +34,7 @@ def _load_dotenv() -> None:
         if key and key not in os.environ:
             os.environ[key] = value
 
+
 @dataclass(frozen=True)
 class AppConfig:
     output_dir: Path
@@ -66,6 +67,7 @@ class AppConfig:
     conversation_memory_enabled: bool = True
     conversation_context_tokens: int = 300_000
     conversation_recent_tokens: int = 20_000
+    conversation_atomic_fact_tokens: int = 32_000
     session_document_ttl_seconds: int = 60 * 60
     max_session_document_sessions: int = 100
     paddleocr_access_token: str | None = field(default=None, repr=False)
@@ -77,14 +79,17 @@ class AppConfig:
     embedding_model: str | None = None
     embedding_api_key: str | None = field(default=None, repr=False)
     embedding_timeout_seconds: float = 30.0
+    embedding_min_similarity: float = 0.5
+    document_tokenizer_path: Path = Path(".runtime/models/bge-m3/tokenizer.json")
     personal_memory_enabled: bool = True
     automatic_memory_consolidation_enabled: bool = True
     automatic_skill_learning_enabled: bool = True
     user_profile_path: Path | None = None
     personal_knowledge_enabled: bool = True
     max_personal_knowledge_documents: int = 100
-    planning_evidence_characters: int = 24_000
-    synthesis_evidence_characters: int = 48_000
+    planning_evidence_tokens: int = 48_000
+    synthesis_evidence_tokens: int = 96_000
+    context_control_reserve_tokens: int = 24_000
     synthesis_output_tokens: int = 4_096
     mcp_servers: tuple[McpServerConfig, ...] = ()
     alltick_token: str | None = field(default=None, repr=False)
@@ -109,6 +114,8 @@ class AppConfig:
                 raise ValueError(f"{principal_name} is invalid")
         if self.market_data_provider not in {"yahoo", "alphavantage", "offline", "disabled", "none"}:
             raise ValueError("unsupported market data provider")
+        if not -1 <= self.embedding_min_similarity <= 1:
+            raise ValueError("embedding minimum similarity must be between -1 and 1")
         if not 1 <= self.port <= 65_535:
             raise ValueError("port must be between 1 and 65535")
         if not 10 <= self.job_lease_seconds <= 3_600:
@@ -139,16 +146,27 @@ class AppConfig:
             raise ValueError("conversation context budget must be between 16000 and 300000 tokens")
         if not 4_000 <= self.conversation_recent_tokens <= 100_000:
             raise ValueError("recent conversation budget must be between 4000 and 100000 tokens")
+        if not 4_000 <= self.conversation_atomic_fact_tokens <= 100_000:
+            raise ValueError("atomic-fact context budget must be between 4000 and 100000 tokens")
         if self.session_document_ttl_seconds < 60:
             raise ValueError("session document TTL must be at least 60 seconds")
         if self.max_session_document_sessions < 1:
             raise ValueError("session document session limit must be positive")
         if not 1 <= self.max_personal_knowledge_documents <= 10_000:
             raise ValueError("personal knowledge document limit is invalid")
-        if not 4_000 <= self.planning_evidence_characters <= 200_000:
-            raise ValueError("planning evidence budget must be between 4000 and 200000 characters")
-        if not 4_000 <= self.synthesis_evidence_characters <= 200_000:
-            raise ValueError("synthesis evidence budget must be between 4000 and 200000 characters")
+        if not 4_000 <= self.planning_evidence_tokens <= 200_000:
+            raise ValueError("planning evidence budget must be between 4000 and 200000 tokens")
+        if not 4_000 <= self.synthesis_evidence_tokens <= 200_000:
+            raise ValueError("synthesis evidence budget must be between 4000 and 200000 tokens")
+        if not 4_000 <= self.context_control_reserve_tokens <= 100_000:
+            raise ValueError("context control reserve must be between 4000 and 100000 tokens")
+        if (
+            max(self.planning_evidence_tokens, self.synthesis_evidence_tokens)
+            + self.context_control_reserve_tokens
+            + 16_000
+            > self.model_input_token_budget
+        ):
+            raise ValueError("model input budget cannot fit evidence, control and conversation context")
         if not 256 <= self.synthesis_output_tokens <= 4_096:
             raise ValueError("synthesis output tokens must be between 256 and 4096")
         if len(self.mcp_servers) > 4:
@@ -209,6 +227,7 @@ class AppConfig:
             in {"1", "true", "yes"},
             conversation_context_tokens=int(os.getenv("MAS_CONVERSATION_CONTEXT_TOKENS", "300000")),
             conversation_recent_tokens=int(os.getenv("MAS_CONVERSATION_RECENT_TOKENS", "20000")),
+            conversation_atomic_fact_tokens=int(os.getenv("MAS_CONVERSATION_ATOMIC_FACT_TOKENS", "32000")),
             session_document_ttl_seconds=int(os.getenv("MAS_SESSION_DOCUMENT_TTL_SECONDS", str(60 * 60))),
             max_session_document_sessions=int(os.getenv("MAS_MAX_SESSION_DOCUMENT_SESSIONS", "100")),
             paddleocr_access_token=os.getenv("PADDLEOCR_ACCESS_TOKEN") or None,
@@ -223,30 +242,31 @@ class AppConfig:
             embedding_model=os.getenv("MAS_EMBEDDING_MODEL") or None,
             embedding_api_key=os.getenv("MAS_EMBEDDING_API_KEY") or None,
             embedding_timeout_seconds=float(os.getenv("MAS_EMBEDDING_TIMEOUT_SECONDS", "30")),
+            embedding_min_similarity=float(os.getenv("MAS_EMBEDDING_MIN_SIMILARITY", "0.5")),
+            document_tokenizer_path=Path(
+                os.getenv("MAS_DOCUMENT_TOKENIZER_PATH", ".runtime/models/bge-m3/tokenizer.json")
+            ),
             personal_memory_enabled=os.getenv("MAS_PERSONAL_MEMORY_ENABLED", "true").strip().lower()
             in {"1", "true", "yes"},
-            automatic_memory_consolidation_enabled=os.getenv(
-                "MAS_AUTOMATIC_MEMORY_CONSOLIDATION_ENABLED", "true"
-            ).strip().lower()
+            automatic_memory_consolidation_enabled=os.getenv("MAS_AUTOMATIC_MEMORY_CONSOLIDATION_ENABLED", "true")
+            .strip()
+            .lower()
             in {"1", "true", "yes"},
-            automatic_skill_learning_enabled=os.getenv(
-                "MAS_AUTOMATIC_SKILL_LEARNING_ENABLED", "true"
-            ).strip().lower()
+            automatic_skill_learning_enabled=os.getenv("MAS_AUTOMATIC_SKILL_LEARNING_ENABLED", "true").strip().lower()
             in {"1", "true", "yes"},
             user_profile_path=(Path(value) if (value := os.getenv("MAS_USER_PROFILE_PATH")) else None),
             personal_knowledge_enabled=os.getenv("MAS_PERSONAL_KNOWLEDGE_ENABLED", "true").strip().lower()
             in {"1", "true", "yes"},
             max_personal_knowledge_documents=int(os.getenv("MAS_MAX_PERSONAL_KNOWLEDGE_DOCUMENTS", "100")),
-            planning_evidence_characters=int(os.getenv("MAS_PLANNING_EVIDENCE_CHARACTERS", "24000")),
-            synthesis_evidence_characters=int(os.getenv("MAS_SYNTHESIS_EVIDENCE_CHARACTERS", "48000")),
+            planning_evidence_tokens=int(os.getenv("MAS_PLANNING_EVIDENCE_TOKENS", "48000")),
+            synthesis_evidence_tokens=int(os.getenv("MAS_SYNTHESIS_EVIDENCE_TOKENS", "96000")),
+            context_control_reserve_tokens=int(os.getenv("MAS_CONTEXT_CONTROL_RESERVE_TOKENS", "24000")),
             synthesis_output_tokens=int(os.getenv("MAS_SYNTHESIS_OUTPUT_TOKENS", "4096")),
             mcp_servers=parse_mcp_servers_json(os.getenv("MAS_MCP_SERVERS")),
             alltick_token=os.getenv("ALLTICK_TOKEN") or None,
             biying_licence=os.getenv("BIYING_LICENCE") or None,
-            enable_yfinance_fallback=os.getenv("MAS_ENABLE_YFINANCE", "false").strip().lower()
-            in {"1", "true", "yes"},
-            enable_akshare_fallback=os.getenv("MAS_ENABLE_AKSHARE", "false").strip().lower()
-            in {"1", "true", "yes"},
+            enable_yfinance_fallback=os.getenv("MAS_ENABLE_YFINANCE", "false").strip().lower() in {"1", "true", "yes"},
+            enable_akshare_fallback=os.getenv("MAS_ENABLE_AKSHARE", "false").strip().lower() in {"1", "true", "yes"},
             fred_max_calls_per_minute=int(os.getenv("FRED_MAX_CALLS_PER_MINUTE", "8")),
             bocha_max_calls_per_minute=int(os.getenv("BOCHA_MAX_CALLS_PER_MINUTE", "6")),
             brave_max_calls_per_minute=int(os.getenv("BRAVE_MAX_CALLS_PER_MINUTE", "6")),

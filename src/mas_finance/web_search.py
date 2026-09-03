@@ -292,6 +292,22 @@ def web_search_harness_tool(
                 required=frozenset({"query"}),
                 optional=frozenset({"count", "freshness", "domains"}),
             ),
+            input_schema={
+                "type": "object",
+                "required": ["query"],
+                "additionalProperties": False,
+                "properties": {
+                    "query": {"type": "string", "minLength": 1, "maxLength": 400},
+                    "count": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "freshness": {"type": "string", "enum": ["pd", "pw", "pm", "py"]},
+                    "domains": {
+                        "type": "array",
+                        "maxItems": 10,
+                        "uniqueItems": True,
+                        "items": {"type": "string", "minLength": 4, "maxLength": 253},
+                    },
+                },
+            },
         ),
         lambda arguments, _context: adapter.search(arguments),
     )

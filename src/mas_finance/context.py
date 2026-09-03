@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict, deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-from .agent import ResearchRequest
+from .agent import AgentContext, ChatTurn
 from .contracts import Evidence, EvidenceBundle, SourceType
 
 
@@ -18,43 +18,88 @@ from .contracts import Evidence, EvidenceBundle, SourceType
 class ContextManifest:
     included_evidence_ids: tuple[str, ...]
     omitted_evidence_count: int
-    evidence_characters: int
-    max_evidence_characters: int
-    max_item_characters: int
+    evidence_tokens: int
+    max_evidence_tokens: int
     groups: tuple[str, ...]
     source_type_counts: Mapping[str, int]
+    thread_context_tokens: int
+    personal_context_tokens: int
+    omitted_personal_context_count: int
+    reserved_tokens: int
+    total_context_tokens: int
+    max_context_tokens: int
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "included_evidence_ids": list(self.included_evidence_ids),
             "omitted_evidence_count": self.omitted_evidence_count,
-            "evidence_characters": self.evidence_characters,
-            "max_evidence_characters": self.max_evidence_characters,
-            "max_item_characters": self.max_item_characters,
+            "evidence_tokens": self.evidence_tokens,
+            "max_evidence_tokens": self.max_evidence_tokens,
             "groups": list(self.groups),
             "source_type_counts": dict(self.source_type_counts),
+            "thread_context_tokens": self.thread_context_tokens,
+            "personal_context_tokens": self.personal_context_tokens,
+            "omitted_personal_context_count": self.omitted_personal_context_count,
+            "reserved_tokens": self.reserved_tokens,
+            "total_context_tokens": self.total_context_tokens,
+            "max_context_tokens": self.max_context_tokens,
         }
 
 
 class FinancialContextAssembler:
-    """Select evidence fairly across entity/source groups within a hard character budget."""
+    """Select complete evidence passages fairly within a hard token budget."""
 
-    def __init__(self, *, max_evidence_chars: int = 48_000, max_item_chars: int = 2_400) -> None:
-        if max_evidence_chars < 1_000 or max_item_chars < 200:
-            raise ValueError("context budgets are too small")
-        self.max_evidence_chars = max_evidence_chars
-        self.max_item_chars = max_item_chars
+    def __init__(
+        self,
+        *,
+        max_evidence_tokens: int,
+        count_tokens: Callable[[str], int],
+        max_context_tokens: int = 300_000,
+    ) -> None:
+        if max_evidence_tokens < 1_000:
+            raise ValueError("context token budget is too small")
+        self.max_evidence_tokens = max_evidence_tokens
+        self.count_tokens = count_tokens
+        if max_context_tokens < max_evidence_tokens + 1_000:
+            raise ValueError("context budget cannot fit the evidence budget")
+        self.max_context_tokens = max_context_tokens
 
     def build(
         self,
-        request: ResearchRequest,
+        turn: ChatTurn,
+        agent_context: AgentContext,
         bundle: EvidenceBundle,
         *,
         research_context: Mapping[str, Any] | None = None,
+        reserved_tokens: int = 0,
     ) -> tuple[dict[str, Any], ContextManifest]:
+        if reserved_tokens < 0 or reserved_tokens >= self.max_context_tokens:
+            raise ValueError("reserved context tokens are invalid")
+        context = dict(research_context or {})
+        thread_context = _safe_thread_context(agent_context.thread_context)
+        base_payload = {
+            "prompt_version": "finance-evidence-synthesis-v3",
+            "task": {
+                "message": turn.message,
+                "response_language": "zh" if _contains_cjk(turn.message) else "en",
+            },
+            "research": {
+                "scope": context.get("scope"),
+                "coverage": context.get("coverage"),
+                "unresolved_gaps": context.get("unresolved_gaps", []),
+                "stop_reason": context.get("stop_reason"),
+            },
+            "thread_context": thread_context,
+            "personal_context": [],
+            "evidence": [],
+        }
+        base_tokens = self.count_tokens(json.dumps(base_payload, ensure_ascii=False, separators=(",", ":")))
+        remaining = self.max_context_tokens - reserved_tokens - base_tokens
+        if remaining < 0:
+            raise ValueError("thread and control context exceed the model input budget")
         ranked = sorted(
             bundle.evidence.values(),
-            key=lambda item: self._score(request.query, item),
+            key=lambda item: self._score(turn.message, item),
             reverse=True,
         )
         grouped: dict[str, deque[Evidence]] = defaultdict(deque)
@@ -70,24 +115,35 @@ class FinancialContextAssembler:
             if not candidates:
                 continue
             item = candidates.popleft()
-            card = self._card(item, request.query)
-            card_characters = len(json.dumps(card, ensure_ascii=False, separators=(",", ":")))
-            if used + card_characters <= self.max_evidence_chars:
-                selected.append((item, card, card_characters))
-                used += card_characters
+            card = self._card(item)
+            card_tokens = self.count_tokens(json.dumps(card, ensure_ascii=False, separators=(",", ":")))
+            if used + card_tokens <= min(self.max_evidence_tokens, remaining):
+                selected.append((item, card, card_tokens))
+                used += card_tokens
             if candidates:
                 active.append(group)
 
-        evidence_cards = [card for _item, card, _characters in selected]
-        context = dict(research_context or {})
-        thread_context = _safe_thread_context(request.thread_context)
+        evidence_cards = [card for _item, card, _tokens in selected]
+        remaining -= used
+        personal_ranked = sorted(
+            (dict(item) for item in agent_context.personal_context),
+            key=lambda item: self._personal_score(turn.message, item),
+            reverse=True,
+        )
+        personal_context: list[dict[str, Any]] = []
+        personal_tokens = 0
+        for personal_item in personal_ranked:
+            item_tokens = self.count_tokens(
+                json.dumps(personal_item, ensure_ascii=False, separators=(",", ":"))
+            )
+            if personal_tokens + item_tokens <= remaining:
+                personal_context.append(personal_item)
+                personal_tokens += item_tokens
         payload = {
             "prompt_version": "finance-evidence-synthesis-v3",
-            "entities": list(request.entities),
             "task": {
-                "query": request.query,
-                "entities": list(request.entities),
-                "response_language": "zh" if _contains_cjk(request.query) else "en",
+                "message": turn.message,
+                "response_language": "zh" if _contains_cjk(turn.message) else "en",
             },
             "research": {
                 "scope": context.get("scope"),
@@ -96,15 +152,19 @@ class FinancialContextAssembler:
                 "stop_reason": context.get("stop_reason"),
             },
             "thread_context": thread_context,
-            "personal_context": [dict(item) for item in request.personal_context],
+            "personal_context": personal_context,
             "evidence": evidence_cards,
         }
+        total_context_tokens = self.count_tokens(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        ) + reserved_tokens
+        if total_context_tokens > self.max_context_tokens:
+            raise ValueError("assembled context exceeds the model input budget")
         manifest = ContextManifest(
             included_evidence_ids=tuple(item.evidence_id for item, _card, _characters in selected),
             omitted_evidence_count=len(bundle.evidence) - len(selected),
-            evidence_characters=used,
-            max_evidence_characters=self.max_evidence_chars,
-            max_item_characters=self.max_item_chars,
+            evidence_tokens=used,
+            max_evidence_tokens=self.max_evidence_tokens,
             groups=tuple(sorted(grouped)),
             source_type_counts={
                 source_type.value: sum(
@@ -112,13 +172,27 @@ class FinancialContextAssembler:
                 )
                 for source_type in SourceType
             },
+            thread_context_tokens=self.count_tokens(
+                json.dumps(thread_context, ensure_ascii=False, separators=(",", ":"))
+            ),
+            personal_context_tokens=personal_tokens,
+            omitted_personal_context_count=len(agent_context.personal_context) - len(personal_context),
+            reserved_tokens=reserved_tokens,
+            total_context_tokens=total_context_tokens,
+            max_context_tokens=self.max_context_tokens,
         )
         return payload, manifest
 
-    def _card(self, item: Evidence, query: str) -> dict[str, Any]:
+    @staticmethod
+    def _personal_score(query: str, item: Mapping[str, Any]) -> tuple[int, str]:
+        terms = _tokens(query)
+        text = json.dumps(item, ensure_ascii=False, sort_keys=True).casefold()
+        return sum(term in text for term in terms), text
+
+    def _card(self, item: Evidence) -> dict[str, Any]:
         return {
             "evidence_id": item.evidence_id,
-            "content": _query_window(item.content, query, self.max_item_chars),
+            "content": item.content,
             "entity": item.entity,
             "field_name": item.field_name,
             "value": item.value,
@@ -214,16 +288,3 @@ def _tokens(text: str) -> set[str]:
 
 def _contains_cjk(text: str) -> bool:
     return any("\u4e00" <= character <= "\u9fff" for character in text)
-
-
-def _query_window(content: str, query: str, limit: int) -> str:
-    if len(content) <= limit:
-        return content
-    lowered = content.casefold()
-    positions = [lowered.find(term) for term in sorted(_tokens(query), key=len, reverse=True)]
-    matches = [position for position in positions if position >= 0]
-    if not matches:
-        return content[:limit]
-    center = min(matches)
-    start = max(0, center - limit // 3)
-    return content[start : start + limit]

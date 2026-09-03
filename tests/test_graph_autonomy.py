@@ -4,9 +4,10 @@ import json
 import unittest
 
 import httpx
-from llm_fixtures import NullPlanner, ScriptedLLM, llm_backed_agent
+from llm_fixtures import NullPlanner, ScriptedLLM, agent_run_input, llm_backed_agent
 
-from mas_finance.agent import CoverageAssessor, ResearchRequest
+from mas_finance.adequacy import LLMEvidenceAdequacyChecker, llm_evidence_adequacy_harness_tool
+from mas_finance.agent import ChatTurn, CoverageAssessor
 from mas_finance.contracts import EvidenceBundle
 from mas_finance.harness import ExecutionPolicy, ToolContext, ToolHarness
 from mas_finance.metrics import financial_calculation_harness_tool
@@ -65,7 +66,7 @@ class GraphAutonomyTests(unittest.TestCase):
                             {
                                 "operation": "cagr",
                                 "inputs": {"beginning_value": 100.0, "ending_value": 121.0, "years": 2.0},
-                                        "label": "cagr",
+                                "label": "cagr",
                             }
                         ]
                     },
@@ -81,12 +82,9 @@ class GraphAutonomyTests(unittest.TestCase):
                 network_access=False,
             )
         )
-        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness)).run(
-            ResearchRequest(
+        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness, count_tokens=len)).run(
+            *agent_run_input(
                 query="一项投资从100增长到121，用了2年，CAGR是多少？",
-                require_documents=False,
-                require_market_data=False,
-                require_regulatory_data=False,
                 run_id="model-tool-choice",
                 max_model_calls=4,
             )
@@ -97,12 +95,110 @@ class GraphAutonomyTests(unittest.TestCase):
             [item["tool_name"] for item in outcome.audit_events],
             ["llm.task_frame", "llm.plan", "finance.calculate", "llm.plan", "llm.synthesize"],
         )
-        self.assertEqual(outcome.state.context_manifests[0]["phase"], "planning")
+        planning_manifest = next(
+            item for item in outcome.state.context_manifests if item["phase"] == "planning"
+        )
         self.assertIn("金融研究 Agent", llm.system_prompts[0])
         self.assertLessEqual(
-            outcome.state.context_manifests[0]["evidence_characters"],
-            outcome.state.context_manifests[0]["max_evidence_characters"],
+            planning_manifest["evidence_tokens"],
+            planning_manifest["max_evidence_tokens"],
         )
+
+    def test_invalid_planner_output_gets_one_model_repair(self) -> None:
+        harness = ToolHarness()
+        llm = ScriptedLLM(
+            [
+                {
+                    "action": "call_tool",
+                    "tool_name": "invented.calculate",
+                    "arguments": {},
+                    "reason": "错误地选择了不存在的工具。",
+                },
+                {
+                    "action": "call_tool",
+                    "tool_name": "finance.calculate",
+                    "arguments": {
+                        "requests": [
+                            {
+                                "operation": "cagr",
+                                "inputs": {"beginning_value": 100.0, "ending_value": 121.0, "years": 2.0},
+                                "label": "cagr",
+                            }
+                        ]
+                    },
+                    "reason": "根据目录改用确定性计算工具。",
+                },
+                {"action": "finish", "reason": "计算证据已经覆盖需求。"},
+            ]
+        )
+        harness.register(financial_calculation_harness_tool())
+        harness.register(llm_planning_harness_tool(llm, network_access=False))
+        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness, count_tokens=len)).run(
+            *agent_run_input(
+                query="一项投资从100增长到121，用了2年，CAGR是多少？",
+                run_id="planner-output-repair",
+                max_model_calls=6,
+            )
+        )
+        self.assertEqual(outcome.status, "succeeded")
+        self.assertEqual([item.task.tool_name for item in outcome.state.observations], ["finance.calculate"])
+        self.assertIn("planner_response_repair", json.loads(llm.user_prompts[1]))
+        self.assertEqual(
+            sum(item["tool_name"] == "llm.plan" for item in outcome.audit_events),
+            3,
+        )
+
+    def test_model_changes_invalid_tool_arguments_after_structured_error(self) -> None:
+        harness = ToolHarness()
+        llm = ScriptedLLM(
+            [
+                {
+                    "action": "call_tool",
+                    "tool_name": "finance.calculate",
+                    "arguments": {
+                        "requests": [
+                            {
+                                "operation": "cagr",
+                                "inputs": {"beginning_value": 100.0, "ending_value": 121.0},
+                                "label": "cagr",
+                            }
+                        ]
+                    },
+                    "reason": "先尝试计算 CAGR。",
+                },
+                {
+                    "action": "call_tool",
+                    "tool_name": "finance.calculate",
+                    "arguments": {
+                        "requests": [
+                            {
+                                "operation": "cagr",
+                                "inputs": {"beginning_value": 100.0, "ending_value": 121.0, "years": 2.0},
+                                "label": "cagr",
+                            }
+                        ]
+                    },
+                    "reason": "根据错误详情补充缺失的 years。",
+                },
+                {"action": "finish", "reason": "修正后的计算证据已经覆盖需求。"},
+            ]
+        )
+        harness.register(financial_calculation_harness_tool())
+        harness.register(llm_planning_harness_tool(llm, network_access=False))
+        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness, count_tokens=len)).run(
+            *agent_run_input(
+                query="一项投资从100增长到121，用了2年，CAGR是多少？",
+                run_id="tool-argument-repair",
+                max_model_calls=6,
+            )
+        )
+        self.assertEqual(outcome.status, "succeeded")
+        self.assertEqual(len(outcome.state.observations), 2)
+        self.assertEqual(outcome.state.observations[0].result["error_code"], "invalid_tool_arguments")
+        self.assertEqual(outcome.state.observations[0].result["error_details"]["missing_fields"], ["years"])
+        self.assertTrue(outcome.state.observations[1].result["ok"])
+        second_plan_context = json.loads(llm.user_prompts[1])
+        self.assertEqual(second_plan_context["prior_actions"][0]["error_details"]["model_action"], "change_arguments")
 
     def test_task_frame_replaces_rule_scope_on_the_llm_path(self) -> None:
         harness = ToolHarness()
@@ -123,12 +219,11 @@ class GraphAutonomyTests(unittest.TestCase):
         harness.register(llm_planning_harness_tool(llm, network_access=False))
         outcome = llm_backed_agent(
             harness,
-            planner=ModelPlanner(harness),
+            planner=ModelPlanner(harness, count_tokens=len),
             task_interpreter=LLMTaskInterpreter(harness),
         ).run(
-            ResearchRequest(
+            *agent_run_input(
                 query="解释市盈率",
-                require_documents=False,
                 run_id="task-frame-scope",
                 max_model_calls=4,
             )
@@ -164,9 +259,8 @@ class GraphAutonomyTests(unittest.TestCase):
             planner=NullPlanner(),
             task_interpreter=LLMTaskInterpreter(harness),
         ).run(
-            ResearchRequest(
+            *agent_run_input(
                 query="它的回撤呢？",
-                require_documents=False,
                 run_id="task-frame-clarification",
                 thread_context={"atomic_facts": [{"entities": ["Apple", "Microsoft"]}]},
             )
@@ -202,10 +296,9 @@ class GraphAutonomyTests(unittest.TestCase):
                 network_access=False,
             )
         )
-        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness)).run(
-            ResearchRequest(
+        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness, count_tokens=len)).run(
+            *agent_run_input(
                 query="一项投资从100增长到121，用了2年，CAGR是多少？",
-                require_documents=False,
                 run_id="premature-finish",
                 max_iterations=3,
                 max_model_calls=5,
@@ -240,10 +333,9 @@ class GraphAutonomyTests(unittest.TestCase):
                 network_access=False,
             )
         )
-        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness)).run(
-            ResearchRequest(
+        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness, count_tokens=len)).run(
+            *agent_run_input(
                 query="What changed in ACME's covenant outlook this week?",
-                require_documents=False,
                 allow_network=True,
                 run_id="model-web-search",
                 max_model_calls=4,
@@ -256,6 +348,133 @@ class GraphAutonomyTests(unittest.TestCase):
         evidence = next(iter(outcome.state.bundle.evidence.values()))
         self.assertEqual(evidence.source.source_type.value, "web")
         self.assertEqual(evidence.source.metadata["content_basis"], "search_result_snippet")
+
+    def test_semantic_evidence_gap_drives_retrieval_then_resolves(self) -> None:
+        harness = ToolHarness()
+        harness.register(web_search_harness_tool(WebSearchEvidenceAdapter(FixtureWebSearch())))
+        planner_llm = ScriptedLLM(
+            [
+                {
+                    "action": "call_tool",
+                    "tool_name": "web.search",
+                    "arguments": {"query": "ACME latest covenant", "count": 5},
+                    "reason": "先检索最新 covenant 信息。",
+                },
+                {"action": "finish", "reason": "初步检索完成。"},
+                {
+                    "action": "call_tool",
+                    "tool_name": "web.search",
+                    "arguments": {"query": "ACME covenant headroom amount latest quarter", "count": 5},
+                    "reason": "根据充分性缺口补查 covenant headroom 的具体金额。",
+                },
+                {"action": "finish", "reason": "补充检索后证据已充分。"},
+            ]
+        )
+        adequacy_llm = ScriptedLLM(
+            [
+                {
+                    "requirements": [
+                        {
+                            "requirement_key": "web:query:1",
+                            "status": "insufficient",
+                            "missing_information": ["缺少 covenant headroom 的具体金额"],
+                            "retrieval_hint": "检索最新季度 covenant headroom amount",
+                        }
+                    ]
+                },
+                {
+                    "requirements": [
+                        {
+                            "requirement_key": "web:query:1",
+                            "status": "sufficient",
+                            "missing_information": [],
+                            "retrieval_hint": "",
+                        }
+                    ]
+                },
+            ]
+        )
+        harness.register(llm_planning_harness_tool(planner_llm, network_access=False))
+        harness.register(llm_evidence_adequacy_harness_tool(adequacy_llm, network_access=False))
+        outcome = llm_backed_agent(
+            harness,
+            planner=ModelPlanner(harness, count_tokens=len),
+            adequacy_checker=LLMEvidenceAdequacyChecker(
+                harness,
+                max_evidence_tokens=48_000,
+                count_tokens=len,
+            ),
+        ).run(
+            *agent_run_input(
+                query="最新的 ACME covenant 情况是什么？",
+                run_id="semantic-retrieval-loop",
+                allow_network=True,
+                max_model_calls=9,
+            )
+        )
+        self.assertEqual(outcome.status, "degraded")
+        self.assertEqual([item.task.tool_name for item in outcome.state.observations], ["web.search", "web.search"])
+        semantic_gaps = [item for item in outcome.state.gaps if item.code == "evidence_semantically_insufficient"]
+        self.assertEqual(len(semantic_gaps), 1)
+        self.assertTrue(semantic_gaps[0].resolved)
+        third_planning_context = json.loads(planner_llm.user_prompts[2])
+        self.assertIn("covenant headroom amount", third_planning_context["unresolved_gaps"][0]["message"])
+        self.assertEqual(
+            sum(item["tool_name"] == "llm.validate_evidence" for item in outcome.audit_events),
+            2,
+        )
+
+    def test_semantically_insufficient_evidence_ends_with_explicit_abstention(self) -> None:
+        harness = ToolHarness()
+        harness.register(web_search_harness_tool(WebSearchEvidenceAdapter(FixtureWebSearch())))
+        planner_llm = ScriptedLLM(
+            [
+                {
+                    "action": "call_tool",
+                    "tool_name": "web.search",
+                    "arguments": {"query": "ACME covenant amount", "count": 5},
+                    "reason": "检索可用网页证据。",
+                },
+                {"action": "finish", "reason": "没有其它已授权来源可继续尝试。"},
+            ]
+        )
+        adequacy_llm = ScriptedLLM(
+            [
+                {
+                    "requirements": [
+                        {
+                            "requirement_key": "web:query:1",
+                            "status": "insufficient",
+                            "missing_information": ["搜索摘要未提供 covenant headroom 金额"],
+                            "retrieval_hint": "需要包含金额的一手公告正文",
+                        }
+                    ]
+                }
+            ]
+        )
+        harness.register(llm_planning_harness_tool(planner_llm, network_access=False))
+        harness.register(llm_evidence_adequacy_harness_tool(adequacy_llm, network_access=False))
+        outcome = llm_backed_agent(
+            harness,
+            planner=ModelPlanner(harness, count_tokens=len),
+            adequacy_checker=LLMEvidenceAdequacyChecker(
+                harness,
+                max_evidence_tokens=48_000,
+                count_tokens=len,
+            ),
+        ).run(
+            *agent_run_input(
+                query="最新 ACME covenant headroom 的具体金额是多少？",
+                run_id="semantic-abstention",
+                allow_network=True,
+                max_iterations=2,
+                max_model_calls=6,
+            )
+        )
+        self.assertEqual(outcome.state.stop_reason.value, "insufficient_evidence")
+        self.assertEqual(outcome.status, "degraded")
+        self.assertIn("当前证据不足以完整回答", outcome.state.report)
+        self.assertTrue(any(not item.resolved for item in outcome.state.gaps))
 
     def test_web_search_deduplicates_tracking_urls_and_requires_source_diversity(self) -> None:
         class DuplicateSearch:
@@ -286,9 +505,9 @@ class GraphAutonomyTests(unittest.TestCase):
         bundle = WebSearchEvidenceAdapter(DuplicateSearch()).search(
             {"query": "ACME liquidity", "count": 5}
         )["bundle"]
-        request = ResearchRequest(query="What changed in ACME liquidity this week?", require_documents=False)
+        turn = ChatTurn(message="What changed in ACME liquidity this week?")
         decision = CoverageAssessor().assess(
-            request,
+            turn,
             EvidenceBundle.from_dict(bundle),
             ResearchScope(
                 intents=(FinancialIntent.GENERAL_RESEARCH,),
@@ -330,7 +549,7 @@ class GraphAutonomyTests(unittest.TestCase):
         self.assertEqual(len(sources), 1)
         self.assertEqual(sources[0]["locator"], "https://reports.pbc.gov.cn/financial-statistics")
 
-    def test_invalid_model_tool_selection_fails_fast(self) -> None:
+    def test_invalid_model_tool_selection_fails_after_one_bad_repair(self) -> None:
         harness = ToolHarness()
         harness.register(financial_calculation_harness_tool())
         harness.register(
@@ -343,19 +562,23 @@ class GraphAutonomyTests(unittest.TestCase):
                             "arguments": {"url": "http://127.0.0.1"},
                             "reason": "Invalid autonomous action.",
                         },
-                        {"action": "finish", "reason": "已收集到可引用的证据。"},
+                        {
+                            "action": "call_tool",
+                            "tool_name": "browser.open_any_url",
+                            "arguments": {"url": "https://example.com"},
+                            "reason": "修复响应仍选择了不存在的工具。",
+                        },
                     ]
                 ),
                 network_access=False,
             )
         )
         with self.assertRaisesRegex(RuntimeError, "model planning response is unusable"):
-            llm_backed_agent(harness, planner=ModelPlanner(harness)).run(
-                ResearchRequest(
+            llm_backed_agent(harness, planner=ModelPlanner(harness, count_tokens=len)).run(
+                *agent_run_input(
                     query="解释市盈率",
-                    require_documents=False,
                     run_id="invalid-model-tool",
-                    max_model_calls=2,
+                    max_model_calls=3,
                 )
             )
 
@@ -532,12 +755,9 @@ class GraphAutonomyTests(unittest.TestCase):
         )
         harness.register(financial_calculation_harness_tool())
         harness.register(llm_planning_harness_tool(llm, network_access=False))
-        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness)).run(
-            ResearchRequest(
+        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness, count_tokens=len)).run(
+            *agent_run_input(
                 query="一项投资从100增长到121，用了2年，CAGR和百分比变化是多少？",
-                require_documents=False,
-                require_market_data=False,
-                require_regulatory_data=False,
                 run_id="multi-tool-plan",
                 max_model_calls=4,
                 max_parallel_tool_calls=2,

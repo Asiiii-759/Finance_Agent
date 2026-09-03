@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from .agent import ResearchPlan, ResearchState, ToolTask
@@ -18,6 +18,8 @@ from .harness import (
     ToolResultKind,
     ToolSpec,
     function_tool,
+    model_retry_policy,
+    model_tool_input_schema,
 )
 from .llm import BaseLLMClient
 
@@ -32,7 +34,9 @@ class ModelPlanner:
         self,
         harness: ToolHarness,
         *,
-        max_evidence_chars: int = 24_000,
+        max_evidence_tokens: int = 48_000,
+        max_context_tokens: int = 300_000,
+        count_tokens: Callable[[str], int],
         mcp_tool_index: Sequence[Mapping[str, Any]] = (),
         tool_usage_context: Sequence[Mapping[str, Any]] = (),
         learned_skills: Sequence[Mapping[str, Any]] = (),
@@ -41,9 +45,11 @@ class ModelPlanner:
         self.mcp_tool_index = tuple(dict(item) for item in mcp_tool_index)
         self.tool_usage_context = tuple(dict(item) for item in tool_usage_context)
         self.learned_skills = {str(item["skill_id"]): dict(item) for item in learned_skills}
+        self.count_tokens = count_tokens
         self.context_assembler = FinancialContextAssembler(
-            max_evidence_chars=max_evidence_chars,
-            max_item_chars=1_200,
+            max_evidence_tokens=max_evidence_tokens,
+            count_tokens=count_tokens,
+            max_context_tokens=max_context_tokens,
         )
         self._diagnostics: list[dict[str, str]] = []
         self._last_manifest: ContextManifest | None = None
@@ -51,26 +57,43 @@ class ModelPlanner:
     def plan(self, state: ResearchState, available_tools: Mapping[str, ToolSpec]) -> ResearchPlan:
         self._diagnostics = []
         self._last_manifest = None
+        planning_context = self._planning_context(state, available_tools)
+        raw = self._generate_plan(state, planning_context)
         try:
-            result = self.harness.invoke(
-                "llm.plan",
-                {
-                    "system_prompt": self._system_prompt(),
-                    "user_prompt": json.dumps(
-                        self._planning_context(state, available_tools),
-                        ensure_ascii=False,
-                    ),
-                    "temperature": 0.0,
-                    "max_tokens": 1600,
-                },
-                self._model_context(state),
-            )
-            if not result.ok or not isinstance(result.data, Mapping):
-                raise RuntimeError(f"model planning failed: {result.error_code or 'invalid_result'}")
-            payload = _parse_json_object(str(result.data.get("content") or ""))
+            payload = _parse_json_object(raw)
             return self._to_plan(payload, state, available_tools)
-        except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"model planning response is unusable ({type(exc).__name__})") from exc
+        except (ValueError, json.JSONDecodeError) as first_error:
+            repair_context = {
+                **planning_context,
+                "planner_response_repair": {
+                    "error_type": type(first_error).__name__,
+                    "error_message": str(first_error)[:500],
+                    "instruction": "重新生成一个完全符合系统 JSON 契约和当前工具目录的规划动作。",
+                },
+            }
+            repaired = self._generate_plan(state, repair_context)
+            try:
+                payload = _parse_json_object(repaired)
+                return self._to_plan(payload, state, available_tools)
+            except (ValueError, json.JSONDecodeError) as second_error:
+                raise RuntimeError(
+                    f"model planning response is unusable after one repair ({type(second_error).__name__})"
+                ) from second_error
+
+    def _generate_plan(self, state: ResearchState, planning_context: Mapping[str, Any]) -> str:
+        result = self.harness.invoke(
+            "llm.plan",
+            {
+                "system_prompt": self._system_prompt(),
+                "user_prompt": json.dumps(planning_context, ensure_ascii=False),
+                "temperature": 0.0,
+                "max_tokens": 1600,
+            },
+            self._model_context(state),
+        )
+        if not result.ok or not isinstance(result.data, Mapping):
+            raise RuntimeError(f"model planning failed: {result.error_code or 'invalid_result'}")
+        return str(result.data.get("content") or "")
 
     def diagnostics(self) -> tuple[dict[str, str], ...]:
         return tuple(dict(item) for item in self._diagnostics)
@@ -106,32 +129,23 @@ class ModelPlanner:
         state: ResearchState,
         available_tools: Mapping[str, ToolSpec],
     ) -> dict[str, Any]:
-        assembled, self._last_manifest = self.context_assembler.build(
-            state.request,
-            state.bundle,
-            research_context={
-                "task_frame": state.task_frame,
-                "scope": state.scope.to_dict() if state.scope else None,
-                "coverage": state.coverage.to_dict() if state.coverage else None,
-                "unresolved_gaps": [gap.to_dict() for gap in state.gaps if not gap.resolved],
-                "stop_reason": state.stop_reason.value if state.stop_reason else None,
-            },
-        )
         tools = [
             {
                 "name": spec.name,
                 "description": spec.description,
                 "network_access": spec.network_access,
                 "input_contract": spec.arguments.to_dict(),
+                **({"input_schema": dict(spec.input_schema)} if spec.input_schema is not None else {}),
             }
             for spec in available_tools.values()
         ]
-        user_request = state.request.to_dict()
-        user_request.pop("thread_context", None)
-        user_request.pop("personal_context", None)
-        return {
-            "user_request": user_request,
-            "intent_hints": state.scope.to_dict() if state.scope else None,
+        selected_skills = [
+            self.learned_skills[skill_id]
+            for skill_id in ((state.task_frame or {}).get("selected_skill_ids") or ())
+            if skill_id in self.learned_skills
+        ]
+        control_context = {
+            "current_turn": state.turn.to_dict(),
             "task_frame": state.task_frame,
             "coverage": state.coverage.to_dict() if state.coverage else None,
             "prior_actions": [
@@ -146,19 +160,42 @@ class ModelPlanner:
                 for item in state.observations
             ],
             "unresolved_gaps": [gap.to_dict() for gap in state.gaps if not gap.resolved],
+            "available_tools": tools,
+            "mcp_tool_index": list(self.mcp_tool_index),
+            "verified_tool_usage": list(self.tool_usage_context),
+            "selected_skills": selected_skills,
+            "discovery_results": _discovery_results(state),
+        }
+        repair_reserve = {
+            "planner_response_repair": {
+                "error_type": "ValidationError",
+                "error_message": "x" * 500,
+                "instruction": "重新生成一个完全符合系统 JSON 契约和当前工具目录的规划动作。",
+            }
+        }
+        reserved_tokens = self.count_tokens(
+            self._system_prompt()
+            + json.dumps(control_context, ensure_ascii=False, separators=(",", ":"))
+            + json.dumps(repair_reserve, ensure_ascii=False, separators=(",", ":"))
+        )
+        assembled, self._last_manifest = self.context_assembler.build(
+            state.turn,
+            state.context,
+            state.bundle,
+            research_context={
+                "scope": state.scope.to_dict() if state.scope else None,
+                "coverage": state.coverage.to_dict() if state.coverage else None,
+                "unresolved_gaps": [gap.to_dict() for gap in state.gaps if not gap.resolved],
+                "stop_reason": state.stop_reason.value if state.stop_reason else None,
+            },
+            reserved_tokens=reserved_tokens,
+        )
+        return {
+            **control_context,
             "thread_context": assembled["thread_context"],
             "personal_context": assembled["personal_context"],
             "evidence": assembled["evidence"],
             "context_manifest": self._last_manifest.to_dict(),
-            "available_tools": tools,
-            "mcp_tool_index": list(self.mcp_tool_index),
-            "verified_tool_usage": list(self.tool_usage_context),
-            "selected_skills": [
-                self.learned_skills[skill_id]
-                for skill_id in ((state.task_frame or {}).get("selected_skill_ids") or ())
-                if skill_id in self.learned_skills
-            ],
-            "discovery_results": _discovery_results(state),
         }
 
     @staticmethod
@@ -228,20 +265,21 @@ class ModelPlanner:
 
     @staticmethod
     def _model_context(state: ResearchState) -> ToolContext:
-        request = state.request
+        turn = state.turn
+        runtime_policy = state.runtime_policy
         return ToolContext(
-            run_id=request.run_id,
-            thread_id=request.thread_id,
-            tenant_id=request.tenant_id,
-            user_id=request.user_id,
+            run_id=turn.run_id,
+            thread_id=turn.thread_id,
+            tenant_id=turn.tenant_id,
+            user_id=turn.user_id,
             policy=ExecutionPolicy(
                 allowed_capabilities=frozenset({"model.generate"}),
-                allow_network=request.allow_network,
-                max_tool_calls=request.max_tool_calls,
-                max_network_calls=request.max_network_calls,
-                max_model_calls=request.max_model_calls,
-                max_model_input_tokens=request.max_model_input_tokens,
-                max_model_output_tokens=request.max_model_output_tokens,
+                allow_network=turn.allow_network,
+                max_tool_calls=runtime_policy.max_tool_calls,
+                max_network_calls=runtime_policy.max_network_calls,
+                max_model_calls=runtime_policy.max_model_calls,
+                max_model_input_tokens=runtime_policy.max_model_input_tokens,
+                max_model_output_tokens=runtime_policy.max_model_output_tokens,
             ),
         )
 
@@ -263,11 +301,13 @@ def llm_planning_harness_tool(client: BaseLLMClient, *, network_access: bool) ->
             capability="model.generate",
             network_access=network_access,
             timeout_seconds=60,
+            retry=model_retry_policy(),
             result_kind=ToolResultKind.MODEL_RESPONSE,
             arguments=ToolArgumentContract(
                 required=frozenset({"system_prompt", "user_prompt"}),
                 optional=frozenset({"temperature", "max_tokens"}),
             ),
+            input_schema=model_tool_input_schema(),
         ),
         invoke,
     )

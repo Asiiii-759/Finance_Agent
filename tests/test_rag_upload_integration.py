@@ -10,7 +10,8 @@ from pdf_fixtures import MCPPDFParserFixture, write_stub_pdf
 
 from mas_finance.config import AppConfig
 from mas_finance.contracts import Evidence, EvidenceBundle, SourceRef, SourceType
-from mas_finance.corpus import InMemoryCorpus
+from mas_finance.corpus import DocumentTokenizer, InMemoryCorpus
+from mas_finance.documents import ParsedBlock, ParsedDocument
 from mas_finance.harness import SideEffect, ToolArgumentContract, ToolResultKind, ToolSpec, function_tool
 from mas_finance.llm import LLMSettings
 from mas_finance.retrieval import RetrievalEvidenceAdapter, RetrievalSource
@@ -112,8 +113,6 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             response = service.analyze(
                 "Assess liquidity resilience using this PDF.",
                 document_paths=[str(pdf_path)],
-                require_documents=True,
-                require_market_data=False,
                 export_artifacts=False,
             )["result"]
 
@@ -125,7 +124,11 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
                 evidence["source"]["metadata"]["retrieval_trace"]["embedding_model"],
                 "fixture-v1",
             )
-            self.assertEqual(embedding.calls, 1)
+            self.assertEqual(embedding.calls, 2)
+            self.assertEqual(
+                evidence["source"]["metadata"]["retrieval_trace"]["embedding_batch_count"],
+                2,
+            )
             catalog = {item["name"]: item for item in service.describe_tools()}
             self.assertEqual(catalog["corpus.search"]["search_mode"], "lexical")
             self.assertEqual(catalog["corpus.hybrid_search"]["search_mode"], "hybrid_rrf")
@@ -155,8 +158,6 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             self.assertEqual(service.list_personal_documents(user_id="alice")[0]["index_status"], "vector_ready")
             result = service.analyze(
                 "What does my library say about liquidity resilience?",
-                require_documents=True,
-                require_market_data=False,
                 export_artifacts=False,
                 user_id="alice",
             )["result"]
@@ -220,7 +221,6 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             service = research_service(make_config(Path(directory)), evidence_tools=(tool,))
             result = service.analyze(
                 "根据组合政策说明单一发行人限额",
-                require_documents=True,
                 export_artifacts=False,
             )["result"]
             self.assertEqual(result["status"], "succeeded")
@@ -249,7 +249,6 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             second = research_service(make_config(root))
             result = second.analyze(
                 "根据我的知识库，duration、convexity 和 credit spread 要怎么检查？",
-                require_documents=True,
                 export_artifacts=False,
                 user_id="alice",
             )["result"]
@@ -261,7 +260,6 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
 
             hidden = second.analyze(
                 "根据我的知识库，duration、convexity 和 credit spread 要怎么检查？",
-                require_documents=True,
                 export_artifacts=False,
                 user_id="bob",
             )["result"]
@@ -319,7 +317,6 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             first = service.analyze(
                 "分析 ACME covenant headroom",
                 thread_id="credit-session",
-                entities=["ACME"],
                 document_paths=[str(pdf_path)],
                 retain_documents_for_session=True,
                 export_artifacts=False,
@@ -328,7 +325,6 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             followup = service.analyze(
                 "这份文档披露的 covenant headroom 是多少？",
                 thread_id="credit-session",
-                entities=["ACME"],
                 use_session_documents=True,
                 export_artifacts=False,
             )
@@ -398,9 +394,14 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             parser_kind = "paddleocr"
             calls = 0
 
-            def extract_document(self, _file_path: Path) -> dict[int, str]:
+            def extract_document(self, _file_path: Path) -> ParsedDocument:
                 self.calls += 1
-                return {1: "ACME covenant headroom narrowed."}
+                return ParsedDocument(
+                    pages={1: "ACME covenant headroom narrowed."},
+                    blocks=(ParsedBlock("text", "ACME covenant headroom narrowed.", 1, 0),),
+                    parser_name="ocr_fixture",
+                    parser_version="1",
+                )
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -416,7 +417,6 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "network authorization"):
                 service.analyze(
                     "分析 ACME 扫描件中的风险",
-                    entities=["ACME"],
                     document_paths=[str(pdf_path)],
                     allow_network=False,
                     export_artifacts=False,
@@ -425,7 +425,6 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
 
             response = service.analyze(
                 "分析 ACME 扫描件中的风险",
-                entities=["ACME"],
                 document_paths=[str(pdf_path)],
                 allow_network=True,
                 export_artifacts=False,
@@ -453,7 +452,6 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
                 make_config(root), pdf_document_parser=parser, pdf_parser_network_access=False
             ).analyze(
                 "根据这份 PDF，ACME 的主要风险是什么？",
-                entities=["ACME"],
                 document_paths=[str(pdf_path)],
                 export_artifacts=False,
             )
@@ -462,7 +460,11 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             evidence = response["result"]["bundle"]["evidence"]
             document_items = [item for item in evidence if item["source"]["source_type"] == "document"]
             self.assertEqual(len(document_items), 1)
-            self.assertEqual(document_items[0]["entity"], "ACME")
+            self.assertIsNone(document_items[0]["entity"])
+            self.assertEqual(
+                [item["name"] for item in response["result"]["task_frame"]["entities"]],
+                ["ACME"],
+            )
             self.assertEqual(document_items[0]["page"], 2)
             self.assertIn("page=2", document_items[0]["source"]["locator"])
             self.assertEqual(len(document_items[0]["source"]["metadata"]["document_id"]), 64)
@@ -484,7 +486,6 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
 
             response = service.analyze(
                 "根据内部文档说明 ACME 的 covenant 风险",
-                entities=["ACME"],
                 export_artifacts=False,
             )
 
@@ -527,23 +528,22 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
 
             forced = service.analyze(
                 "说明 ACME 的 covenant 风险",
-                entities=["ACME"],
-                require_documents=True,
                 export_artifacts=False,
             )["result"]
             self.assertEqual(forced["status"], "succeeded")
             self.assertEqual(forced["observations"][0]["task"]["tool_name"], "internal.search")
             self.assertEqual(client.calls, 1)
 
-            disabled = service.analyze(
+            explicit_document_question = service.analyze(
                 "根据内部文档说明 ACME 的 covenant 风险",
-                entities=["ACME"],
-                require_documents=False,
                 export_artifacts=False,
             )["result"]
-            self.assertEqual(disabled["status"], "failed")
-            self.assertEqual(disabled["observations"], [])
-            self.assertEqual(client.calls, 1)
+            self.assertEqual(explicit_document_question["status"], "succeeded")
+            self.assertEqual(
+                explicit_document_question["observations"][0]["task"]["tool_name"],
+                "internal.search",
+            )
+            self.assertEqual(client.calls, 2)
 
     def test_rag_fallback_and_network_denial_are_bounded_and_visible(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -559,7 +559,6 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             )
             response = service.analyze(
                 "根据内部文档说明 ACME 的 covenant 风险",
-                entities=["ACME"],
                 export_artifacts=False,
             )
             self.assertEqual(response["result"]["status"], "succeeded")
@@ -577,7 +576,6 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
             )
             denied = denied_service.analyze(
                 "根据外部资料说明 ACME 的 covenant 风险",
-                entities=["ACME"],
                 allow_network=False,
                 export_artifacts=False,
             )
@@ -591,7 +589,7 @@ class RAGAndUploadIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "content must be a string"):
             RetrievalEvidenceAdapter(malformed).search("ACME")
 
-        corpus = InMemoryCorpus()
+        corpus = InMemoryCorpus(tokenizer=DocumentTokenizer(Path(".runtime/models/bge-m3/tokenizer.json")))
         with self.assertRaisesRegex(ValueError, "query is required"):
             corpus.search_json({"query": ["not", "text"]})
         with self.assertRaisesRegex(ValueError, "top_k must be an integer"):

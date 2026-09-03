@@ -8,8 +8,6 @@ from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from .metrics import MetricRequest
-
 
 class FinancialIntent(StrEnum):
     DOCUMENT_RESEARCH = "document_research"
@@ -61,14 +59,12 @@ class ResearchRequirement:
 class ResearchScope:
     intents: tuple[FinancialIntent, ...]
     requirements: tuple[ResearchRequirement, ...]
-    calculations: tuple[MetricRequest, ...] = ()
     rationale: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "intents": [item.value for item in self.intents],
             "requirements": [item.to_dict() for item in self.requirements],
-            "calculations": [item.to_dict() for item in self.calculations],
             "rationale": self.rationale,
         }
 
@@ -77,7 +73,6 @@ class ResearchScope:
         return cls(
             intents=tuple(FinancialIntent(str(item)) for item in value.get("intents") or ()),
             requirements=tuple(ResearchRequirement.from_dict(item) for item in value.get("requirements") or ()),
-            calculations=tuple(MetricRequest.from_dict(item) for item in value.get("calculations") or ()),
             rationale=str(value.get("rationale") or ""),
         )
 

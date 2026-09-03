@@ -2,48 +2,21 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..memory_store import PersonalMemoryKind
-from ..metrics import MetricOperation, MetricRequest
 
 QueryText = Annotated[str, Field(min_length=1, max_length=8_000, pattern=r".*\S.*")]
-EntityName = Annotated[str, Field(min_length=1, max_length=200, pattern=r".*\S.*")]
-MarketSymbol = Annotated[
-    str,
-    Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9.^=_:-]+$"),
-]
 RunIdentifier = Annotated[
     str,
     Field(min_length=1, max_length=200, pattern=r"^[^\x00-\x1f\x7f]+$"),
 ]
 
 
-class CalculationRequestModel(BaseModel):
+class AnalyzeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    operation: MetricOperation
-    inputs: dict[str, Any] = Field(min_length=1, max_length=20)
-    label: str | None = Field(default=None, max_length=100)
-    entity: str | None = Field(default=None, max_length=200)
-    unit: str | None = Field(default=None, max_length=50)
-    period: str | None = Field(default=None, max_length=100)
-    request_id: str | None = Field(default=None, max_length=100)
-
-    @model_validator(mode="after")
-    def validate_calculation_shape(self) -> CalculationRequestModel:
-        MetricRequest.from_dict(self.model_dump(mode="json", exclude_none=True))
-        return self
-
-
-class AnalyzeRequest(BaseModel):
     query: QueryText = Field(description="Financial research question.")
-    entities: list[EntityName] = Field(
-        default_factory=list, max_length=50, description="Explicit companies or issuers."
-    )
-    symbols: dict[EntityName, MarketSymbol] = Field(
-        default_factory=dict, max_length=50, description="Entity-to-market-symbol mapping."
-    )
     allow_network: bool = Field(default=False, description="Request network tools; server policy still applies.")
     thread_id: RunIdentifier | None = Field(default=None, description="Optional conversation thread id.")
     export_artifacts: bool = Field(default=True, description="Whether to persist report and state files.")
@@ -59,31 +32,6 @@ class AnalyzeRequest(BaseModel):
         default=True,
         description="Make explicitly persisted personal documents available to the planner.",
     )
-    macro_series: list[str] = Field(
-        default_factory=list,
-        max_length=20,
-        description="Explicit FRED series identifiers in addition to query inference.",
-    )
-    calculations: list[CalculationRequestModel] = Field(
-        default_factory=list,
-        max_length=20,
-        description="Structured allowlisted financial calculation requests.",
-    )
-    require_documents: bool | None = Field(
-        default=None,
-        description="Use a configured document/RAG source; uploaded documents always take precedence.",
-    )
-    require_market_data: bool | None = Field(
-        default=None, description="Override automatic current-market evidence selection."
-    )
-    require_market_history: bool | None = Field(
-        default=None, description="Override automatic historical-market evidence selection."
-    )
-    require_regulatory_data: bool | None = Field(
-        default=None, description="Override automatic SEC fundamental evidence selection."
-    )
-    market_history_range: str = Field(default="1y", pattern=r"^(1mo|3mo|6mo|1y|2y|5y|10y)$")
-    market_history_interval: str = Field(default="1d", pattern=r"^(1d|1wk|1mo)$")
 
 
 class AnalyzeResponse(BaseModel):
@@ -131,6 +79,8 @@ class PersonalMemoryResponse(BaseModel):
 
 
 class SubmitJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     query: QueryText = Field(description="User query for asynchronous financial analysis.")
     thread_id: RunIdentifier | None = Field(default=None, description="Optional workflow thread id.")
     export_artifacts: bool = Field(default=True, description="Whether the background job should export files.")

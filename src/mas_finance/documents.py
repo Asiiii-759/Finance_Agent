@@ -1,22 +1,54 @@
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from collections.abc import Mapping
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-COMPANY_HINTS = {
-    "apple": "Apple",
-    "microsoft": "Microsoft",
-    "tesla": "Tesla",
-    "amazon": "Amazon",
-    "google": "Alphabet",
-    "alphabet": "Alphabet",
-    "meta": "Meta",
-    "nvidia": "NVIDIA",
-}
+
+@dataclass(frozen=True)
+class ParsedBlock:
+    label: Literal["text", "heading", "table", "chart"]
+    content: str
+    page_number: int
+    order: int
+    paragraph_title: str | None = None
+    bbox: tuple[float, float, float, float] | None = None
+
+    def __post_init__(self) -> None:
+        if self.label not in {"text", "heading", "table", "chart"}:
+            raise ValueError("parsed block label is invalid")
+        if not isinstance(self.content, str) or not self.content.strip():
+            raise ValueError("parsed block content is invalid")
+        if isinstance(self.page_number, bool) or not isinstance(self.page_number, int) or self.page_number < 1:
+            raise ValueError("parsed block page number is invalid")
+        if isinstance(self.order, bool) or not isinstance(self.order, int) or self.order < 0:
+            raise ValueError("parsed block order is invalid")
+        if self.paragraph_title is not None and (
+            not isinstance(self.paragraph_title, str) or len(self.paragraph_title) > 1_000
+        ):
+            raise ValueError("parsed block paragraph title is invalid")
+        if self.bbox is not None and (
+            len(self.bbox) != 4
+            or any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in self.bbox)
+            or any(not math.isfinite(float(value)) for value in self.bbox)
+        ):
+            raise ValueError("parsed block bbox is invalid")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ParsedDocument:
+    pages: Mapping[int, str]
+    blocks: tuple[ParsedBlock, ...]
+    parser_name: str
+    parser_version: str
 
 
 class PDFDocumentParser(Protocol):
@@ -25,7 +57,7 @@ class PDFDocumentParser(Protocol):
     @property
     def parser_kind(self) -> Literal["paddleocr", "mcp"]: ...
 
-    def extract_document(self, file_path: Path) -> Mapping[int, str]: ...
+    def extract_document(self, file_path: Path) -> ParsedDocument: ...
 
 
 def parse_pdf_document(
@@ -48,7 +80,10 @@ def parse_pdf_document(
         raise ValueError("a PaddleOCR or MCP PDF document parser is required")
     if document_parser.parser_kind not in {"paddleocr", "mcp"}:
         raise ValueError("PDF document parser must be PaddleOCR or MCP")
-    parsed_pages = document_parser.extract_document(file_path)
+    extracted = document_parser.extract_document(file_path)
+    if not isinstance(extracted, ParsedDocument):
+        raise ValueError("PDF parser must return ParsedDocument")
+    parsed_pages = extracted.pages
     if not isinstance(parsed_pages, Mapping) or not parsed_pages:
         raise ValueError("PDF document parser must return a non-empty page-to-text mapping")
     if len(parsed_pages) > max_pages:
@@ -72,14 +107,23 @@ def parse_pdf_document(
                 "text": normalized_text,
                 "extraction_method": document_parser.parser_kind,
                 "text_characters": len(normalized_text),
+                "blocks": [
+                    {
+                        **block.to_dict(),
+                        "content": _normalize_extracted_text(block.content),
+                    }
+                    for block in extracted.blocks
+                    if block.page_number == page_number and _normalize_extracted_text(block.content)
+                ],
             }
         )
+    if not extracted.blocks:
+        raise ValueError("PDF parser returned no structured blocks")
+    if any(block.page_number not in expected_page_numbers for block in extracted.blocks):
+        raise ValueError("PDF parser returned a block outside the document page range")
     visible_name = Path(display_name).name if display_name else file_path.name
     if not visible_name or len(visible_name) > 255:
         raise ValueError("document display name is invalid")
-    full_text = "\n".join(str(page["text"]) for page in pages).strip()
-    lowered = full_text.lower()
-    detected_companies = detect_companies(f"{visible_name}\n{lowered}")
     result: dict[str, Any] = {
         "document_id": sha256(file_path.read_bytes()).hexdigest(),
         "filename": visible_name,
@@ -87,8 +131,9 @@ def parse_pdf_document(
         "text_page_count": sum(bool(page["text"]) for page in pages),
         "parsed_page_count": len(pages),
         "parser_kind": document_parser.parser_kind,
+        "parser_name": extracted.parser_name,
+        "parser_version": extracted.parser_version,
         "warnings": [],
-        "detected_companies": detected_companies,
     }
     if include_pages:
         # Page records are an ingestion contract, not a second copy persisted in
@@ -96,11 +141,6 @@ def parse_pdf_document(
         # point back to the exact page instead of an opaque whole-document span.
         result["pages"] = [dict(page) for page in pages if page["text"]]
     return result
-
-
-def detect_companies(text: str) -> list[str]:
-    lowered = text.casefold()
-    return sorted({name for key, name in COMPANY_HINTS.items() if key in lowered})
 
 
 def _normalize_extracted_text(text: str) -> str:

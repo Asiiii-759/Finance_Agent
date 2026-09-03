@@ -138,6 +138,10 @@ provider-neutral `web.search`，使模型能自主产生检索式和时效范围
 | HAR-08 | 同一 run 可换 tenant/user 或提高上限 | 身份与成本边界穿透 | 首次调用绑定 run、principal、网络授权和预算 ceiling | run boundary test | 已解决 |
 | HAR-09 | 错误字符串可能携带 token/URL 凭据 | 审计和 API 泄密 | 参数、Bearer、API key、密码和 credential URL 脱敏；job 只保存异常类型 | redaction/job error tests | 已解决 |
 | HAR-10 | timeout 被误解成强制取消 | Python 线程不能安全终止任意同步函数 | 明确为观测边界；生产要求 async/进程隔离 | 文档与生产门槛 | 生产门槛 |
+| HAR-11 | schema 只展示、不与浅层契约核对 | 文档 required 与实际执行键可漂移 | ToolSpec 构造时核对 root/properties/required；三个模型工具也补完整 schema | schema contract tests + 全量启动 | 已解决 |
+| HAR-12 | ValueError/网络异常都退化成模糊错误 | 模型无法判断改参、重试还是换工具 | 稳定错误码与 `model_action`；MCP 保留字段、候选、JSON-RPC code 和 retryability | Harness/MCP error tests | 已解决 |
+| HAR-13 | 行情 MCP 吞掉网络异常并返回空数据 | Planner 把供应商故障误作事实性无数据 | 显式 symbol；传输异常向 Harness 传播，参数/配置/瞬时/无效响应分型 | extmarket fault test | 已解决 |
+| HAR-14 | 模型供应商偶发 5xx 会直接终止整个 run | 模型阶段没有声明瞬时故障策略，真实计算验收在第二次规划处暴露该边界 | 仅将模型 HTTP 429/5xx 与 transport error 映射为 `ConnectionError`，模型工具最多重试一次；普通 4xx 和坏响应继续快速失败 | MockTransport 500→成功、400/transport 边界 + 三条 DeepSeek live | 已解决 |
 
 ### 4.4 证据、引用与冲突
 
@@ -174,6 +178,7 @@ provider-neutral `web.search`，使模型能自主产生检索式和时效范围
 | FIN-14 | 无公司实体的计算显示“未知实体” | 通用合成模板把“计算无须实体”误作“实体缺失” | calculation evidence 使用“计算结果”标签，其他证据仍保持缺实体提示 | compact CAGR report assertion | 已解决 |
 | FIN-15 | 结构化计算可携带多余字段、隐式文本或伪造单位 | LLM/调用方参数若被宽松强转，会制造语义正确性假象 | request extra-forbid、严格 operation/text/numeric、operation-unit compatibility、大小与指数边界 | 全 operation 与 malformed contract tests | 已解决 |
 | FIN-16 | “让 LLM 算”与“让函数算”边界不清 | 模型算术、任意表达式和隐式假设不可复算 | LLM 不执行表达式；只接受最终通过 `MetricRequest` 的白名单函数参数，函数输出登记公式与输入血缘 | tool-set、formula 与 lineage assertions | 已解决 |
+| FIN-17 | 公司名可被当作证券代码 | 同名公司、市场后缀和跨市场资产会被误查 | 删除生产静态 ticker map；市场工具要求模型先确认并显式传 `symbol` | schema 与无 symbol 快速失败测试 | 已解决 |
 
 FRED observations 的接口边界依据 [FRED 官方 series observations](https://fred.stlouisfed.org/docs/api/fred/series_observations.html)。Alpha Vantage 将 raw daily 和 adjusted daily 分开提供，当前实现据其[官方文档](https://www.alphavantage.co/documentation/)公开 raw 历史口径。SEC 客户端使用固定 EDGAR endpoint 和组织 User-Agent，并依据[SEC Developer Resources](https://www.sec.gov/about/developer-resources)保守限速；多实例生产仍需要共享 limiter。
 
@@ -194,8 +199,15 @@ FRED observations 的接口边界依据 [FRED 官方 series observations](https:
 | RAG-11 | 文档可能包含提示注入 | RAG 并不能消除间接 prompt injection | 文档位于 evidence trust zone；不能改变工具权限；模型输出仍受引用和校验约束 | injection/Markdown tests | 已解决 |
 | RAG-12 | scanned PDF 没有 OCR | 无文本时无法检索 | PaddleOCR-VL-1.6 有界整文档解析；无解析器或无结果时失败关闭 | 授权、MockTransport 与真实单页 smoke | 已解决 |
 | RAG-13 | 本地 PDF 对象顺序不等于阅读顺序 | 多栏财报文本可能交错 | 删除 PyMuPDF 分支，统一交给 PaddleOCR 或成熟 PDF 解析 MCP 返回页级文本 | parser contract tests | 已解决 |
-| RAG-14 | OCR 示例无限轮询并下载所有图片 | 任务悬挂、内存/存储增长及外域资源风险 | 固定请求/轮询/文件/JSONL 上限；只读取页 Markdown；结果下载不携带 bearer token | OCR adapter tests | 已解决 |
+| RAG-14 | OCR 示例无限轮询并下载所有图片 | 任务悬挂、内存/存储增长及外域资源风险 | 固定请求/轮询/文件/JSONL 上限；读取 Markdown 与结构化 block；不下载图片且结果下载不携带 bearer token | OCR adapter tests | 已解决 |
 | RAG-15 | 已限定“根据内部文档”的收入问题仍自动要求 SEC | 文档证据充分却被错误标成 degraded | 文档模式不隐式追加 regulatory requirement；显式交叉核验仍可同时要求 SEC | scope regression + real fallback RAG retest | 已解决 |
+| RAG-16 | 页级 Markdown 丢失标题/表格版面 | 财务表跨行切碎，语义 chunk 不稳定 | PaddleOCR `prunedResult` 转 heading/text/table/chart block，保留 page/order/title/bbox | structured OCR test | 已解决 |
+| RAG-17 | 字符切块与 embedding tokenizer 不一致 | 1024“字符”并不代表模型长度 | BGE-M3 tokenizer 1024 token、256 overlap，并优先自然边界 | token chunk tests | 已解决 |
+| RAG-18 | 大 PDF 一次生成全部向量 | 内存和 provider 请求上限风险 | 文档向量每批最多 128，query 单独请求 | 300 chunk batching test | 已解决 |
+| RAG-19 | RRF 会让双路都无关的 chunk 进入 top-k | RRF 名次没有绝对相关性含义 | BM25 仅正分；向量先过 cosine 阈值，双路均无候选则返回空 | abstention test + BGE-M3 calibration | 已解决 |
+| RAG-20 | overlap 文本重复进入最终上下文 | 同一句被重复计数并放大注意力 | top-k 后按同源原始字符坐标无损合并 | repeated-text reconstruction test | 已解决 |
+| RAG-21 | 个人文档查询时临时重算全部向量 | 延迟、费用和结果版本不可治理 | 上传/reindex 批量持久化；查询只 embed query；manifest 记录 chunking/model/dimension | restart/persist test | 已解决 |
+| RAG-22 | 同模型名下分块升级仍误报 vector ready | chunk ID 不一致要到查询期才暴露 | manifest 增加 `chunking_version`，版本不符不注册 hybrid | manifest version assertion | 已解决 |
 
 本地默认使用依赖很少的 BM25-style 检索，是为了让上传能力在无 embedding 服务时仍可确定运行。它不是“最终企业检索引擎”。生产可在相同 JSON 契约后替换为 lexical + semantic hybrid。Elastic 官方资料将 RRF 作为混合全文与语义检索的推荐方式之一：[Hybrid search](https://www.elastic.co/docs/solutions/search/hybrid-search)。是否真正提高本项目的金融召回率仍必须通过领域 query set、人工 relevance judgment 和 ACL 测试证明，不能仅凭采用向量库就宣称提升。
 
@@ -212,7 +224,7 @@ FRED observations 的接口边界依据 [FRED 官方 series observations](https:
 | EXT-07 | 远端响应、redirect 或 NaN 无界 | 内存 DoS、跳转绕过、恢复失败 | 禁止跟随 redirect、限制解压后字节、严格 JSON/object/chunk schema | gateway fault tests | 已解决 |
 | EXT-08 | RAG request/index trace 丢失 | 无法关联搜索后台日志 | evidence metadata 保留白名单 trace 字段，完整 trace 留在 observation | trace test | 已解决 |
 | EXT-09 | 新闻/网页内容的时效、版权和许可未定义 | “能搜到”不等于可用于金融产品 | 仅提供 canonical gateway 接缝，不内置无许可 scraper | 文档化 | 刻意不实现 |
-| EXT-10 | 一旦配置 RAG 就让所有问题强制检索 | 把工具可用性误当成本次 requirement，纯计算也被污染 | 上传始终触发；普通请求仅在文档/内部资料/新闻/搜索语义或 `require_documents=true` 时触发 | unrelated CAGR test | 已解决 |
+| EXT-10 | 一旦配置 RAG 就让所有问题强制检索 | 把工具可用性误当成本次 requirement，纯计算也被污染 | 文档只进入资源目录；TaskFrame 模型按问题建立 requirement，Validation 不反推意图 | unrelated CAGR test | 已解决 |
 | EXT-11 | 外部搜索结果丢失网页标题和 URL | 内部文档字段集不能完整表达 web provenance | canonical chunk 接受 `title/source_url/publisher/publish_date` 并进入 SourceRef | web search provenance test | 已解决 |
 
 NIST 的生成式 AI 风险框架指出，模型可能生成错误内容以及伪造的逻辑或引用，尤其在重要决策场景中需要监控：[NIST AI 600-1](https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.600-1.pdf)。OWASP 同时明确提醒 RAG 并不能完全解决 prompt injection，恶意内容可以进入知识库形成间接注入：[OWASP LLM01:2025](https://genai.owasp.org/llmrisk/llm01-prompt-injection/)。因此当前系统把检索结果视为不可信数据，而不是高权限指令。
@@ -222,10 +234,10 @@ NIST 的生成式 AI 风险框架指出，模型可能生成错误内容以及�
 | ID | 发现的问题 | 根因与风险 | 采用的方案 | 验证 | 状态 |
 |---|---|---|---|---|---|
 | CTX-01 | 旧 prompt 混合任务、文档、指标和状态 | 模型无法区分指令与数据 | task/research/thread/evidence 分区 | context payload tests | 已解决 |
-| CTX-02 | 整个 evidence ledger 直接进入模型 | token 无界且单一实体挤占上下文 | 字符预算、item 上限、entity × source round-robin | balance test | 已解决 |
+| CTX-02 | 整个 evidence ledger 直接进入模型 | token 无界且单一实体挤占上下文 | token 预算、完整 passage、entity × source round-robin | balance/full-passage test | 已解决 |
 | CTX-03 | 上一轮问题可能被当作当前事实 | memory 与 evidence 混淆 | thread context 明示非证据，字段白名单 | minimal context test | 已解决 |
 | CTX-04 | prompt 和原始 provider error 进入审计 | 可能泄漏敏感文档/凭据 | model audit 不保存 prompt，只保存状态和预算 | synthesis harness test | 已解决 |
-| CTX-05 | 字符预算不等于模型 token | 不同语言估算误差 | 当前采用保守字符门；未来按模型 tokenizer 替换 | 文档化 | 生产门槛 |
+| CTX-05 | 字符预算不等于模型 token | 不同语言估算误差 | 规划/生成统一使用 BGE-M3 tokenizer 计数，manifest 记录 token | tokenizer/context tests | 已解决 |
 | CTX-06 | literal quote 不能证明语义蕴含 | 模型仍可能曲解原句 | quote 只作为最低引用门；高风险结论需要数值 parser/NLI/人工抽检 | 文档化 | 生产门槛 |
 | CTX-07 | DeepSeek 旧模型名已停用，V4 默认 thinking 可吃完短输出预算 | 时效变化导致空正文或部署失效 | 默认 `deepseek-v4-flash`，证据合成显式关闭 thinking，并严格校验 prompt/参数/response | MockTransport + 8-token live smoke | 已解决 |
 | CTX-08 | 十项计算的真实模型 JSON 在 1400 token 上限被截断 | 函数和证据正确但合成只能降级 | 合成上限提高到 3000；简单响应仍提前结束 | 3173 字符截断诊断 + 10/10 live supported claim | 已解决 |
@@ -445,15 +457,18 @@ compileall、Compose YAML、PEP 517 构建和全新临时目录 wheel 导入全�
 - `SourceType.WEB` 未进入 ContextAssembler 优先级表，真实网页+LLM 路径会抛 `KeyError`；补齐类型并增加真实合成路径回归。
 - 网页 tracking URL、fragment 和相同摘要可重复占位；增加 canonical URL/内容双去重，私网/IP 结果拒绝。
 - 单一普通站点即可满足 web requirement；改为至少两个 domain，公共机构例外，同时 snippet claim 固定降级为 inferred。
-- RAG 只按 entity/source 分组导致同一 PDF 的重叠 chunks 垄断上下文；增加 document/domain/provider origin 分组和问题附近窗口。
-- 输出 token 与输入上下文混为一谈；分成规划 24K、生成 48K evidence 字符和 4096 输出 token，预算可配置且 manifest 可审计。
-- `require_documents=true` 在没有 document provider 时被静默改成 false，且概念知识可能错误满足文档要求；保留显式 requirement，并排除 curated knowledge 伪装用户文档。
+- RAG 只按 entity/source 分组导致同一 PDF 的重叠 chunks 垄断上下文；增加 document/domain/provider origin 分组，检索后按原始坐标无损合并 overlap。
+- 输出 token 与输入上下文混为一谈；最终收敛为规划 48K、生成 96K evidence token 和 4096 输出 token，完整 passage 不做逐条字符截断，manifest 可审计。
+- 旧 `require_documents` 覆盖项会把聊天接口重新变成表单式 workflow；现已删除，由 TaskFrame 产生显式 requirement，并排除 curated knowledge 伪装用户文档。
 - 个人偏好若按内容 ID 写入会同时注入冲突版本；改为 kind+title 稳定槽位，由最新显式写入覆盖。
 - 临时 PDF 与长期知识库容易发生隐式留存；拆为 request/session/personal 三套接口和生命周期，原文件始终请求后删除。
 - “模型设计函数”若等同动态 Python 会突破安全边界；改为 AST 白名单声明式公式，验证执行安全与数值域，但不伪称语义正确。
 - MCP/企业能力若直接暴露原始工具会带入副作用和任意 schema；部署注入只接受现有只读 capability + canonical EvidenceBundle。
 - `httpx` 网络异常不在默认 retry exception 中，声明的 web/RAG 两次尝试实际只跑一次；显式加入 transport exceptions 并做行为测试。
-- 初版多 PDF 修复无条件“每份文档一个名额”，把文档覆盖误当成问题相关性；改为默认全局相关排序，只有模型/明确多文档意图才启用 `diversify_documents`，并补“八份材料但只问一个数值”的反例。
+- 仅靠脚本模型时，`finance.calculate` 的浅层 ToolArgumentContract 看似足够，真实 DeepSeek 却只能猜测 requests 内部字段；增加可选 `ToolSpec.input_schema` 并公开 operation-specific 嵌套契约，不用规则替模型改参。
+- 真实计算已成功但 Coverage 仍跑到 `max_iterations`：模型可自由设置展示 label，验收却按 label 匹配且把空 request ID 当必需 tag。改为有 ID 时精确匹配、无 ID 时使用 canonical operation/field。
+- Service 终态日志从 `result.claims/sources/budget` 读取不存在的旧层级，真实 run 有 claim 却记录为 0；改为 `result.bundle` 与 `budget_usage` 并补日志回归。
+- 初版多 PDF 修复无条件“每份文档一个名额”，把文档覆盖误当成问题相关性；改为默认全局相关排序，只有模型根据用户问题主动传 `diversify_documents` 才分散，并补“八份材料但只问一个数值”的反例。
 - 旧路由在第一条 evidence 满足最低 coverage 后立即生成，模型实际上没有机会基于工具结果决定是否继续；ModelPlanner 现在必须在看到新 Evidence 后显式 finish，Validation 只提供最低证据门和硬预算，规则 planner 仍可直接收敛。
 - 本地 adapter 默认发送 `search_mode=rrf`，但 corpus 实际始终只跑 BM25，接口语义和 trace 不一致；现在把 lexical
   与 hybrid 拆成不同 ToolSpec，只有配置 embedding 才注册 hybrid，执行真实 cosine + RRF，未配置 reranker 时快速失败。
@@ -481,7 +496,8 @@ compileall、Compose YAML、PEP 517 构建和全新临时目录 wheel 导入全�
 LangGraph checkpoint 保存中断，前端明确展示工具、参数和影响范围后再恢复同一 run。
 
 本轮回归增加了：明确长期更新与临时 ignore、原子事实来源边界、早期事实跨摘要保留、Skill 选中后才披露完整步骤、
-Agent 失败后日志仍可查询、工具审计返回摘要和线程删除联动日志。完整现状见 `AGENT_DETAILED_GUIDE.md` 第 25.5 节。
+Agent 失败后日志仍可查询、工具审计返回摘要和线程删除联动日志。完整现状见
+[上下文与记忆](architecture/context-and-memory.md)和[运行时与安全](architecture/runtime-and-security.md)。
 
 ## 8. 仍然存在的边界
 

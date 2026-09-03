@@ -16,16 +16,19 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
+from .adequacy import EvidenceAdequacyChecker, EvidenceAdequacyGap
 from .agent import (
+    AgentContext,
     AgentPhase,
+    ChatTurn,
     CoverageAssessor,
-    DeterministicSynthesizer,
+    CoverageDecision,
     Planner,
     ResearchGap,
     ResearchOutcome,
     ResearchPlan,
-    ResearchRequest,
     ResearchState,
+    RuntimePolicy,
     StopReason,
     Synthesizer,
     ToolObservation,
@@ -64,7 +67,6 @@ def _requires_grounding(state: ResearchState) -> bool:
 
 
 class FinancialGraphState(TypedDict, total=False):
-    request: dict[str, Any]
     research: dict[str, Any]
 
 
@@ -77,8 +79,9 @@ class FinancialResearchAgent:
         *,
         planner: Planner,
         task_interpreter: LLMTaskInterpreter,
-        synthesizer: Synthesizer | None = None,
+        synthesizer: Synthesizer,
         assessor: CoverageAssessor | None = None,
+        adequacy_checker: EvidenceAdequacyChecker | None = None,
         checkpointer: BaseCheckpointSaver[Any] | None = None,
         allowed_capabilities: frozenset[str] = frozenset(
             {
@@ -98,8 +101,9 @@ class FinancialResearchAgent:
         self.harness = harness
         self.planner = planner
         self.task_interpreter = task_interpreter
-        self.synthesizer = synthesizer or DeterministicSynthesizer()
+        self.synthesizer = synthesizer
         self.assessor = assessor or CoverageAssessor()
+        self.adequacy_checker = adequacy_checker
         self.allowed_capabilities = allowed_capabilities
         self.planner_hidden_tool_names = planner_hidden_tool_names
         self.checkpointer = checkpointer or InMemorySaver()
@@ -131,45 +135,62 @@ class FinancialResearchAgent:
         builder.add_edge("final_generation", "validation")
         return builder.compile(checkpointer=self.checkpointer)
 
-    def run(self, request: ResearchRequest, *, resume: bool = False) -> ResearchOutcome:
-        config = self._config(request)
+    def run(
+        self,
+        turn: ChatTurn,
+        runtime_policy: RuntimePolicy,
+        context: AgentContext,
+        *,
+        resume: bool = False,
+    ) -> ResearchOutcome:
+        config = self._config(turn, runtime_policy)
         snapshot = self.graph.get_state(config)
         if resume:
             if not snapshot.values:
                 raise ValueError("no LangGraph checkpoint exists for this run")
             persisted = self._state(snapshot.values)
-            if persisted.request.to_dict() != request.to_dict():
-                raise ValueError("checkpoint request does not match resume request")
+            if (
+                persisted.turn != turn
+                or persisted.runtime_policy != runtime_policy
+                or persisted.context != context
+            ):
+                raise ValueError("checkpoint input does not match resume input")
             self._prime_harness(persisted)
             result = self.graph.invoke(None, config)
         else:
             if snapshot.values:
                 raise ValueError("a LangGraph checkpoint already exists for this run")
-            result = self.graph.invoke({"request": request.to_dict()}, config)
+            initial = ResearchState(turn=turn, runtime_policy=runtime_policy, context=context)
+            result = self.graph.invoke({"research": initial.to_dict()}, config)
         state = self._state(result)
         return self._outcome(state)
 
-    def get_state(self, request: ResearchRequest) -> ResearchState | None:
-        values = self.graph.get_state(self._config(request)).values
+    def get_state(self, turn: ChatTurn, runtime_policy: RuntimePolicy) -> ResearchState | None:
+        values = self.graph.get_state(self._config(turn, runtime_policy)).values
         return self._state(values) if values else None
 
-    def state_history(self, request: ResearchRequest) -> tuple[ResearchState, ...]:
+    def state_history(self, turn: ChatTurn, runtime_policy: RuntimePolicy) -> tuple[ResearchState, ...]:
         return tuple(
             self._state(snapshot.values)
-            for snapshot in self.graph.get_state_history(self._config(request))
+            for snapshot in self.graph.get_state_history(self._config(turn, runtime_policy))
             if snapshot.values and "research" in snapshot.values
         )
 
     def _intent_node(self, graph_state: FinancialGraphState) -> dict[str, Any]:
-        request = ResearchRequest.from_dict(graph_state["request"])
-        self.harness.clear_run(request.run_id)
-        frame = self.task_interpreter.interpret(request, self._planner_catalog())
-        state = ResearchState(
-            request=request,
-            scope=frame.scope,
-            task_frame=frame.to_dict(),
-            phase=AgentPhase.INTENT,
+        state = self._state(graph_state)
+        self.harness.clear_run(state.turn.run_id)
+        frame = self.task_interpreter.interpret(
+            state.turn,
+            state.runtime_policy,
+            state.context,
+            self._planner_catalog(),
         )
+        state.scope = frame.scope
+        state.task_frame = frame.to_dict()
+        context_manifest = self.task_interpreter.context_manifest()
+        if context_manifest:
+            state.context_manifests.append({"phase": "intent", "iteration": 0, **context_manifest})
+        state.phase = AgentPhase.INTENT
         if frame.requires_clarification:
             state.stop_reason = StopReason.CLARIFICATION_REQUIRED
             state.report = f"需要澄清后才能继续：{frame.clarification_question}"
@@ -180,14 +201,14 @@ class FinancialResearchAgent:
         state.phase = AgentPhase.PLANNING
         if state.stop_reason is not None:
             return self._update(state)
-        if len(state.observations) >= state.request.max_tool_calls:
+        if len(state.observations) >= state.runtime_policy.max_tool_calls:
             self._mark_tool_budget_exhausted(state)
             return self._update(state)
 
         observed = {item.task.task_id for item in state.observations}
         plan = self._unfinished_plan(state, observed)
         if plan is None:
-            if state.iteration >= state.request.max_iterations:
+            if state.iteration >= state.runtime_policy.max_iterations:
                 state.stop_reason = StopReason.MAX_ITERATIONS
                 return self._update(state)
             plan = self._validated_plan(self.planner.plan(state, self._planner_catalog()), state)
@@ -198,7 +219,7 @@ class FinancialResearchAgent:
                 )
             state.audit_events = _merge_audit_events(
                 state.audit_events,
-                self.harness.audit_events(state.request.run_id),
+                self.harness.audit_events(state.turn.run_id),
             )
             self._consume_planner_diagnostics(state)
             if not plan.tasks:
@@ -212,13 +233,13 @@ class FinancialResearchAgent:
             observed = {item.task.task_id for item in state.observations}
 
         pending = [item for item in plan.tasks if item.task_id not in observed]
-        budget_left = state.request.max_tool_calls - len(state.observations)
+        budget_left = state.runtime_policy.max_tool_calls - len(state.observations)
         if budget_left <= 0 or not pending:
             self._mark_tool_budget_exhausted(state)
             return self._update(state)
         self._execute_tasks(state, pending[:budget_left])
         remaining = {item.task_id for item in plan.tasks} - {item.task.task_id for item in state.observations}
-        if remaining and len(state.observations) >= state.request.max_tool_calls:
+        if remaining and len(state.observations) >= state.runtime_policy.max_tool_calls:
             self._mark_tool_budget_exhausted(state)
         return self._update(state)
 
@@ -232,8 +253,8 @@ class FinancialResearchAgent:
         }
 
     def _execute_tasks(self, state: ResearchState, tasks: Sequence[ToolTask]) -> None:
-        context = self._tool_context(state.request, self.available_tools)
-        workers = max(1, min(state.request.max_parallel_tool_calls, len(tasks)))
+        context = self._tool_context(state.turn, state.runtime_policy, self.available_tools)
+        workers = max(1, min(state.runtime_policy.max_parallel_tool_calls, len(tasks)))
 
         def run(task: ToolTask) -> tuple[ToolTask, Any]:
             return task, self.harness.invoke(task.tool_name, task.arguments, context)
@@ -257,7 +278,7 @@ class FinancialResearchAgent:
                 exhausted = True
         state.audit_events = _merge_audit_events(
             state.audit_events,
-            self.harness.audit_events(state.request.run_id),
+            self.harness.audit_events(state.turn.run_id),
         )
         if exhausted:
             self._mark_tool_budget_exhausted(state)
@@ -287,24 +308,38 @@ class FinancialResearchAgent:
             return self._update(state)
 
         derive_standard_ratios(state.bundle)
-        state.coverage = self.assessor.assess(state.request, state.bundle, state.scope)
+        state.coverage = self.assessor.assess(state.turn, state.bundle, state.scope)
         self._resolve_recovered_gaps(state)
         if self._only_unsupported_requirements_remain(state):
             self._mark_no_available_action(state)
             return self._update(state)
         planner_finish_required = bool(getattr(self.planner, "requires_explicit_finish", False))
         model_declared_finish = bool(state.plans and state.plans[-1].ready_for_validation)
+        if state.coverage.complete and model_declared_finish and self.adequacy_checker is not None:
+            adequacy_gaps = tuple(self.adequacy_checker.check(state))
+            state.audit_events = _merge_audit_events(
+                state.audit_events,
+                self.harness.audit_events(state.turn.run_id),
+            )
+            manifest = getattr(self.adequacy_checker, "context_manifest", lambda: None)()
+            if manifest:
+                state.context_manifests.append(
+                    {"phase": "validation", "iteration": state.iteration, **manifest}
+                )
+            self._apply_adequacy(state, adequacy_gaps)
+            if adequacy_gaps and state.iteration >= state.runtime_policy.max_iterations:
+                state.stop_reason = StopReason.INSUFFICIENT_EVIDENCE
         if (
             state.coverage.complete
             and (state.bundle.evidence or not _requires_grounding(state))
             and (
                 not planner_finish_required
                 or model_declared_finish
-                or state.iteration >= state.request.max_iterations
+                or state.iteration >= state.runtime_policy.max_iterations
             )
         ):
             state.stop_reason = StopReason.COVERAGE_SATISFIED
-        elif state.stop_reason is None and state.iteration >= state.request.max_iterations:
+        elif state.stop_reason is None and state.iteration >= state.runtime_policy.max_iterations:
             state.stop_reason = StopReason.MAX_ITERATIONS
         return self._update(state)
 
@@ -313,10 +348,16 @@ class FinancialResearchAgent:
         state.phase = AgentPhase.FINAL_GENERATION
         derive_standard_ratios(state.bundle)
         state.bundle.claims.clear()
+        if not state.bundle.evidence and _requires_grounding(state):
+            state.stop_reason = StopReason.NO_EVIDENCE
+            state.report = render_report(state)
+            return self._update(state)
         claims = reconcile_conflicts(
             state.bundle,
             self.synthesizer.synthesize(
-                state.request,
+                state.turn,
+                state.runtime_policy,
+                state.context,
                 state.bundle,
                 research_context={
                     "task_frame": state.task_frame,
@@ -327,10 +368,6 @@ class FinancialResearchAgent:
                 },
             ),
         )
-        if not state.bundle.evidence and _requires_grounding(state):
-            # 需要检索或计算时，不允许把无引用的概念判断当成已完成答案。
-            state.stop_reason = StopReason.NO_EVIDENCE
-            claims = []
         diagnostics = getattr(self.synthesizer, "diagnostics", lambda: ())()
         context_manifest = getattr(self.synthesizer, "context_manifest", lambda: None)()
         if context_manifest:
@@ -349,10 +386,59 @@ class FinancialResearchAgent:
             state.bundle.add_claim(claim)
         state.audit_events = _merge_audit_events(
             state.audit_events,
-            self.harness.audit_events(state.request.run_id),
+            self.harness.audit_events(state.turn.run_id),
         )
         state.report = render_report(state)
         return self._update(state)
+
+    @staticmethod
+    def _apply_adequacy(state: ResearchState, decisions: Sequence[EvidenceAdequacyGap]) -> None:
+        missing = {item.requirement_key for item in decisions}
+        updated: list[ResearchGap] = []
+        for gap in state.gaps:
+            if gap.code not in {"evidence_semantically_insufficient", "evidence_conflict"}:
+                updated.append(gap)
+                continue
+            updated.append(
+                ResearchGap(
+                    code=gap.code,
+                    message=gap.message,
+                    entity=gap.entity,
+                    requirement_key=gap.requirement_key,
+                    tool_name=gap.tool_name,
+                    task_id=gap.task_id,
+                    resolvable=gap.resolvable,
+                    resolved=gap.requirement_key not in missing,
+                )
+            )
+        for decision in decisions:
+            code = "evidence_conflict" if decision.status == "conflicting" else "evidence_semantically_insufficient"
+            parts = [*decision.missing_information]
+            if decision.retrieval_hint:
+                parts.append(f"下一步：{decision.retrieval_hint}")
+            message = "；".join(parts)
+            if not any(
+                gap.code == code
+                and gap.requirement_key == decision.requirement_key
+                and not gap.resolved
+                and gap.message == message
+                for gap in updated
+            ):
+                updated.append(
+                    ResearchGap(
+                        code=code,
+                        message=message,
+                        requirement_key=decision.requirement_key,
+                        resolvable=True,
+                    )
+                )
+        state.gaps = updated
+        if missing:
+            state.coverage = CoverageDecision(
+                complete=False,
+                missing=tuple(sorted(missing)),
+                rationale="Retrieved evidence is not semantically sufficient for every requirement.",
+            )
 
     def _route_after_planning(self, graph_state: FinancialGraphState) -> Literal["planning", "validation"]:
         state = self._state(graph_state)
@@ -435,7 +521,7 @@ class FinancialResearchAgent:
                 state.gaps.append(ResearchGap(code=code, message=message, resolvable=False))
 
     def _mark_no_available_action(self, state: ResearchState) -> None:
-        state.coverage = self.assessor.assess(state.request, state.bundle, state.scope)
+        state.coverage = self.assessor.assess(state.turn, state.bundle, state.scope)
         if state.coverage.complete and (state.bundle.evidence or not _requires_grounding(state)):
             state.stop_reason = StopReason.COVERAGE_SATISFIED
             return
@@ -591,21 +677,25 @@ class FinancialResearchAgent:
         state.gaps = updated
 
     @staticmethod
-    def _tool_context(request: ResearchRequest, available: Mapping[str, ToolSpec]) -> ToolContext:
+    def _tool_context(
+        turn: ChatTurn,
+        runtime_policy: RuntimePolicy,
+        available: Mapping[str, ToolSpec],
+    ) -> ToolContext:
         return ToolContext(
-            run_id=request.run_id,
-            thread_id=request.thread_id,
-            tenant_id=request.tenant_id,
-            user_id=request.user_id,
+            run_id=turn.run_id,
+            thread_id=turn.thread_id,
+            tenant_id=turn.tenant_id,
+            user_id=turn.user_id,
             policy=ExecutionPolicy(
                 allowed_capabilities=frozenset(spec.capability for spec in available.values()),
                 allowed_side_effects=frozenset({SideEffect.READ_ONLY}),
-                allow_network=request.allow_network,
-                max_tool_calls=request.max_tool_calls,
-                max_network_calls=request.max_network_calls,
-                max_model_calls=request.max_model_calls,
-                max_model_input_tokens=request.max_model_input_tokens,
-                max_model_output_tokens=request.max_model_output_tokens,
+                allow_network=turn.allow_network,
+                max_tool_calls=runtime_policy.max_tool_calls,
+                max_network_calls=runtime_policy.max_network_calls,
+                max_model_calls=runtime_policy.max_model_calls,
+                max_model_input_tokens=runtime_policy.max_model_input_tokens,
+                max_model_output_tokens=runtime_policy.max_model_output_tokens,
             ),
         )
 
@@ -614,7 +704,7 @@ class FinancialResearchAgent:
             state.audit_events
         )
         self.harness.prime_run(
-            state.request.run_id,
+            state.turn.run_id,
             tool_calls=tool_calls,
             network_calls=network_calls,
             model_calls=model_calls,
@@ -626,7 +716,7 @@ class FinancialResearchAgent:
     def _outcome(self, state: ResearchState) -> ResearchOutcome:
         state.audit_events = _merge_audit_events(
             state.audit_events,
-            self.harness.audit_events(state.request.run_id),
+            self.harness.audit_events(state.turn.run_id),
         )
         tool_calls, network_calls, model_calls, model_input_tokens, model_output_tokens, _ = self._audit_usage(
             state.audit_events
@@ -671,16 +761,17 @@ class FinancialResearchAgent:
         return {"research": state.to_dict()}
 
     @staticmethod
-    def _config(request: ResearchRequest) -> dict[str, Any]:
+    def _config(turn: ChatTurn, runtime_policy: RuntimePolicy) -> dict[str, Any]:
         thread_id = stable_id(
             "run",
             {
-                "tenant_id": request.tenant_id,
-                "thread_id": request.thread_id,
-                "run_id": request.run_id,
+                "tenant_id": turn.tenant_id,
+                "user_id": turn.user_id,
+                "thread_id": turn.thread_id,
+                "run_id": turn.run_id,
             },
         )
         return {
             "configurable": {"thread_id": thread_id},
-            "recursion_limit": request.max_tool_calls * 2 + request.max_iterations * 2 + 8,
+            "recursion_limit": runtime_policy.max_tool_calls * 2 + runtime_policy.max_iterations * 2 + 8,
         }

@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
+from pathlib import Path
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
-from llm_fixtures import NullPlanner, llm_backed_agent, llm_research_request
+from llm_fixtures import NullPlanner, agent_run_input, llm_backed_agent
 
-from mas_finance.agent import ResearchRequest
-from mas_finance.corpus import CorpusDocument, InMemoryCorpus
+from mas_finance.corpus import CorpusDocument, DocumentTokenizer, InMemoryCorpus
 from mas_finance.harness import ToolHarness
 from mas_finance.market import MarketEvidenceAdapter, market_data_harness_tool
 from mas_finance.retrieval import RetrievalEvidenceAdapter, retrieval_harness_tool
+
+TOKENIZER = DocumentTokenizer(Path(".runtime/models/bge-m3/tokenizer.json"))
 
 
 class FakeMarket:
@@ -38,7 +41,7 @@ class EmptyRetrieval:
 
 
 def populated_corpus() -> InMemoryCorpus:
-    corpus = InMemoryCorpus()
+    corpus = InMemoryCorpus(tokenizer=TOKENIZER)
     corpus.ingest(
         CorpusDocument.create(
             title="acme-annual-report.txt",
@@ -50,8 +53,22 @@ def populated_corpus() -> InMemoryCorpus:
 
 
 class AgentLoopTests(unittest.TestCase):
+    def test_corpus_uses_bge_token_windows_with_hard_limit_and_overlap(self) -> None:
+        corpus = InMemoryCorpus(tokenizer=TOKENIZER)
+        corpus.ingest(CorpusDocument.create(title="long.pdf", text="现金流风险分析。" * 400))
+
+        records = corpus.index_records()
+        self.assertGreater(len(records), 1)
+        for record in records:
+            self.assertLessEqual(TOKENIZER.count_tokens(record["content"]), 1024)
+        for previous, current in zip(records[:-1], records[1:], strict=True):
+            self.assertEqual(
+                previous["metadata"]["token_end"] - current["metadata"]["token_start"],
+                256,
+            )
+
     def test_corpus_top_k_diversifies_relevant_documents_before_extra_chunks(self) -> None:
-        corpus = InMemoryCorpus(chunk_chars=200, overlap_chars=0)
+        corpus = InMemoryCorpus(tokenizer=TOKENIZER, chunk_tokens=20, overlap_tokens=0)
         corpus.ingest(
             CorpusDocument.create(
                 title="first.pdf",
@@ -80,7 +97,7 @@ class AgentLoopTests(unittest.TestCase):
         )
 
     def test_corpus_retrieval_supports_chinese_bigrams(self) -> None:
-        corpus = InMemoryCorpus()
+        corpus = InMemoryCorpus(tokenizer=TOKENIZER)
         corpus.ingest(CorpusDocument.create(title="苹果财报", text="苹果公司收入增长，经营现金流保持稳定。"))
         result = corpus.search_json({"query": "分析苹果收入和现金流", "top_k": 3})
         self.assertEqual(len(result["chunks"]), 1)
@@ -95,14 +112,10 @@ class AgentLoopTests(unittest.TestCase):
         )
         harness.register(market_data_harness_tool(MarketEvidenceAdapter(FakeMarket())))
         outcome = llm_backed_agent(harness).run(
-            llm_research_request(
-                query="Analyze ACME demand, cash flow, and valuation",
-                entities=("ACME",),
-                symbols={"ACME": "ACME"},
+            *agent_run_input(
+                query="Analyze the supplied ACME report for demand, cash flow, and valuation",
                 run_id="loop-success",
                 allow_network=True,
-                require_documents=True,
-                require_regulatory_data=False,
             )
         )
         self.assertIn(outcome.status, {"succeeded", "degraded"})
@@ -110,7 +123,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn("## Run controls", outcome.state.report)
         self.assertFalse(outcome.state.validation_issues)
 
-    def test_sqlite_checkpoint_is_tenant_scoped_and_terminal_run_resumes(self) -> None:
+    def test_sqlite_checkpoint_is_principal_scoped_and_terminal_run_resumes(self) -> None:
         with (
             tempfile.TemporaryDirectory() as directory,
             SqliteSaver.from_conn_string(f"{directory}/checkpoints.db") as checkpointer,
@@ -122,20 +135,25 @@ class AgentLoopTests(unittest.TestCase):
                     fixed_search_mode="lexical",
                 )
             )
-            request = llm_research_request(
+            turn, policy, context = agent_run_input(
                 query="Analyze ACME demand",
-                entities=("ACME",),
-                require_documents=True,
-                require_market_data=False,
                 run_id="resume-run",
             )
-            first = llm_backed_agent(harness, checkpointer=checkpointer).run(request)
-            second = llm_backed_agent(ToolHarness(), checkpointer=checkpointer).run(request, resume=True)
+            first = llm_backed_agent(harness, checkpointer=checkpointer).run(turn, policy, context)
+            second = llm_backed_agent(ToolHarness(), checkpointer=checkpointer).run(
+                turn, policy, context, resume=True
+            )
             self.assertEqual(first.state.to_dict(), second.state.to_dict())
-            other_tenant = ResearchRequest.from_dict({**request.to_dict(), "tenant_id": "other-tenant"})
+            other_tenant = replace(turn, tenant_id="other-tenant")
             self.assertIsNone(
                 llm_backed_agent(ToolHarness(), planner=NullPlanner(), checkpointer=checkpointer).get_state(
-                    other_tenant
+                    other_tenant, policy
+                )
+            )
+            other_user = replace(turn, user_id="other-user")
+            self.assertIsNone(
+                llm_backed_agent(ToolHarness(), planner=NullPlanner(), checkpointer=checkpointer).get_state(
+                    other_user, policy
                 )
             )
 
@@ -143,16 +161,15 @@ class AgentLoopTests(unittest.TestCase):
         harness = ToolHarness()
         harness.register(retrieval_harness_tool(RetrievalEvidenceAdapter(EmptyRetrieval())))
         outcome = llm_backed_agent(harness, checkpointer=InMemorySaver()).run(
-            llm_research_request(
-                query="Unknown topic",
+            *agent_run_input(
+                query="根据文档分析 Unknown topic",
                 run_id="no-evidence",
-                require_documents=True,
-                require_market_data=False,
                 max_iterations=2,
             )
         )
         self.assertEqual(outcome.status, "failed")
         self.assertEqual(outcome.state.bundle.claims, {})
+        self.assertIn("当前证据不足以完整回答", outcome.state.report)
         self.assertIn("No structured finding could be supported", outcome.state.report)
 
 

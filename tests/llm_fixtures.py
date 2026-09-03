@@ -7,19 +7,27 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from mas_finance.agent import ResearchPlan, ResearchRequest, _requests_multi_document_synthesis
+from mas_finance.agent import AgentContext, ChatAttachment, ChatTurn, ResearchPlan, RuntimePolicy
 from mas_finance.api.app import create_app
 from mas_finance.graph import FinancialResearchAgent
 from mas_finance.harness import ToolHarness
 from mas_finance.llm import BaseLLMClient
-from mas_finance.market_data import DEFAULT_TICKER_MAP
-from mas_finance.metrics import MetricRequest, infer_metric_requests
+from mas_finance.metrics import MetricOperation, MetricRequest
 from mas_finance.planning import ModelPlanner, llm_planning_harness_tool
 from mas_finance.service import FinanceAnalysisService
 from mas_finance.synthesis import EvidenceBoundLLMSynthesizer, llm_synthesis_harness_tool
 from mas_finance.task_frame import LLMTaskInterpreter, llm_task_frame_harness_tool
 
-_PRONOUNS = ("它", "其", "前者", "后者", "这只", "该公司", "那家")
+_PRONOUNS = ("它", "其", "前者", "后者", "这只", "这份", "刚才", "该公司", "那家")
+_FIXTURE_SYMBOLS = {
+    "Apple": "AAPL",
+    "Microsoft": "MSFT",
+    "Tesla": "TSLA",
+    "Amazon": "AMZN",
+    "Alphabet": "GOOGL",
+    "Meta": "META",
+    "NVIDIA": "NVDA",
+}
 _DOCUMENT_PREFERRED = (
     "corpus.hybrid_search",
     "corpus.search",
@@ -49,6 +57,43 @@ _MACRO_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("PCEPI", ("pce price", "pce inflation", "pce物价", "pce通胀")),
     ("MORTGAGE30US", ("mortgage rate", "30-year mortgage", "房贷利率", "抵押贷款利率")),
 )
+
+
+def _requests_multi_document_synthesis(query: str) -> bool:
+    normalized = query.casefold()
+    return bool(
+        re.search(
+            r"(?:综合|对比|比较|分别|逐份).{0,12}(?:文档|材料|pdf|报告)|"
+            r"(?:所有|全部|这些|几份).{0,12}(?:文档|材料|pdf|报告)|"
+            r"\b(?:compare|synthesize|across|both|all)\b.{0,30}\b(?:documents?|files?|pdfs?)\b",
+            normalized,
+        )
+    )
+
+
+def _fixture_metric_requests(query: str) -> tuple[MetricRequest, ...]:
+    normalized = query.casefold()
+    numbers = [float(item) for item in re.findall(r"[-+]?\d+(?:\.\d+)?", normalized)]
+    if any(item in normalized for item in ("cagr", "复合增长率", "年复合增长率")) and len(numbers) >= 3:
+        return (
+            MetricRequest(
+                operation=MetricOperation.CAGR,
+                inputs={"beginning_value": numbers[0], "ending_value": numbers[1], "years": numbers[2]},
+                label="cagr",
+            ),
+        )
+    percentage_requested = any(
+        item in normalized for item in ("percentage change", "percent change", "增长率", "变化率")
+    )
+    if percentage_requested and len(numbers) >= 2:
+        return (
+            MetricRequest(
+                operation=MetricOperation.PERCENTAGE_CHANGE,
+                inputs={"beginning_value": numbers[0], "ending_value": numbers[1]},
+                label="percentage_change",
+            ),
+        )
+    return ()
 
 
 class ScriptedLLM(BaseLLMClient):
@@ -81,8 +126,8 @@ class FixtureResearchLLM(BaseLLMClient):
         del temperature, max_tokens
         payload = json.loads(user_prompt)
         if "最小语义事实" in system_prompt:
-            events = list(payload.get("events") or ())
-            user_event = next((item for item in events if item.get("kind") == "user_message"), None)
+            events = list(payload.get("user_messages") or ())
+            user_event = events[0] if events else None
             if user_event is None:
                 return '{"facts":[]}'
             return json.dumps(
@@ -91,8 +136,9 @@ class FixtureResearchLLM(BaseLLMClient):
                         {
                             "text": f"用户提出请求：{str(user_event.get('content') or '')[:300]}",
                             "source_event_ids": [user_event["event_id"]],
-                            "entities": list(user_event.get("entities") or ()),
-                            "status": "requested",
+                            "entities": list(
+                                dict.fromkeys(str(entity) for entity in payload.get("resolved_entity_candidates") or ())
+                            ),
                         }
                     ]
                 },
@@ -106,16 +152,34 @@ class FixtureResearchLLM(BaseLLMClient):
             return json.dumps(self._task_frame(payload), ensure_ascii=False)
         if "规划组件" in system_prompt:
             return json.dumps(self._plan(payload), ensure_ascii=False)
+        if "证据充分性校验组件" in system_prompt:
+            return json.dumps(
+                {
+                    "requirements": [
+                        {
+                            "requirement_key": item["key"],
+                            "status": "sufficient",
+                            "missing_information": [],
+                            "retrieval_hint": "",
+                        }
+                        for item in payload.get("requirements") or ()
+                    ]
+                },
+                ensure_ascii=False,
+            )
         return json.dumps(self._synthesize(payload), ensure_ascii=False)
 
     def _task_frame(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         current = payload.get("current_request") or {}
-        query = str(current.get("query") or "")
-        current_entities = [str(item) for item in current.get("explicit_or_detected_entities") or ()]
+        query = str(current.get("message") or "")
+        current_entities: list[str] = []
+        current_entities.extend(name for name in _FIXTURE_SYMBOLS if name in query and name not in current_entities)
         current_entities.extend(
-            name for name in DEFAULT_TICKER_MAP if name in query and name not in current_entities
+            name
+            for name in re.findall(r"[A-Z][A-Za-z0-9.-]{1,31}", query)
+            if name not in current_entities and name not in {"PDF", "CAGR"}
         )
-        symbols = dict(current.get("symbols") or {})
+        symbols = {entity: _FIXTURE_SYMBOLS.get(entity, entity) for entity in current_entities}
         replay = _atomic_fact_replay(str(payload.get("atomic_fact_history") or ""))
         unique_history = _unique_replay_entities(replay)
         if _needs_clarification(query, current_entities, unique_history):
@@ -152,7 +216,12 @@ class FixtureResearchLLM(BaseLLMClient):
         }
 
     def _plan(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        request = payload.get("user_request") or {}
+        current_turn = payload.get("current_turn") or {}
+        request = {
+            **current_turn,
+            "query": current_turn.get("message"),
+            "attachments": current_turn.get("attachments") or (),
+        }
         tools = {str(item["name"]): item for item in payload.get("available_tools") or () if item.get("name")}
         attempted = {
             _signature(str(item.get("tool_name") or ""), dict(item.get("arguments") or {}))
@@ -166,8 +235,9 @@ class FixtureResearchLLM(BaseLLMClient):
         if evidence and not missing:
             return {"action": "finish", "reason": "已有证据且无未覆盖需求。"}
 
-        scope = payload.get("intent_hints") or {}
+        scope: Mapping[str, Any] = {}
         frame = payload.get("task_frame") or {}
+        request["entities"] = [str(item.get("name")) for item in frame.get("entities") or () if item.get("name")]
         if isinstance(frame.get("scope"), Mapping):
             scope = frame["scope"]
         requirements = list(scope.get("requirements") or ())
@@ -215,7 +285,7 @@ class FixtureResearchLLM(BaseLLMClient):
     def _synthesize(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         cards = [item for item in payload.get("evidence") or () if isinstance(item, Mapping)]
         if not cards:
-            query = str((payload.get("task") or {}).get("query") or "")
+            query = str((payload.get("task") or {}).get("message") or "")
             text = f"根据金融概念解释：{query}" if query else "该问题可由模型根据金融概念直接回答。"
             return {
                 "claims": [
@@ -241,10 +311,40 @@ class FixtureResearchLLM(BaseLLMClient):
         }
 
 
-def llm_research_request(**kwargs: Any) -> ResearchRequest:
-    kwargs.setdefault("max_model_calls", 8)
-    kwargs.setdefault("max_iterations", 6)
-    return ResearchRequest(**kwargs)
+def agent_run_input(**kwargs: Any) -> tuple[ChatTurn, RuntimePolicy, AgentContext]:
+    message = str(kwargs.pop("query", kwargs.pop("message", "")))
+    turn_fields = {
+        key: kwargs.pop(key)
+        for key in ("tenant_id", "user_id", "thread_id", "run_id", "allow_network")
+        if key in kwargs
+    }
+    policy_fields = {
+        key: kwargs.pop(key)
+        for key in (
+            "max_iterations",
+            "max_tool_calls",
+            "max_network_calls",
+            "max_model_calls",
+            "max_model_input_tokens",
+            "max_model_output_tokens",
+            "max_parallel_tool_calls",
+        )
+        if key in kwargs
+    }
+    policy_fields.setdefault("max_model_calls", 8)
+    policy_fields.setdefault("max_iterations", 6)
+    document_count = int(kwargs.pop("available_document_count", 0))
+    attachments = tuple(
+        ChatAttachment(document_id=f"doc-{index}", title=f"document-{index}.pdf") for index in range(document_count)
+    )
+    context = AgentContext(
+        thread_context=dict(kwargs.pop("thread_context", {})),
+        personal_context=tuple(kwargs.pop("personal_context", ())),
+        skill_index=tuple(kwargs.pop("skill_index", ())),
+    )
+    if kwargs:
+        raise TypeError(f"unsupported agent test input fields: {sorted(kwargs)}")
+    return ChatTurn(message=message, attachments=attachments, **turn_fields), RuntimePolicy(**policy_fields), context
 
 
 def register_research_llm(harness: ToolHarness, llm: BaseLLMClient, *, network_access: bool = False) -> None:
@@ -262,9 +362,9 @@ def llm_backed_agent(harness: ToolHarness, llm: BaseLLMClient | None = None, **k
     register_research_llm(harness, client)
     mcp_tool_index = kwargs.pop("mcp_tool_index", ())
     if "planner" not in kwargs:
-        kwargs["planner"] = ModelPlanner(harness, mcp_tool_index=mcp_tool_index)
+        kwargs["planner"] = ModelPlanner(harness, count_tokens=len, mcp_tool_index=mcp_tool_index)
     if "synthesizer" not in kwargs:
-        kwargs["synthesizer"] = EvidenceBoundLLMSynthesizer(client, harness=harness)
+        kwargs["synthesizer"] = EvidenceBoundLLMSynthesizer(client, harness=harness, count_tokens=len)
     if "task_interpreter" not in kwargs:
         kwargs["task_interpreter"] = LLMTaskInterpreter(harness)
     return FinancialResearchAgent(harness, **kwargs)
@@ -291,13 +391,17 @@ def _unique_replay_entities(replay: Sequence[Mapping[str, Any]]) -> list[str]:
 
 
 def _atomic_fact_replay(value: str) -> list[dict[str, Any]]:
-    return [
-        {
-            "event_id": match.group(1),
-            "entities": [item for item in match.group(2).split(",") if item],
-        }
-        for match in re.finditer(r"event_id=([^;\]]+);[^\]]*entities=([^\]]*)\]", value)
-    ]
+    replay: list[dict[str, Any]] = []
+    for match in re.finditer(r"event_id=([^;\]]+);[^\]]*\]\s*(.+)$", value, flags=re.MULTILINE):
+        content = match.group(2)
+        entities = [name for name in _FIXTURE_SYMBOLS if name in content]
+        entities.extend(
+            name
+            for name in re.findall(r"[A-Z][A-Za-z0-9.-]{1,31}", content)
+            if name not in entities and name not in {"PDF", "CAGR"}
+        )
+        replay.append({"event_id": match.group(1), "entities": entities})
+    return replay
 
 
 def _needs_clarification(query: str, current_entities: Sequence[str], history: Sequence[str]) -> bool:
@@ -344,9 +448,21 @@ def _frame_requirements(
             }
         ]
     requirements: list[dict[str, Any]] = []
-    calculations = [dict(item) for item in current.get("calculations") or ()]
-    inferred = [item.to_dict() for item in infer_metric_requests(query)]
-    for item in calculations or inferred:
+    inferred = [item.to_dict() for item in _fixture_metric_requests(query)]
+    if "夏普" in query and not inferred:
+        numbers = [float(item) for item in re.findall(r"[-+]?\d+(?:\.\d+)?", query)]
+        if len(numbers) >= 6:
+            inferred.append(
+                MetricRequest(
+                    operation=MetricOperation.SHARPE_RATIO,
+                    inputs={
+                        "returns": numbers[:4],
+                        "annualization_factor": numbers[4],
+                        "annual_risk_free_rate": numbers[5],
+                    },
+                ).to_dict()
+            )
+    for item in inferred:
         request = item if "request_id" in item and item["request_id"] else MetricRequest.from_dict(item).to_dict()
         requirements.append(
             {
@@ -356,25 +472,42 @@ def _frame_requirements(
                 "reason": "需要确定性公式计算结果。",
             }
         )
-    want_documents = bool(current.get("require_documents") or int(current.get("document_count") or 0) > 0)
+    attachments = list(current.get("attachments") or ())
+    want_documents = (
+        bool(attachments)
+        or any(
+            marker in query.casefold()
+            for marker in (
+                "文档",
+                "pdf",
+                "报告",
+                "材料",
+                "知识库",
+                "my library",
+                "library",
+                "政策",
+                "扫描件",
+                "document",
+                "report",
+            )
+        )
+        or ("covenant" in query.casefold() and "document.search" in capabilities)
+    )
     if want_documents:
-        targets = entity_names or [None]
-        for entity in targets:
-            item = {
+        minimum_documents = min(20, len(attachments)) if _requests_multi_document_synthesis(query) else 1
+        requirements.append(
+            {
                 "category": "document",
                 "fields": [],
-                "parameters": {},
+                "parameters": ({"minimum_documents": minimum_documents} if minimum_documents > 1 else {}),
                 "reason": "需要已授权文档中的证据。",
             }
-            if entity:
-                item["entity"] = entity
-            requirements.append(item)
-    series = [str(item) for item in current.get("macro_series") or ()]
-    if not series:
-        normalized = query.casefold()
-        for series_id, keywords in _MACRO_ALIASES:
-            if any(keyword in normalized for keyword in keywords):
-                series.append(series_id)
+        )
+    series: list[str] = []
+    normalized = query.casefold()
+    for series_id, keywords in _MACRO_ALIASES:
+        if any(keyword in normalized for keyword in keywords):
+            series.append(series_id)
     if series and "macro.read" in capabilities:
         for series_id in series:
             requirements.append(
@@ -385,14 +518,21 @@ def _frame_requirements(
                     "reason": "需要官方宏观序列的最新观察值。",
                 }
             )
-    want_history = current.get("require_market_history") is True or any(marker in query for marker in _HISTORY_MARKERS)
-    want_market = current.get("require_market_data") is True or (
-        any(marker in query for marker in _MARKET_MARKERS) and not want_history
-    )
+    if "web.search" in _tool_names and any(
+        marker in query.casefold() for marker in ("this week", "latest", "最新", "本周")
+    ):
+        requirements.append(
+            {
+                "category": "web",
+                "fields": [],
+                "parameters": {},
+                "reason": "需要近期公开网页信息。",
+            }
+        )
+    want_history = any(marker in query for marker in _HISTORY_MARKERS)
+    want_market = any(marker in query for marker in _MARKET_MARKERS) and not want_history
     want_filings = any(marker in query for marker in _FILING_MARKERS)
-    want_regulatory = current.get("require_regulatory_data") is True or any(
-        marker in query for marker in _REGULATORY_MARKERS
-    )
+    want_regulatory = any(marker in query for marker in _REGULATORY_MARKERS)
     for entity in entity_names:
         if want_history and "market.read" in capabilities:
             requirements.append(
@@ -401,7 +541,7 @@ def _frame_requirements(
                     "entity": entity,
                     "fields": ["total_return", "max_drawdown"],
                     "parameters": {
-                        "range": current.get("market_history_range") or "1y",
+                        "range": "1y",
                         "symbol": symbols.get(entity, entity),
                     },
                     "reason": "需要价格历史以计算风险指标。",
@@ -473,7 +613,7 @@ def _tool_for_requirement(
             "reason": "调用白名单公式工具。",
         }
     if category == "document":
-        return _document_tool(tools, request, mcp_index, attempted)
+        return _document_tool(tools, request, requirement, mcp_index, attempted)
     if category == "macro" and "macro.fred_series" in tools:
         series_id = str(parameters.get("series_id") or (request.get("macro_series") or ["UNRATE"])[0])
         return {
@@ -531,18 +671,19 @@ def _tool_for_requirement(
 def _document_tool(
     tools: Mapping[str, Mapping[str, Any]],
     request: Mapping[str, Any],
+    requirement: Mapping[str, Any],
     mcp_index: Sequence[Mapping[str, Any]],
     attempted: set[tuple[str, str]],
 ) -> dict[str, Any] | None:
     query = str(request.get("query") or "")
-    entities = [str(item).strip() for item in request.get("entities") or () if str(item).strip()]
-    search_query = " ".join([query, *entities]).strip() or query
-    arguments: dict[str, Any] = {"query": search_query, "top_k": int(request.get("top_k") or 5)}
-    if _requests_multi_document_synthesis(query):
+    search_query = " ".join((query, *(str(item) for item in request.get("entities") or ()))).strip()
+    arguments: dict[str, Any] = {"query": search_query, "top_k": 5}
+    minimum_documents = int((requirement.get("parameters") or {}).get("minimum_documents", 1))
+    if minimum_documents > 1:
         arguments["diversify_documents"] = True
         arguments["top_k"] = min(
             20,
-            max(int(request.get("top_k") or 5), int(request.get("available_document_count") or 0)),
+            max(5, minimum_documents),
         )
     if any(marker in query for marker in _PERSONAL_LIBRARY_MARKERS):
         preferred = _PERSONAL_DOCUMENT_PREFERRED
@@ -563,10 +704,7 @@ def _document_tool(
         contract = spec.get("input_contract") or {}
         if name in ordered or name.startswith("llm.") or name.startswith("mcp."):
             continue
-        if (
-            "query" in (contract.get("required") or ())
-            and name not in {"web.search", "finance.formula"}
-        ):
+        if "query" in (contract.get("required") or ()) and name not in {"web.search", "finance.formula"}:
             ordered.append(name)
     for name in ordered:
         item = {"tool_name": name, "arguments": dict(arguments), "reason": "检索已授权文档。"}
@@ -591,11 +729,7 @@ def _document_tool(
 
 
 def _calculation_from_request(request: Mapping[str, Any], query: str) -> dict[str, Any] | None:
-    raw = list(request.get("calculations") or ())
-    if raw:
-        item = dict(raw[0])
-        return item if item.get("request_id") else MetricRequest.from_dict(item).to_dict()
-    inferred = infer_metric_requests(query)
+    inferred = _fixture_metric_requests(query)
     return inferred[0].to_dict() if inferred else None
 
 

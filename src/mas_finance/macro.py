@@ -295,6 +295,22 @@ def fred_series_harness_tool(adapter: FREDEvidenceAdapter) -> Tool:
                 required=frozenset({"series_id"}),
                 optional=frozenset({"observation_start", "observation_end", "limit"}),
             ),
+            input_schema={
+                "type": "object",
+                "required": ["series_id"],
+                "additionalProperties": False,
+                "properties": {
+                    "series_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64,
+                        "pattern": "^[A-Za-z0-9_.-]+$",
+                    },
+                    "observation_start": {"type": "string", "format": "date"},
+                    "observation_end": {"type": "string", "format": "date"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10000},
+                },
+            },
         ),
         invoke,
     )

@@ -62,8 +62,8 @@ class MemoryConsolidationTests(unittest.TestCase):
                 content="用户长期偏好使用中文。",
             )
             service._merge_long_term_memory_candidate(
-                "default",
-                "anonymous",
+                "local",
+                "owner",
                 "memory-update-thread",
                 "memory-update-run",
                 LongTermMemoryCandidate(
@@ -84,8 +84,8 @@ class MemoryConsolidationTests(unittest.TestCase):
             self.assertTrue(updated["metadata"]["replaces_prior_memory"])
 
             service._consolidate_long_term_memory(
-                "default",
-                "anonymous",
+                "local",
+                "owner",
                 "temporary-thread",
                 "temporary-run",
                 (),
@@ -163,7 +163,7 @@ class MemoryConsolidationTests(unittest.TestCase):
                     run_id="profile-run",
                     export_artifacts=False,
                 )["result"]
-                context = result["request"]["personal_context"]
+                context = result["context"]["personal_context"]
                 self.assertEqual(context[0]["kind"], "user_instructions")
                 self.assertIn("所有报告先给结论", context[0]["content"])
                 memories = service.list_personal_memories()

@@ -11,7 +11,7 @@ from typing import Any, Protocol
 
 from .contracts import Claim, ClaimStatus, EvidenceBundle, SourceType, stable_id
 from .harness import ToolSpec
-from .research import ResearchRequirement, ResearchScope, validate_macro_series
+from .research import ResearchRequirement, ResearchScope
 
 
 class AgentPhase(StrEnum):
@@ -31,64 +31,53 @@ class StopReason(StrEnum):
     NO_AVAILABLE_ACTION = "no_available_action"
     VALIDATION_FAILED = "validation_failed"
     NO_EVIDENCE = "no_evidence"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
 
 
 @dataclass(frozen=True)
-class ResearchRequest:
-    query: str
-    entities: tuple[str, ...] = ()
-    symbols: Mapping[str, str] = field(default_factory=dict)
+class ChatAttachment:
+    document_id: str
+    title: str
+    media_type: str = "application/pdf"
+
+    def __post_init__(self) -> None:
+        for name, value, limit in (
+            ("document_id", self.document_id, 256),
+            ("title", self.title, 255),
+            ("media_type", self.media_type, 100),
+        ):
+            if not value.strip() or len(value) > limit or any(ord(item) < 32 or ord(item) == 127 for item in value):
+                raise ValueError(f"attachment {name} is invalid")
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ChatAttachment:
+        return cls(
+            document_id=str(value["document_id"]),
+            title=str(value["title"]),
+            media_type=str(value.get("media_type") or "application/pdf"),
+        )
+
+
+@dataclass(frozen=True)
+class ChatTurn:
+    message: str
     tenant_id: str = "default"
     user_id: str = "anonymous"
     thread_id: str = "thread"
     run_id: str = "run"
     allow_network: bool = False
-    top_k: int = 5
-    max_iterations: int = 3
-    max_tool_calls: int = 12
-    max_network_calls: int = 8
-    max_model_calls: int = 8
-    max_model_input_tokens: int = 300_000
-    max_model_output_tokens: int = 32_768
-    max_parallel_tool_calls: int = 4
-    require_documents: bool = True
-    require_market_data: bool | None = None
-    require_market_history: bool | None = None
-    require_regulatory_data: bool | None = None
-    market_history_range: str = "1y"
-    market_history_interval: str = "1d"
-    macro_series: tuple[str, ...] = ()
-    calculations: tuple[Mapping[str, Any], ...] = ()
-    thread_context: Mapping[str, Any] = field(default_factory=dict)
-    personal_context: tuple[Mapping[str, Any], ...] = ()
-    skill_index: tuple[Mapping[str, Any], ...] = ()
-    available_document_count: int = 0
+    attachments: tuple[ChatAttachment, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.query.strip():
-            raise ValueError("query is required")
-        if len(self.query) > 8_000:
-            raise ValueError("query cannot exceed 8000 characters")
-        if len(self.entities) > 50 or any(
-            len(item) > 200 or any(ord(character) < 32 or ord(character) == 127 for character in item)
-            for item in self.entities
-        ):
-            raise ValueError("entities exceed count or length limits")
-        if any(not item.strip() for item in self.entities):
-            raise ValueError("entities cannot contain empty values")
-        if len(set(self.entities)) != len(self.entities):
-            raise ValueError("entities cannot contain duplicates")
-        if len(self.symbols) > 50 or any(
-            not str(key).strip()
-            or len(str(key)) > 200
-            or not str(value).strip()
-            or len(str(value)) > 64
-            or not re.fullmatch(r"[A-Za-z0-9.^=_:-]{1,64}", str(value))
-            for key, value in self.symbols.items()
-        ):
-            raise ValueError("symbols exceed count or length limits")
-        if set(self.symbols).difference(self.entities):
-            raise ValueError("symbol keys must refer to requested entities")
+        if not self.message.strip():
+            raise ValueError("message is required")
+        if len(self.message) > 8_000:
+            raise ValueError("message cannot exceed 8000 characters")
+        if len(self.attachments) > 20 or any(not isinstance(item, ChatAttachment) for item in self.attachments):
+            raise ValueError("attachments must contain at most 20 attachment references")
         for name, value in (
             ("tenant_id", self.tenant_id),
             ("user_id", self.user_id),
@@ -97,8 +86,34 @@ class ResearchRequest:
         ):
             if not value.strip() or len(value) > 200 or any(ord(item) < 32 or ord(item) == 127 for item in value):
                 raise ValueError(f"{name} is invalid")
-        if not 1 <= self.top_k <= 20:
-            raise ValueError("top_k must be between 1 and 20")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> ChatTurn:
+        return cls(
+            message=str(value["message"]),
+            tenant_id=str(value["tenant_id"]),
+            user_id=str(value["user_id"]),
+            thread_id=str(value["thread_id"]),
+            run_id=str(value["run_id"]),
+            allow_network=bool(value["allow_network"]),
+            attachments=tuple(ChatAttachment.from_dict(item) for item in value.get("attachments") or ()),
+        )
+
+
+@dataclass(frozen=True)
+class RuntimePolicy:
+    max_iterations: int = 3
+    max_tool_calls: int = 12
+    max_network_calls: int = 8
+    max_model_calls: int = 8
+    max_model_input_tokens: int = 300_000
+    max_model_output_tokens: int = 32_768
+    max_parallel_tool_calls: int = 4
+
+    def __post_init__(self) -> None:
         if not 1 <= self.max_iterations <= 8:
             raise ValueError("max_iterations must be between 1 and 8")
         if not 1 <= self.max_tool_calls <= 100:
@@ -113,9 +128,30 @@ class ResearchRequest:
             raise ValueError("max_model_output_tokens must be between 1024 and 200000")
         if not 1 <= self.max_parallel_tool_calls <= 8:
             raise ValueError("max_parallel_tool_calls must be between 1 and 8")
-        object.__setattr__(self, "macro_series", validate_macro_series(self.macro_series))
-        if len(self.calculations) > 20 or any(not isinstance(item, Mapping) for item in self.calculations):
-            raise ValueError("calculations must contain at most 20 objects")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> RuntimePolicy:
+        return cls(
+            max_iterations=int(value["max_iterations"]),
+            max_tool_calls=int(value["max_tool_calls"]),
+            max_network_calls=int(value["max_network_calls"]),
+            max_model_calls=int(value["max_model_calls"]),
+            max_model_input_tokens=int(value["max_model_input_tokens"]),
+            max_model_output_tokens=int(value["max_model_output_tokens"]),
+            max_parallel_tool_calls=int(value["max_parallel_tool_calls"]),
+        )
+
+
+@dataclass(frozen=True)
+class AgentContext:
+    thread_context: Mapping[str, Any] = field(default_factory=dict)
+    personal_context: tuple[Mapping[str, Any], ...] = ()
+    skill_index: tuple[Mapping[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
         if len(self.thread_context) > 20:
             raise ValueError("thread_context contains too many fields")
         try:
@@ -145,59 +181,20 @@ class ResearchRequest:
         skill_payload = json.dumps([dict(item) for item in self.skill_index], ensure_ascii=False, allow_nan=False)
         if len(skill_payload) > 20_000:
             raise ValueError("skill_index exceeds length limit")
-        if (
-            isinstance(self.available_document_count, bool)
-            or not isinstance(self.available_document_count, int)
-            or not 0 <= self.available_document_count <= 10_000
-        ):
-            raise ValueError("available_document_count must be between zero and 10000")
-        if self.market_history_range not in {"1mo", "3mo", "6mo", "1y", "2y", "5y", "10y"}:
-            raise ValueError("unsupported market_history_range")
-        if self.market_history_interval not in {"1d", "1wk", "1mo"}:
-            raise ValueError("unsupported market_history_interval")
 
     def to_dict(self) -> dict[str, Any]:
-        value = asdict(self)
-        value["entities"] = list(self.entities)
-        value["symbols"] = dict(self.symbols)
-        value["macro_series"] = list(self.macro_series)
-        value["calculations"] = [dict(item) for item in self.calculations]
-        value["thread_context"] = dict(self.thread_context)
-        value["personal_context"] = [dict(item) for item in self.personal_context]
-        value["skill_index"] = [dict(item) for item in self.skill_index]
-        return value
+        return {
+            "thread_context": dict(self.thread_context),
+            "personal_context": [dict(item) for item in self.personal_context],
+            "skill_index": [dict(item) for item in self.skill_index],
+        }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> ResearchRequest:
+    def from_dict(cls, value: Mapping[str, Any]) -> AgentContext:
         return cls(
-            query=str(value.get("query") or ""),
-            entities=tuple(str(item) for item in value.get("entities") or ()),
-            symbols={str(key): str(item) for key, item in dict(value.get("symbols") or {}).items()},
-            tenant_id=str(value.get("tenant_id") or "default"),
-            user_id=str(value.get("user_id") or "anonymous"),
-            thread_id=str(value.get("thread_id") or "thread"),
-            run_id=str(value.get("run_id") or "run"),
-            allow_network=bool(value.get("allow_network", False)),
-            top_k=int(value.get("top_k", 5)),
-            max_iterations=int(value.get("max_iterations", 3)),
-            max_tool_calls=int(value.get("max_tool_calls", 12)),
-            max_network_calls=int(value.get("max_network_calls", 8)),
-            max_model_calls=int(value.get("max_model_calls", 8)),
-            max_model_input_tokens=int(value.get("max_model_input_tokens", 300_000)),
-            max_model_output_tokens=int(value.get("max_model_output_tokens", 32_768)),
-            max_parallel_tool_calls=int(value.get("max_parallel_tool_calls", 4)),
-            require_documents=bool(value.get("require_documents", True)),
-            require_market_data=value.get("require_market_data"),
-            require_market_history=value.get("require_market_history"),
-            require_regulatory_data=value.get("require_regulatory_data"),
-            market_history_range=str(value.get("market_history_range") or "1y"),
-            market_history_interval=str(value.get("market_history_interval") or "1d"),
-            macro_series=tuple(str(item) for item in value.get("macro_series") or ()),
-            calculations=tuple(dict(item) for item in value.get("calculations") or ()),
-            thread_context=dict(value.get("thread_context") or {}),
-            personal_context=tuple(dict(item) for item in value.get("personal_context") or ()),
-            skill_index=tuple(dict(item) for item in value.get("skill_index") or ()),
-            available_document_count=int(value.get("available_document_count", 0)),
+            thread_context=dict(value["thread_context"]),
+            personal_context=tuple(dict(item) for item in value["personal_context"]),
+            skill_index=tuple(dict(item) for item in value["skill_index"]),
         )
 
 
@@ -353,7 +350,9 @@ class CoverageDecision:
 
 @dataclass
 class ResearchState:
-    request: ResearchRequest
+    turn: ChatTurn
+    runtime_policy: RuntimePolicy
+    context: AgentContext = field(default_factory=AgentContext)
     scope: ResearchScope | None = None
     task_frame: dict[str, Any] | None = None
     phase: AgentPhase = AgentPhase.INTENT
@@ -371,8 +370,10 @@ class ResearchState:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 4,
-            "request": self.request.to_dict(),
+            "schema_version": 6,
+            "turn": self.turn.to_dict(),
+            "runtime_policy": self.runtime_policy.to_dict(),
+            "context": self.context.to_dict(),
             "scope": self.scope.to_dict() if self.scope else None,
             "task_frame": dict(self.task_frame) if self.task_frame else None,
             "phase": self.phase.value,
@@ -391,10 +392,12 @@ class ResearchState:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ResearchState:
-        if int(value.get("schema_version", 0)) not in {3, 4}:
+        if int(value.get("schema_version", 0)) != 6:
             raise ValueError("unsupported checkpoint schema")
         return cls(
-            request=ResearchRequest.from_dict(value["request"]),
+            turn=ChatTurn.from_dict(value["turn"]),
+            runtime_policy=RuntimePolicy.from_dict(value["runtime_policy"]),
+            context=AgentContext.from_dict(value["context"]),
             scope=ResearchScope.from_dict(value["scope"]) if value.get("scope") else None,
             task_frame=dict(value["task_frame"]) if value.get("task_frame") else None,
             phase=AgentPhase(str(value["phase"])),
@@ -419,113 +422,19 @@ class Planner(Protocol):
 class Synthesizer(Protocol):
     def synthesize(
         self,
-        request: ResearchRequest,
+        turn: ChatTurn,
+        runtime_policy: RuntimePolicy,
+        context: AgentContext,
         bundle: EvidenceBundle,
         *,
         research_context: Mapping[str, Any] | None = None,
     ) -> Sequence[Claim]: ...
 
 
-def _requests_multi_document_synthesis(query: str) -> bool:
-    normalized = query.casefold()
-    return bool(
-        re.search(
-            r"(?:综合|对比|比较|分别|逐份).{0,12}(?:文档|材料|pdf|报告)|"
-            r"(?:所有|全部|这些|几份).{0,12}(?:文档|材料|pdf|报告)|"
-            r"\b(?:compare|synthesize|across|both|all)\b.{0,30}\b(?:documents?|files?|pdfs?)\b",
-            normalized,
-        )
-    )
-
-
-class DeterministicSynthesizer:
-    """Safe baseline: only restates evidence and never invents unsupported facts."""
-
-    def synthesize(
-        self,
-        request: ResearchRequest,
-        bundle: EvidenceBundle,
-        *,
-        research_context: Mapping[str, Any] | None = None,
-    ) -> Sequence[Claim]:
-        claims: list[Claim] = []
-        chinese = _contains_cjk(request.query)
-        for item in bundle.evidence.values():
-            if item.value is not None and item.field_name:
-                suffix = f" {item.unit}" if item.unit else ""
-                period = f" ({item.period})" if item.period else ""
-                if item.entity:
-                    entity = item.entity
-                elif item.source.source_type == SourceType.CALCULATION:
-                    entity = "计算结果" if chinese else "Calculation result"
-                else:
-                    entity = "未知实体" if chinese else "Unknown entity"
-                text = f"{entity} {item.field_name}: {item.value}{suffix}{period}."
-                if "declarative_formula" in item.tags:
-                    claims.append(
-                        Claim.create(
-                            text=text,
-                            status=ClaimStatus.INFERRED,
-                            evidence_ids=(item.evidence_id,),
-                            caveat=(
-                                "数值可复算且执行安全，但公式语义由用户或模型提供，尚未经过内置金融公式验证。"
-                                if chinese
-                                else (
-                                    "The value is reproducible and safely evaluated, but the user/model-supplied "
-                                    "formula semantics are not a built-in verified financial formula."
-                                )
-                            ),
-                        )
-                    )
-                    continue
-            elif item.source.source_type == SourceType.DOCUMENT:
-                excerpt = " ".join(item.content.split())[:360]
-                prefix = "与问题相关的文档证据表明：" if chinese else "Document evidence relevant to the query states: "
-                text = f"{prefix}{excerpt}"
-            elif item.source.source_type == SourceType.WEB:
-                excerpt = " ".join(item.content.split())[:360]
-                prefix = "搜索结果摘要显示：" if chinese else "An open-web search snippet states: "
-                text = f"{prefix}{excerpt}"
-                claims.append(
-                    Claim.create(
-                        text=text,
-                        status=ClaimStatus.INFERRED,
-                        evidence_ids=(item.evidence_id,),
-                        caveat=(
-                            "该结论仅基于搜索结果摘要，需打开原始页面或结构化一手来源复核。"
-                            if chinese
-                            else (
-                                "This is based only on a search-result snippet and requires verification against "
-                                "the original page or a structured primary source."
-                            )
-                        ),
-                    )
-                )
-                continue
-            else:
-                continue
-            claims.append(Claim.create(text=text, status=ClaimStatus.SUPPORTED, evidence_ids=(item.evidence_id,)))
-        if not claims and not bundle.evidence:
-            caveat = (
-                "该结论来自概念判断，未经检索核验。"
-                if chinese
-                else "This conclusion is a conceptual judgment and was not verified by retrieval."
-            )
-            prefix = "根据金融概念：" if chinese else "Conceptual answer: "
-            claims.append(
-                Claim.create(
-                    text=f"{prefix}{request.query[:360]}",
-                    status=ClaimStatus.INFERRED,
-                    caveat=caveat,
-                )
-            )
-        return claims
-
-
 class CoverageAssessor:
     def assess(
         self,
-        request: ResearchRequest,
+        turn: ChatTurn,
         bundle: EvidenceBundle,
         scope: ResearchScope | None = None,
     ) -> CoverageDecision:
@@ -537,7 +446,13 @@ class CoverageAssessor:
                 # 概念定义由模型自身判断，不强制检索词条。
                 continue
             candidates = self._candidates(requirement, bundle)
-            fields = {item.field_name for item in candidates if item.field_name}
+            fields = {item.field_name.casefold() for item in candidates if item.field_name}
+            if requirement.category == "calculation":
+                fields.update(
+                    str(item.source.metadata["operation"]).casefold()
+                    for item in candidates
+                    if item.source.metadata.get("operation")
+                )
             distinct_documents = {
                 item.source.metadata.get("document_id")
                 or item.source.metadata.get("corpus_record_id")
@@ -545,14 +460,13 @@ class CoverageAssessor:
                 or item.source.title
                 for item in candidates
             }
+            minimum_documents = int(requirement.parameters.get("minimum_documents", 1))
             multi_document_floor_missing = (
-                requirement.category == "document"
-                and _requests_multi_document_synthesis(request.query)
-                and len(distinct_documents) < 2
+                requirement.category == "document" and len(distinct_documents) < minimum_documents
             )
             if (
                 not candidates
-                or any(field not in fields for field in requirement.fields)
+                or any(field.casefold() not in fields for field in requirement.fields)
                 or multi_document_floor_missing
             ):
                 missing.append(requirement.key)
@@ -603,7 +517,8 @@ class CoverageAssessor:
             return [
                 item
                 for item in candidates
-                if item.source.source_type == SourceType.CALCULATION and request_id in item.tags
+                if item.source.source_type == SourceType.CALCULATION
+                and (not request_id or request_id in item.tags)
             ]
         if requirement.category == "derived_metric":
             return [
@@ -661,11 +576,26 @@ class ResearchOutcome:
 
 
 def render_report(state: ResearchState) -> str:
-    request = state.request
+    turn = state.turn
+    runtime_policy = state.runtime_policy
+    incomplete = bool(state.coverage and state.coverage.missing) or state.stop_reason in {
+        StopReason.NO_EVIDENCE,
+        StopReason.INSUFFICIENT_EVIDENCE,
+        StopReason.MAX_ITERATIONS,
+        StopReason.NO_AVAILABLE_ACTION,
+        StopReason.TOOL_BUDGET_EXHAUSTED,
+    }
     lines = [
         "# Evidence-first financial research report / 证据优先金融研究报告",
         "",
-        f"Query: {_report_text(request.query)}",
+        f"Query: {_report_text(turn.message)}",
+        "",
+        "## Answerability / 可回答性",
+        (
+            "- 当前证据不足以完整回答该问题；以下只保留已取得的材料、明确缺口和可核验内容。"
+            if incomplete
+            else "- 当前答案已达到本轮声明的证据要求。"
+        ),
         "",
         "## Research strategy / 研究策略",
     ]
@@ -725,7 +655,7 @@ def render_report(state: ResearchState) -> str:
         )
 
     lines.extend(["", "## Run controls / 运行控制"])
-    lines.append(f"- Iterations: {state.iteration}/{request.max_iterations}")
+    lines.append(f"- Iterations: {state.iteration}/{runtime_policy.max_iterations}")
     research_tool_calls = sum(
         1
         for item in state.audit_events
@@ -741,10 +671,10 @@ def render_report(state: ResearchState) -> str:
         for item in state.audit_events
         if item.get("capability") == "model.generate" and int(item.get("attempts") or 0) > 0
     )
-    lines.append(f"- Research tool calls: {research_tool_calls}/{request.max_tool_calls}")
-    lines.append(f"- Data-network attempts: {network_attempts}/{request.max_network_calls}")
-    lines.append(f"- Model calls: {model_calls}/{request.max_model_calls}")
-    lines.append(f"- Parallel tool calls per plan: {request.max_parallel_tool_calls}")
+    lines.append(f"- Research tool calls: {research_tool_calls}/{runtime_policy.max_tool_calls}")
+    lines.append(f"- Data-network attempts: {network_attempts}/{runtime_policy.max_network_calls}")
+    lines.append(f"- Model calls: {model_calls}/{runtime_policy.max_model_calls}")
+    lines.append(f"- Parallel tool calls per plan: {runtime_policy.max_parallel_tool_calls}")
     lines.append(f"- Harness audit events: {len(state.audit_events)}")
     lines.append(f"- Stop reason: {(state.stop_reason or StopReason.NO_AVAILABLE_ACTION).value}")
 
@@ -814,10 +744,6 @@ def reconcile_conflicts(bundle: EvidenceBundle, claims: Sequence[Claim]) -> list
             )
         )
     return reconciled
-
-
-def _contains_cjk(text: str) -> bool:
-    return any("\u4e00" <= character <= "\u9fff" for character in text)
 
 
 def _report_text(value: str) -> str:

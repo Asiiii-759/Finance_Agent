@@ -58,10 +58,10 @@ class PaddleOCRClientTests(unittest.TestCase):
                 transport=httpx.MockTransport(handler),
             )
             self.assertNotIn("secret", repr(client))
-            self.assertEqual(
-                client.extract_document(path),
-                {1: "# ACME\nCovenant headroom narrowed."},
-            )
+            document = client.extract_document(path)
+            self.assertEqual(document.pages, {1: "# ACME\nCovenant headroom narrowed."})
+            self.assertEqual(document.blocks[0].content, "# ACME\nCovenant headroom narrowed.")
+            self.assertEqual(document.parser_version, "PaddleOCR-VL-1.6")
 
     def test_polling_limit_fails_closed(self) -> None:
         def pending(request: httpx.Request) -> httpx.Response:
@@ -80,6 +80,59 @@ class PaddleOCRClientTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(TimeoutError, "polling limit"):
                 client.extract_document(path)
+
+    def test_structured_layout_preserves_heading_table_page_and_bbox(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(200, json={"data": {"jobId": "job-1"}})
+            if request.url.host == "paddleocr.aistudio-app.com":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "state": "done",
+                            "resultUrl": {"jsonUrl": "https://results.example.test/job.jsonl"},
+                        }
+                    },
+                )
+            layout = {
+                "markdown": {"text": "## Liquidity\n\n| Period | Cash |\n|---|---|\n| Q1 | 10 |"},
+                "prunedResult": {
+                    "parsing_res_list": [
+                        {
+                            "block_label": "paragraph_title",
+                            "block_content": "Liquidity",
+                            "block_order": 1,
+                            "block_bbox": [1, 2, 30, 12],
+                        },
+                        {
+                            "block_label": "table",
+                            "block_content": "| Period | Cash |\n|---|---|\n| Q1 | 10 |",
+                            "block_order": 2,
+                            "block_bbox": [1, 14, 80, 50],
+                        },
+                    ]
+                },
+            }
+            return httpx.Response(
+                200,
+                content=(json.dumps({"result": {"layoutParsingResults": [layout]}}) + "\n").encode(),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "structured.pdf"
+            write_stub_pdf(path)
+            document = PaddleOCRClient(
+                "secret",
+                poll_interval_seconds=0,
+                max_poll_requests=1,
+                transport=httpx.MockTransport(handler),
+            ).extract_document(path)
+
+        self.assertEqual([block.label for block in document.blocks], ["heading", "table"])
+        self.assertEqual(document.blocks[1].paragraph_title, "Liquidity")
+        self.assertEqual(document.blocks[1].page_number, 1)
+        self.assertEqual(document.blocks[1].bbox, (1.0, 14.0, 80.0, 50.0))
 
 
 if __name__ == "__main__":

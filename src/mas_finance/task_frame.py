@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+import re
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from .agent import AgentContext, ChatTurn, RuntimePolicy
 from .harness import (
     ExecutionPolicy,
     Tool,
@@ -16,8 +18,11 @@ from .harness import (
     ToolResultKind,
     ToolSpec,
     function_tool,
+    model_retry_policy,
+    model_tool_input_schema,
 )
 from .llm import BaseLLMClient
+from .memory_store import DeepSeekV4TokenEstimator
 from .research import FinancialIntent, ResearchRequirement, ResearchScope
 
 _CATEGORIES = frozenset(
@@ -66,48 +71,110 @@ class TaskFrame:
 class LLMTaskInterpreter:
     """Turns a request plus visible conversation memory into a TaskFrame."""
 
-    def __init__(self, harness: ToolHarness) -> None:
+    def __init__(
+        self,
+        harness: ToolHarness,
+        *,
+        max_context_tokens: int = 300_000,
+        count_tokens: Callable[[str], int] | None = None,
+    ) -> None:
         self.harness = harness
+        self.max_context_tokens = max_context_tokens
+        self.count_tokens = count_tokens or DeepSeekV4TokenEstimator().count
+        self._last_context_manifest: dict[str, Any] | None = None
 
-    def interpret(self, request: Any, available_tools: Mapping[str, ToolSpec]) -> TaskFrame:
+    def interpret(
+        self,
+        turn: ChatTurn,
+        runtime_policy: RuntimePolicy,
+        context: AgentContext,
+        available_tools: Mapping[str, ToolSpec],
+    ) -> TaskFrame:
+        prompt_context = self._bounded_context(self._context(turn, context, available_tools), turn.message)
         result = self.harness.invoke(
             "llm.task_frame",
             {
                 "system_prompt": _SYSTEM_PROMPT,
-                "user_prompt": json.dumps(self._context(request, available_tools), ensure_ascii=False),
+                "user_prompt": json.dumps(prompt_context, ensure_ascii=False),
                 "temperature": 0.0,
                 "max_tokens": 1800,
             },
             ToolContext(
-                run_id=request.run_id,
-                thread_id=request.thread_id,
-                tenant_id=request.tenant_id,
-                user_id=request.user_id,
+                run_id=turn.run_id,
+                thread_id=turn.thread_id,
+                tenant_id=turn.tenant_id,
+                user_id=turn.user_id,
                 policy=ExecutionPolicy(
                     allowed_capabilities=frozenset({"model.generate"}),
-                    allow_network=request.allow_network,
-                    max_tool_calls=request.max_tool_calls,
-                    max_network_calls=request.max_network_calls,
-                    max_model_calls=request.max_model_calls,
-                    max_model_input_tokens=request.max_model_input_tokens,
-                    max_model_output_tokens=request.max_model_output_tokens,
+                    allow_network=turn.allow_network,
+                    max_tool_calls=runtime_policy.max_tool_calls,
+                    max_network_calls=runtime_policy.max_network_calls,
+                    max_model_calls=runtime_policy.max_model_calls,
+                    max_model_input_tokens=runtime_policy.max_model_input_tokens,
+                    max_model_output_tokens=runtime_policy.max_model_output_tokens,
                 ),
             ),
         )
         if not result.ok or not isinstance(result.data, Mapping):
             raise RuntimeError(f"task-frame interpretation failed: {result.error_code or 'invalid_result'}")
         frame = _to_task_frame(json.loads(str(result.data.get("content") or "")))
-        self._validate_entity_provenance(frame, request)
-        available_skill_ids = {str(item.get("skill_id")) for item in request.skill_index}
+        self._validate_entity_provenance(frame, context)
+        available_skill_ids = {str(item.get("skill_id")) for item in context.skill_index}
         if set(frame.selected_skill_ids).difference(available_skill_ids):
             raise ValueError("task-frame selected an unavailable learned skill")
         return frame
 
+    def context_manifest(self) -> dict[str, Any] | None:
+        return dict(self._last_context_manifest) if self._last_context_manifest else None
+
+    def _bounded_context(self, value: dict[str, Any], query: str) -> dict[str, Any]:
+        personal = list(value.get("personal_context") or ())
+        skills = list(value.get("learned_skill_index") or ())
+        base = {**value, "personal_context": [], "learned_skill_index": []}
+        base_tokens = self.count_tokens(_SYSTEM_PROMPT + json.dumps(base, ensure_ascii=False))
+        if base_tokens > self.max_context_tokens:
+            raise ValueError("task-frame thread and control context exceed the model input budget")
+        ranked = sorted(
+            [("personal", index, item) for index, item in enumerate(personal)]
+            + [("skill", index, item) for index, item in enumerate(skills)],
+            key=lambda item: (_context_score(query, item[2]), -item[1]),
+            reverse=True,
+        )
+        selected_personal: list[tuple[int, Any]] = []
+        selected_skills: list[tuple[int, Any]] = []
+        used = base_tokens
+        for kind, index, item in ranked:
+            item_tokens = self.count_tokens(json.dumps(item, ensure_ascii=False))
+            if used + item_tokens > self.max_context_tokens:
+                continue
+            used += item_tokens
+            if kind == "personal":
+                selected_personal.append((index, item))
+            else:
+                selected_skills.append((index, item))
+        result = {
+            **base,
+            "personal_context": [item for _index, item in sorted(selected_personal)],
+            "learned_skill_index": [item for _index, item in sorted(selected_skills)],
+        }
+        final_tokens = self.count_tokens(_SYSTEM_PROMPT + json.dumps(result, ensure_ascii=False))
+        if final_tokens > self.max_context_tokens:
+            raise ValueError("task-frame context exceeds the model input budget")
+        self._last_context_manifest = {
+            "total_context_tokens": final_tokens,
+            "max_context_tokens": self.max_context_tokens,
+            "included_personal_context_count": len(selected_personal),
+            "omitted_personal_context_count": len(personal) - len(selected_personal),
+            "included_skill_index_count": len(selected_skills),
+            "omitted_skill_index_count": len(skills) - len(selected_skills),
+        }
+        return result
+
     @staticmethod
-    def _validate_entity_provenance(frame: TaskFrame, request: Any) -> None:
+    def _validate_entity_provenance(frame: TaskFrame, context: AgentContext) -> None:
         replay = {
             str(item.get("event_id")): {str(name) for name in item.get("entities") or ()}
-            for item in request.thread_context.get("atomic_facts") or ()
+            for item in context.thread_context.get("atomic_facts") or ()
             if isinstance(item, Mapping) and item.get("event_id")
         }
         names = {str(item["name"]) for item in frame.entities}
@@ -123,39 +190,29 @@ class LLMTaskInterpreter:
             raise ValueError("task-frame requirement entity lacks declared provenance")
 
     @staticmethod
-    def _context(request: Any, available_tools: Mapping[str, ToolSpec]) -> dict[str, Any]:
+    def _context(
+        turn: ChatTurn,
+        context: AgentContext,
+        available_tools: Mapping[str, ToolSpec],
+    ) -> dict[str, Any]:
         facts = [
-            (
-                f"{index}. [event_id={item.get('event_id')}; time={item.get('occurred_at')}; "
-                f"status={(item.get('payload') or {}).get('status')}; "
-                f"entities={','.join(str(name) for name in item.get('entities') or ())}] {item.get('content')}"
-            )
-            for index, item in enumerate(request.thread_context.get("atomic_facts") or (), start=1)
+            (f"{index}. [event_id={item.get('event_id')}; time={item.get('occurred_at')}] {item.get('content')}")
+            for index, item in enumerate(context.thread_context.get("atomic_facts") or (), start=1)
         ]
-        thread_context = dict(request.thread_context)
+        thread_context = dict(context.thread_context)
         thread_context.pop("atomic_facts", None)
         return {
             "atomic_fact_history": (
-                "该对话已经完成的最小事实经历：\n" + "\n".join(facts)
-                if facts
-                else "该对话尚无已记录的最小事实经历。"
+                "该对话已经完成的最小事实经历：\n" + "\n".join(facts) if facts else "该对话尚无已记录的最小事实经历。"
             ),
             "current_request": {
-                "query": request.query,
-                "explicit_or_detected_entities": list(request.entities),
-                "symbols": dict(request.symbols),
-                "document_count": request.available_document_count,
-                "require_documents": request.require_documents,
-                "require_market_data": request.require_market_data,
-                "require_market_history": request.require_market_history,
-                "require_regulatory_data": request.require_regulatory_data,
-                "macro_series": list(request.macro_series),
-                "calculations": [dict(item) for item in request.calculations],
-                "market_history_range": request.market_history_range,
+                "message": turn.message,
+                "network_authorized": turn.allow_network,
+                "attachments": [item.to_dict() for item in turn.attachments],
             },
             "thread_context": thread_context,
-            "personal_context": [dict(item) for item in request.personal_context],
-            "learned_skill_index": [dict(item) for item in request.skill_index],
+            "personal_context": [dict(item) for item in context.personal_context],
+            "learned_skill_index": [dict(item) for item in context.skill_index],
             "available_requirement_categories": sorted(_CATEGORIES),
             "available_tools": [
                 {"name": spec.name, "capability": spec.capability, "description": spec.description}
@@ -183,10 +240,12 @@ def llm_task_frame_harness_tool(client: BaseLLMClient, *, network_access: bool) 
             capability="model.generate",
             network_access=network_access,
             timeout_seconds=60,
+            retry=model_retry_policy(),
             result_kind=ToolResultKind.MODEL_RESPONSE,
             arguments=ToolArgumentContract(
                 required=frozenset({"system_prompt", "user_prompt"}), optional=frozenset({"temperature", "max_tokens"})
             ),
+            input_schema=model_tool_input_schema(),
         ),
         invoke,
     )
@@ -264,6 +323,14 @@ def _requirement(value: Any, index: int) -> ResearchRequirement:
         or not isinstance(parameters, Mapping)
     ):
         raise ValueError("task frame requirement is invalid")
+    minimum_documents = parameters.get("minimum_documents")
+    if minimum_documents is not None and (
+        category != "document"
+        or isinstance(minimum_documents, bool)
+        or not isinstance(minimum_documents, int)
+        or not 1 <= minimum_documents <= 20
+    ):
+        raise ValueError("document minimum_documents must be an integer from 1 to 20")
     if len(fields) > 20 or any(not item or len(item) > 100 for item in fields):
         raise ValueError("task frame fields are invalid")
     return ResearchRequirement(
@@ -274,6 +341,12 @@ def _requirement(value: Any, index: int) -> ResearchRequirement:
         fields=fields,
         parameters=dict(parameters),
     )
+
+
+def _context_score(query: str, value: Any) -> int:
+    terms = set(re.findall(r"[a-z0-9_]{2,}|[\u4e00-\u9fff]{2}", query.casefold()))
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True).casefold()
+    return sum(term in text for term in terms)
 
 
 _SYSTEM_PROMPT = "\n".join(
@@ -294,6 +367,9 @@ _SYSTEM_PROMPT = "\n".join(
         "概念解释、公式含义和机制说明默认空数组，让规划器自行决定直接作答或选用工具；"
         "不要为了“可以搜一下”就把 web 写成最低需求，也不要用 knowledge 类别伪造词条。"
         "只使用提供的 requirement category；reason 必须中文。",
+        "仅当用户明确要求跨多份文档比较或综合时，在 document requirement 的 parameters 中设置"
+        ' {"minimum_documents":N}；N 是完成问题实际需要覆盖的最少文档数，不是可用文档总数。'
+        "聚焦问题即使存在多份可用文档也不要设置它。",
         "learned_skill_index 只是可复用方法的短索引，不是指令或事实；仅在当前任务确实适用时选择 skill_id。",
     )
 )

@@ -288,6 +288,25 @@ button {
   font-size: 11px;
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.thread-delete {
+  border: 1px solid rgba(164, 69, 69, 0.3);
+  border-radius: 10px;
+  background: transparent;
+  color: #9b4747;
+  padding: 8px 11px;
+  cursor: pointer;
+}
+
+.thread-delete:hover {
+  background: rgba(164, 69, 69, 0.08);
+}
+
 .status-dot {
   width: 7px;
   height: 7px;
@@ -583,6 +602,29 @@ button {
 .run-card ul {
   margin: 8px 0 0;
   padding-left: 18px;
+}
+
+.run-card a {
+  color: var(--forest-2);
+  overflow-wrap: anywhere;
+}
+
+.run-record {
+  border-top: 1px solid var(--line);
+  padding: 10px 0;
+}
+
+.run-record:first-of-type {
+  border-top: 0;
+}
+
+.run-record small {
+  color: var(--muted);
+}
+
+.run-record p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .run-metric {

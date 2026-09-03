@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from llm_fixtures import llm_backed_agent, llm_research_request
+from llm_fixtures import agent_run_input, llm_backed_agent
 
 from mas_finance.harness import ToolHarness
 from mas_finance.macro import FREDEvidenceAdapter, fred_series_harness_tool
@@ -85,11 +85,8 @@ class FinancialScenarioTests(unittest.TestCase):
         harness = ToolHarness()
         harness.register(sec_company_facts_harness_tool(SECCompanyFactsAdapter(FixtureSEC())))
         outcome = llm_backed_agent(harness).run(
-            llm_research_request(
+            *agent_run_input(
                 query="比较 Apple 和 Microsoft 的净利率和盈利能力",
-                entities=("Apple", "Microsoft"),
-                symbols={"Apple": "AAPL", "Microsoft": "MSFT"},
-                require_documents=False,
                 allow_network=True,
                 run_id="scenario-profitability",
             )
@@ -110,11 +107,8 @@ class FinancialScenarioTests(unittest.TestCase):
         harness = ToolHarness()
         harness.register(market_history_harness_tool(MarketHistoryEvidenceAdapter(FixtureHistory())))
         outcome = llm_backed_agent(harness).run(
-            llm_research_request(
+            *agent_run_input(
                 query="Alpha过去1年的收益率、波动率和最大回撤是多少？",
-                entities=("Alpha",),
-                symbols={"Alpha": "ALPHA"},
-                require_documents=False,
                 allow_network=True,
                 run_id="scenario-risk",
             )
@@ -139,11 +133,8 @@ class FinancialScenarioTests(unittest.TestCase):
         harness = ToolHarness()
         harness.register(market_history_harness_tool(MarketHistoryEvidenceAdapter(UnadjustedHistory())))
         outcome = llm_backed_agent(harness).run(
-            llm_research_request(
+            *agent_run_input(
                 query="Alpha过去1年的收益率和最大回撤是多少？",
-                entities=("Alpha",),
-                symbols={"Alpha": "ALPHA"},
-                require_documents=False,
                 allow_network=True,
                 run_id="scenario-unadjusted-risk",
             )
@@ -155,9 +146,8 @@ class FinancialScenarioTests(unittest.TestCase):
         harness = ToolHarness()
         harness.register(fred_series_harness_tool(FREDEvidenceAdapter(FixtureFRED())))
         outcome = llm_backed_agent(harness).run(
-            llm_research_request(
+            *agent_run_input(
                 query="美国失业率目前是多少？",
-                require_documents=False,
                 allow_network=True,
                 run_id="scenario-macro",
             )

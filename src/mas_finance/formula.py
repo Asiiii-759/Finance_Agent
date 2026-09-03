@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from .contracts import Evidence, EvidenceBundle, SourceRef, SourceType, stable_id
-from .harness import Tool, ToolArgumentContract, ToolResultKind, ToolSpec, function_tool
+from .harness import Tool, ToolArgumentContract, ToolExecutionError, ToolResultKind, ToolSpec, function_tool
 
 _BINARY_OPERATORS: dict[type[ast.operator], Callable[[float, float], float]] = {
     ast.Add: lambda left, right: left + right,
@@ -60,23 +60,30 @@ def evaluate_formula(expression: str, inputs: Mapping[str, Any]) -> float:
 
 def formula_harness_tool() -> Tool:
     def invoke(arguments: Mapping[str, Any], _context: Any) -> dict[str, Any]:
-        expression = arguments.get("expression")
-        inputs = arguments.get("inputs")
-        label = arguments.get("label", "custom_formula")
-        unit = arguments.get("unit", "unspecified")
-        entity = arguments.get("entity")
-        period = arguments.get("period")
-        if not isinstance(expression, str) or not isinstance(inputs, Mapping):
-            raise ValueError("formula expression and inputs have invalid types")
-        for name, value, limit in (
-            ("label", label, 100),
-            ("unit", unit, 50),
-            ("entity", entity, 200),
-            ("period", period, 100),
-        ):
-            if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > limit):
-                raise ValueError(f"formula {name} is invalid")
-        result = evaluate_formula(expression, inputs)
+        try:
+            expression = arguments.get("expression")
+            inputs = arguments.get("inputs")
+            label = arguments.get("label", "custom_formula")
+            unit = arguments.get("unit", "unspecified")
+            entity = arguments.get("entity")
+            period = arguments.get("period")
+            if not isinstance(expression, str) or not isinstance(inputs, Mapping):
+                raise ValueError("formula expression and inputs have invalid types")
+            for name, value, limit in (
+                ("label", label, 100),
+                ("unit", unit, 50),
+                ("entity", entity, 200),
+                ("period", period, 100),
+            ):
+                if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > limit):
+                    raise ValueError(f"formula {name} is invalid")
+            result = evaluate_formula(expression, inputs)
+        except ValueError as exc:
+            raise ToolExecutionError(
+                "invalid_formula",
+                str(exc),
+                details={"model_action": "change_arguments"},
+            ) from exc
         request_id = stable_id(
             "formula",
             {"expression": expression, "inputs": dict(inputs), "label": label, "unit": unit, "entity": entity},
@@ -139,6 +146,25 @@ def formula_harness_tool() -> Tool:
                 optional=frozenset({"label", "unit", "entity", "period"}),
                 max_serialized_characters=20_000,
             ),
+            input_schema={
+                "type": "object",
+                "required": ["expression", "inputs"],
+                "additionalProperties": False,
+                "properties": {
+                    "expression": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "inputs": {
+                        "type": "object",
+                        "minProperties": 1,
+                        "maxProperties": 30,
+                        "propertyNames": {"pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"},
+                        "additionalProperties": {"type": "number"},
+                    },
+                    "label": {"type": "string", "minLength": 1, "maxLength": 100},
+                    "unit": {"type": "string", "minLength": 1, "maxLength": 50},
+                    "entity": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "period": {"type": "string", "minLength": 1, "maxLength": 100},
+                },
+            },
         ),
         invoke,
     )

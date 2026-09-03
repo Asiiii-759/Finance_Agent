@@ -3,9 +3,8 @@ from __future__ import annotations
 import json
 import unittest
 
-from llm_fixtures import llm_backed_agent
+from llm_fixtures import agent_run_input, llm_backed_agent
 
-from mas_finance.agent import ResearchRequest
 from mas_finance.formula import evaluate_formula, formula_harness_tool
 from mas_finance.harness import ExecutionPolicy, ToolContext, ToolHarness
 from mas_finance.llm import BaseLLMClient
@@ -37,11 +36,9 @@ class DeclarativeFormulaTests(unittest.TestCase):
         harness = ToolHarness()
         harness.register(formula_harness_tool())
         harness.register(llm_planning_harness_tool(FormulaPlanningLLM(), network_access=False))
-        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness)).run(
-            ResearchRequest(
+        outcome = llm_backed_agent(harness, planner=ModelPlanner(harness, count_tokens=len)).run(
+            *agent_run_input(
                 query="Calculate ACME gross margin using (revenue-cost)/revenue.",
-                require_documents=False,
-                require_market_data=False,
                 max_iterations=1,
                 max_model_calls=4,
                 run_id="formula-planning",

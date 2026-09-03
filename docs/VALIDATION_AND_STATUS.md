@@ -29,7 +29,7 @@
 - 研究工具、数据 provider attempts、模型调用独立预算；恢复时 denied 调用不误计预算。
 - PaddleOCR 结构化 request/session/personal corpus：heading/text/table/chart、1024/256 token 分块、BM25 + embedding/cosine/RRF、0.50 向量 abstention、重叠块坐标合并与 provider-neutral adapter。
 - lexical 与 hybrid 拆为独立 ToolSpec：模型自主选择，网络属性在调用前可判定，未配置 embedding/reranker 时不伪装能力；提供受限 OpenAI-compatible HTTPS embedding client。
-- PDF 解析收敛到 PaddleOCR-VL-1.6 或部署注入的成熟 PDF 解析 MCP；无本地 PyMuPDF fallback。PaddleOCR 整文档单次提交、有限轮询、结构化版面 block、结果字节上限且不下载图片。
+- PDF 解析收敛到 PaddleOCR-VL-1.6 或部署注入的成熟 PDF 解析 MCP；无本地 PyMuPDF fallback。PaddleOCR 整文档单次提交、有限轮询、结构化版面 block、结果字节上限且不下载图片；状态轮询和结果 GET 的瞬时错误有限重试，创建 Job 的 POST 因无幂等保证不自动重试。
 - 部署期可注入多个内部/外部 `RetrievalSource`；固定 ACL filters、主备规划和受控 HTTPS JSON gateway。
 - provider-neutral `web.search` 与 Bocha/Brave adapters：模型控制 query、freshness 和域名范围；域名
   allowlist 在响应边界强制执行；canonical URL/内容去重、公开域名校验、来源分散度和 snippet 推断降级。
@@ -66,15 +66,18 @@
 
 ```text
 7 enterprise black-box scenarios defined
-216 tests collected；默认全量 213 passed / 3 live skipped
-3 个受控 DeepSeek live 场景单独启用后通过
+228 tests collected；默认全量 224 passed / 4 live skipped
+3 个受控 DeepSeek Agent 场景和 1 个真实记忆场景单独启用后通过
 Ruff passed for src/tests
 mypy passed for all 50 source files
 compileall passed
 QuickJS compiled the packaged frontend script successfully
 Real DeepSeek planner selected authorized catalog tools; conceptual questions may finish without retrieval
 Real DeepSeek selected corpus.hybrid_search first for a semantic-only PDF query; cross-checked lexical, deduplicated one Evidence, succeeded in 5 model calls
-Bocha raw API and project EvidenceBundle path both returned two results; deepseek-v4-pro short live call succeeded
+FRED `UNRATE` 真实 Harness 路径一次成功并生成 4 条 Evidence；Bocha 真实 Harness 路径一次成功并生成 2 条 Evidence
+PaddleOCR-VL-1.6 真实提交并解析一页 PDF，返回 1 页/1 block
+SEC EDGAR 从当前执行环境真实返回 HTTP 403；现已稳定映射为 `provider_access_denied`、attempts=1、`report_unavailable`
+真实 DeepSeek 原子事实提取未吸收 Tool/Assistant 内部内容；对话摘要保留“最大回撤改为波动率”的用户纠正
 Compose YAML parsed successfully; Docker CLI was unavailable, so no image-build claim is made
 PEP 517 sdist/wheel built with isolated build requirements; packaged HTML/CSS/JS present; 2.2.0 wheel imported and created the API from a clean temporary target
 ```
@@ -83,6 +86,11 @@ PEP 517 sdist/wheel built with isolated build requirements; packaged HTML/CSS/JS
 `llm.task_frame`、`llm.plan`、`llm.synthesize` 仅对 HTTP 429/5xx 和传输错误最多重试一次；HTTP 400、
 响应 JSON/正文契约错误不会重试。故障注入验证 500→成功共两次 attempt；概念题、CAGR 确定性计算题，以及受控行情工具
 返回 `unknown_symbol + suggested_symbol + change_arguments` 后由模型改参重试的场景，均执行真实 DeepSeek 全链路并通过。
+
+2026-09-03 的 Provider 复测补充了六个 HTTP 故障注入场景：FRED/SEC 的 503 可恢复、403 不重试；Bocha 的 500
+可恢复、403 不重试。PaddleOCR 另覆盖轮询 503/连接失败、结果下载 503 和非幂等 Job POST 的 503/连接失败。真实 FRED、Bocha、PaddleOCR
+成功；官方 SEC EDGAR 因当前执行出口被 403 拒绝，证明了错误契约但没有证明成功取数。`.env` 中的 `SEC_API_KEY`
+尚未接入任何客户端，也未在本次测试中消耗；必须确认供应商文档后才能实现和验证。
 
 完整评测设计、发现问题、外部数据源判断和上线门槛见本文第 2 章。
 

@@ -30,6 +30,7 @@ Draft 2020-12 JSON Schema。Schema 同时用于模型选择说明和执行前校
 
 - `change_arguments`：字段、类型、缺失值、allowed values 或候选 symbol 已给出；
 - `choose_alternative_tool`：供应商或工具内部失败，换来源；
+- `report_unavailable`：凭据、供应商访问策略或部署环境拒绝，停止重复调用并向用户说明；
 - `request_authorization`：缺少联网或未来副作用审批；
 - `stop_and_report`：部署凭据缺失等不可由本轮参数解决的问题。
 
@@ -38,7 +39,9 @@ Draft 2020-12 JSON Schema。Schema 同时用于模型选择说明和执行前校
 ## 4. 重试边界
 
 - 自动重试只允许 read-only 工具；
-- web/RAG/FRED/SEC 的 transport timeout/connection 通常最多两次；
+- web/RAG/FRED/SEC 的 429、5xx、transport timeout/connection 通常最多两次；
+- FRED/SEC/Bocha 的 401/403 返回 `provider_access_denied + report_unavailable`，不重试；
+- PaddleOCR 状态轮询与结果 GET 可有限重试；创建 Job 的 POST 没有幂等键，因此不自动重试；
 - DeepSeek 429/5xx/transport 最多重试一次；
 - 普通 HTTP 4xx、Schema 错误、空结果和 `ToolExecutionError` 不盲重试；
 - MCP 绑定工具默认一次，结构化错误交给下一轮 Planner 改参；

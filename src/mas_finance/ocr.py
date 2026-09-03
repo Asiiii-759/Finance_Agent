@@ -68,21 +68,26 @@ class PaddleOCRClient:
             transport=self.transport,
             headers=headers,
         ) as client:
-            response = client.post(
-                self.job_url,
-                data={
-                    "model": self.model,
-                    "optionalPayload": json.dumps(
-                        {
-                            "useDocOrientationClassify": False,
-                            "useDocUnwarping": False,
-                            "useChartRecognition": False,
-                        }
-                    ),
-                },
-                files={"file": (file_path.name, content, "application/pdf")},
-            )
-            response.raise_for_status()
+            try:
+                response = client.post(
+                    self.job_url,
+                    data={
+                        "model": self.model,
+                        "optionalPayload": json.dumps(
+                            {
+                                "useDocOrientationClassify": False,
+                                "useDocUnwarping": False,
+                                "useChartRecognition": False,
+                            }
+                        ),
+                    },
+                    files={"file": (file_path.name, content, "application/pdf")},
+                )
+            except httpx.TransportError as exc:
+                raise ConnectionError(
+                    "PaddleOCR submission transport failed; job submission was not retried because it is not idempotent"
+                ) from exc
+            _raise_for_provider_status(response, "PaddleOCR submission", transient_retryable=False)
             job_id = _job_id(response)
             result_url = self._poll(client, job_id)
         # Result objects commonly live on a different signed storage host.
@@ -92,14 +97,32 @@ class PaddleOCRClient:
             follow_redirects=False,
             transport=self.transport,
         ) as result_client:
-            raw_result = _bounded_get(result_client, result_url, self.max_result_bytes)
+            raw_result: bytes | None = None
+            for attempt in range(2):
+                try:
+                    raw_result = _bounded_get(result_client, result_url, self.max_result_bytes)
+                    break
+                except ConnectionError:
+                    if attempt == 1:
+                        raise
+                    if self.poll_interval_seconds:
+                        time.sleep(self.poll_interval_seconds)
+            if raw_result is None:
+                raise AssertionError("unreachable")
         return _parse_document(raw_result, self.max_pages, self.model)
 
     def _poll(self, client: httpx.Client, job_id: str) -> str:
         status_url = f"{self.job_url.rstrip('/')}/{job_id}"
         for attempt in range(self.max_poll_requests):
-            response = client.get(status_url)
-            response.raise_for_status()
+            try:
+                response = client.get(status_url)
+                _raise_for_provider_status(response, "PaddleOCR status", transient_retryable=True)
+            except (ConnectionError, httpx.TransportError) as exc:
+                if attempt + 1 >= self.max_poll_requests:
+                    raise ConnectionError("PaddleOCR status polling remained unavailable") from exc
+                if self.poll_interval_seconds:
+                    time.sleep(self.poll_interval_seconds)
+                continue
             data = _response_data(response, "PaddleOCR status")
             state = data.get("state")
             if state == "done":
@@ -140,16 +163,35 @@ def _response_data(response: httpx.Response, label: str) -> Mapping[str, Any]:
 
 
 def _bounded_get(client: httpx.Client, url: str, limit: int) -> bytes:
-    with client.stream("GET", url) as response:
-        response.raise_for_status()
-        chunks: list[bytes] = []
-        total = 0
-        for chunk in response.iter_bytes():
-            total += len(chunk)
-            if total > limit:
-                raise ValueError("PaddleOCR JSONL result exceeds the byte limit")
-            chunks.append(chunk)
+    try:
+        with client.stream("GET", url) as response:
+            _raise_for_provider_status(response, "PaddleOCR result", transient_retryable=True)
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_bytes():
+                total += len(chunk)
+                if total > limit:
+                    raise ValueError("PaddleOCR JSONL result exceeds the byte limit")
+                chunks.append(chunk)
+    except httpx.TransportError as exc:
+        raise ConnectionError("PaddleOCR result download transport failed") from exc
     return b"".join(chunks)
+
+
+def _raise_for_provider_status(
+    response: httpx.Response,
+    label: str,
+    *,
+    transient_retryable: bool,
+) -> None:
+    if response.status_code == 429 or response.status_code >= 500:
+        suffix = "" if transient_retryable else "; job submission was not retried because it is not idempotent"
+        raise ConnectionError(f"{label} transient HTTP status: {response.status_code}{suffix}")
+    if response.status_code in {401, 403}:
+        raise PermissionError(f"{label} access denied with HTTP {response.status_code}")
+    if 400 <= response.status_code < 500:
+        raise ValueError(f"{label} rejected the request with HTTP {response.status_code}")
+    response.raise_for_status()
 
 
 def _parse_document(raw: bytes, max_pages: int, model: str) -> ParsedDocument:

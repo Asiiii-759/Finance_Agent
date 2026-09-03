@@ -142,6 +142,8 @@ provider-neutral `web.search`，使模型能自主产生检索式和时效范围
 | HAR-12 | ValueError/网络异常都退化成模糊错误 | 模型无法判断改参、重试还是换工具 | 稳定错误码与 `model_action`；MCP 保留字段、候选、JSON-RPC code 和 retryability | Harness/MCP error tests | 已解决 |
 | HAR-13 | 行情 MCP 吞掉网络异常并返回空数据 | Planner 把供应商故障误作事实性无数据 | 显式 symbol；传输异常向 Harness 传播，参数/配置/瞬时/无效响应分型 | extmarket fault test | 已解决 |
 | HAR-14 | 模型供应商偶发 5xx 会直接终止整个 run | 模型阶段没有声明瞬时故障策略，真实计算验收在第二次规划处暴露该边界 | 仅将模型 HTTP 429/5xx 与 transport error 映射为 `ConnectionError`，模型工具最多重试一次；普通 4xx 和坏响应继续快速失败 | MockTransport 500→成功、400/transport 边界 + 三条 DeepSeek live | 已解决 |
+| HAR-15 | Provider 401/403 被归为 `tool_internal_error`，Bocha 5xx 不会重试 | HTTP 状态没有在进入 Harness 前分为瞬时与永久错误 | FRED/SEC/Bocha 将 429/5xx 映射为可重试连接错误，将 401/403 映射为 `provider_access_denied + report_unavailable` | 六个 Provider HTTP 故障注入 + 真实 SEC 403 | 已解决 |
+| HAR-16 | OCR 所有 HTTP 阶段都依赖一次请求 | 状态轮询、结果下载和创建 Job 的幂等性不同 | GET 阶段的瞬时 HTTP/transport 错误有限重试；没有幂等键的 Job POST 快速失败，避免重复任务和费用 | poll 503/连接失败、result 503 恢复、submission 503/连接失败单次测试 + PaddleOCR live | 已解决 |
 
 ### 4.4 证据、引用与冲突
 

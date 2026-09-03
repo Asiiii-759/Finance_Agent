@@ -18,6 +18,7 @@ from .harness import (
     RetryPolicy,
     Tool,
     ToolArgumentContract,
+    ToolExecutionError,
     ToolResultKind,
     ToolSpec,
     function_tool,
@@ -47,6 +48,7 @@ class FREDClient:
         timeout_seconds: float = 30.0,
         rate_limiter: RateLimiter | None = None,
         rate_limit: RateLimit | None = None,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         if not api_key.strip():
             raise ValueError("FRED API key is required")
@@ -55,6 +57,7 @@ class FREDClient:
         self.timeout_seconds = timeout_seconds
         self.rate_limiter = rate_limiter
         self.rate_limit = rate_limit or RateLimit(8)
+        self.transport = transport
 
     def fetch_series(
         self,
@@ -79,14 +82,41 @@ class FREDClient:
             observation_params["observation_start"] = _validate_date(observation_start)
         if observation_end:
             observation_params["observation_end"] = _validate_date(observation_end)
-        with httpx.Client(timeout=self.timeout_seconds) as client:
+        with httpx.Client(timeout=self.timeout_seconds, transport=self.transport) as client:
             series_response = client.get(f"{self.base_url}/fred/series", params=common)
             if series_response.status_code == 429 or series_response.status_code >= 500:
                 raise ConnectionError(f"FRED transient HTTP status: {series_response.status_code}")
+            if series_response.status_code in {401, 403}:
+                raise ToolExecutionError(
+                    "provider_access_denied",
+                    f"FRED denied the request with HTTP {series_response.status_code}",
+                    details={"http_status": series_response.status_code, "model_action": "report_unavailable"},
+                )
+            if 400 <= series_response.status_code < 500:
+                raise ToolExecutionError(
+                    "provider_request_rejected",
+                    f"FRED rejected the request with HTTP {series_response.status_code}",
+                    details={"http_status": series_response.status_code, "model_action": "choose_alternative_tool"},
+                )
             series_response.raise_for_status()
             observations_response = client.get(f"{self.base_url}/fred/series/observations", params=observation_params)
             if observations_response.status_code == 429 or observations_response.status_code >= 500:
                 raise ConnectionError(f"FRED transient HTTP status: {observations_response.status_code}")
+            if observations_response.status_code in {401, 403}:
+                raise ToolExecutionError(
+                    "provider_access_denied",
+                    f"FRED denied the request with HTTP {observations_response.status_code}",
+                    details={"http_status": observations_response.status_code, "model_action": "report_unavailable"},
+                )
+            if 400 <= observations_response.status_code < 500:
+                raise ToolExecutionError(
+                    "provider_request_rejected",
+                    f"FRED rejected the request with HTTP {observations_response.status_code}",
+                    details={
+                        "http_status": observations_response.status_code,
+                        "model_action": "choose_alternative_tool",
+                    },
+                )
             observations_response.raise_for_status()
         series_payload = series_response.json()
         observations_payload = observations_response.json()

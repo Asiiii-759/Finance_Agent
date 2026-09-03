@@ -9,7 +9,7 @@ from llm_fixtures import NullPlanner, ScriptedLLM, agent_run_input, llm_backed_a
 from mas_finance.adequacy import LLMEvidenceAdequacyChecker, llm_evidence_adequacy_harness_tool
 from mas_finance.agent import ChatTurn, CoverageAssessor
 from mas_finance.contracts import EvidenceBundle
-from mas_finance.harness import ExecutionPolicy, ToolContext, ToolHarness
+from mas_finance.harness import ExecutionPolicy, ToolContext, ToolExecutionError, ToolHarness
 from mas_finance.metrics import financial_calculation_harness_tool
 from mas_finance.planning import ModelPlanner, llm_planning_harness_tool
 from mas_finance.research import FinancialIntent, ResearchRequirement, ResearchScope
@@ -95,9 +95,7 @@ class GraphAutonomyTests(unittest.TestCase):
             [item["tool_name"] for item in outcome.audit_events],
             ["llm.task_frame", "llm.plan", "finance.calculate", "llm.plan", "llm.synthesize"],
         )
-        planning_manifest = next(
-            item for item in outcome.state.context_manifests if item["phase"] == "planning"
-        )
+        planning_manifest = next(item for item in outcome.state.context_manifests if item["phase"] == "planning")
         self.assertIn("金融研究 Agent", llm.system_prompts[0])
         self.assertLessEqual(
             planning_manifest["evidence_tokens"],
@@ -502,9 +500,7 @@ class GraphAutonomyTests(unittest.TestCase):
         self.assertNotIn("utm_", evidence["source"]["locator"])
         self.assertNotIn("#top", evidence["source"]["locator"])
 
-        bundle = WebSearchEvidenceAdapter(DuplicateSearch()).search(
-            {"query": "ACME liquidity", "count": 5}
-        )["bundle"]
+        bundle = WebSearchEvidenceAdapter(DuplicateSearch()).search({"query": "ACME liquidity", "count": 5})["bundle"]
         turn = ChatTurn(message="What changed in ACME liquidity this week?")
         decision = CoverageAssessor().assess(
             turn,
@@ -606,9 +602,7 @@ class GraphAutonomyTests(unittest.TestCase):
             )
 
         client = BraveWebSearchClient("test-key", transport=httpx.MockTransport(handler))
-        result = client.search_json(
-            {"query": "ACME results", "count": 3, "freshness": "pw", "domains": ["sec.gov"]}
-        )
+        result = client.search_json({"query": "ACME results", "count": 3, "freshness": "pw", "domains": ["sec.gov"]})
         self.assertEqual(result["results"][0]["url"], "https://example.com/result")
 
     def test_bocha_client_uses_fixed_origin_maps_freshness_and_normalizes_results(self) -> None:
@@ -645,9 +639,7 @@ class GraphAutonomyTests(unittest.TestCase):
             )
 
         client = BochaWebSearchClient("test-key", transport=httpx.MockTransport(handler))
-        result = client.search_json(
-            {"query": "ACME results", "count": 3, "freshness": "pw", "domains": ["sec.gov"]}
-        )
+        result = client.search_json({"query": "ACME results", "count": 3, "freshness": "pw", "domains": ["sec.gov"]})
         self.assertEqual(result["results"][0]["url"], "https://example.com/result")
         self.assertEqual(result["results"][0]["published_at"], "2026-08-11T00:00:00+00:00")
 
@@ -662,8 +654,9 @@ class GraphAutonomyTests(unittest.TestCase):
                 )
             ),
         )
-        with self.assertRaisesRegex(ValueError, "API error"):
+        with self.assertRaises(ToolExecutionError) as raised:
             client.search_json({"query": "ACME"})
+        self.assertEqual(raised.exception.code, "provider_access_denied")
 
     def test_web_search_retries_one_http_transport_failure(self) -> None:
         attempts = 0
@@ -707,9 +700,7 @@ class GraphAutonomyTests(unittest.TestCase):
 
             def search_json(self, payload):
                 return {
-                    "results": [
-                        {"title": "Private", "url": "http://127.0.0.1/admin", "description": "Do not trust."}
-                    ]
+                    "results": [{"title": "Private", "url": "http://127.0.0.1/admin", "description": "Do not trust."}]
                 }
 
         with self.assertRaisesRegex(ValueError, "result URL is invalid"):

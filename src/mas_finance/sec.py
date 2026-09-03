@@ -15,6 +15,7 @@ from .harness import (
     RetryPolicy,
     Tool,
     ToolArgumentContract,
+    ToolExecutionError,
     ToolResultKind,
     ToolSpec,
     function_tool,
@@ -47,26 +48,28 @@ class SECCompanyFactsClient:
         *,
         timeout_seconds: float = 30.0,
         minimum_request_interval: float = 0.12,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         if not user_agent.strip() or "@" not in user_agent:
             raise ValueError("SEC user agent must identify an organization and contact email")
         self.user_agent = user_agent.strip()
         self.timeout_seconds = timeout_seconds
         self.minimum_request_interval = minimum_request_interval
+        self.transport = transport
         self._ticker_ciks: dict[str, int] | None = None
         self._last_request = 0.0
         self._lock = threading.RLock()
 
     def fetch_company_facts(self, symbol: str) -> Mapping[str, Any]:
         headers = {"User-Agent": self.user_agent, "Accept-Encoding": "gzip, deflate"}
-        with httpx.Client(timeout=self.timeout_seconds, headers=headers) as client:
+        with httpx.Client(timeout=self.timeout_seconds, headers=headers, transport=self.transport) as client:
             cik = self._resolve_cik(client, symbol)
             response = self._get(client, f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json")
             return response.json()
 
     def fetch_recent_filings(self, symbol: str) -> Mapping[str, Any]:
         headers = {"User-Agent": self.user_agent, "Accept-Encoding": "gzip, deflate"}
-        with httpx.Client(timeout=self.timeout_seconds, headers=headers) as client:
+        with httpx.Client(timeout=self.timeout_seconds, headers=headers, transport=self.transport) as client:
             cik = self._resolve_cik(client, symbol)
             response = self._get(client, f"https://data.sec.gov/submissions/CIK{cik:010d}.json")
             return response.json()
@@ -90,6 +93,18 @@ class SECCompanyFactsClient:
             self._last_request = time.monotonic()
         if response.status_code == 429 or response.status_code >= 500:
             raise ConnectionError(f"SEC transient HTTP status: {response.status_code}")
+        if response.status_code in {401, 403}:
+            raise ToolExecutionError(
+                "provider_access_denied",
+                f"SEC EDGAR denied the request with HTTP {response.status_code}",
+                details={"http_status": response.status_code, "model_action": "report_unavailable"},
+            )
+        if 400 <= response.status_code < 500:
+            raise ToolExecutionError(
+                "provider_request_rejected",
+                f"SEC EDGAR rejected the request with HTTP {response.status_code}",
+                details={"http_status": response.status_code, "model_action": "choose_alternative_tool"},
+            )
         response.raise_for_status()
         return response
 

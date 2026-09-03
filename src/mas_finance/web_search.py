@@ -14,6 +14,7 @@ from .harness import (
     RetryPolicy,
     Tool,
     ToolArgumentContract,
+    ToolExecutionError,
     ToolResultKind,
     ToolSpec,
     function_tool,
@@ -77,6 +78,20 @@ class BraveWebSearchClient:
                     "Accept": "application/json",
                     "X-Subscription-Token": self.api_key,
                 },
+            )
+        if response.status_code == 429 or response.status_code >= 500:
+            raise ConnectionError(f"Brave Search transient HTTP status: {response.status_code}")
+        if response.status_code in {401, 403}:
+            raise ToolExecutionError(
+                "provider_access_denied",
+                f"Brave Search denied the request with HTTP {response.status_code}",
+                details={"http_status": response.status_code, "model_action": "report_unavailable"},
+            )
+        if 400 <= response.status_code < 500:
+            raise ToolExecutionError(
+                "provider_request_rejected",
+                f"Brave Search rejected the request with HTTP {response.status_code}",
+                details={"http_status": response.status_code, "model_action": "choose_alternative_tool"},
             )
         response.raise_for_status()
         if "json" not in response.headers.get("content-type", "").casefold():
@@ -159,14 +174,43 @@ class BochaWebSearchClient:
                 },
                 json=request_body,
             )
+        if response.status_code == 429 or response.status_code >= 500:
+            raise ConnectionError(f"Bocha Search transient HTTP status: {response.status_code}")
+        if response.status_code in {401, 403}:
+            raise ToolExecutionError(
+                "provider_access_denied",
+                f"Bocha Search denied the request with HTTP {response.status_code}",
+                details={"http_status": response.status_code, "model_action": "report_unavailable"},
+            )
+        if 400 <= response.status_code < 500:
+            raise ToolExecutionError(
+                "provider_request_rejected",
+                f"Bocha Search rejected the request with HTTP {response.status_code}",
+                details={"http_status": response.status_code, "model_action": "choose_alternative_tool"},
+            )
         response.raise_for_status()
         if "json" not in response.headers.get("content-type", "").casefold():
             raise ValueError("Bocha Search response must be JSON")
         if len(response.content) > 5_000_000:
             raise ValueError("Bocha Search response exceeds the byte limit")
         value = response.json()
-        if not isinstance(value, Mapping) or value.get("code") != 200:
-            raise ValueError("Bocha Search response indicates an API error")
+        if not isinstance(value, Mapping):
+            raise ValueError("Bocha Search response must be an object")
+        code = value.get("code")
+        if code in {401, 403}:
+            raise ToolExecutionError(
+                "provider_access_denied",
+                f"Bocha Search response indicates access denial code {code}",
+                details={"provider_code": code, "model_action": "report_unavailable"},
+            )
+        if code == 429 or isinstance(code, int) and code >= 500:
+            raise ConnectionError(f"Bocha Search transient provider code: {code}")
+        if code != 200:
+            raise ToolExecutionError(
+                "provider_request_rejected",
+                f"Bocha Search response indicates provider code {code}",
+                details={"provider_code": code, "model_action": "choose_alternative_tool"},
+            )
         data = value.get("data")
         web_pages = data.get("webPages") if isinstance(data, Mapping) else None
         raw_results = web_pages.get("value") if isinstance(web_pages, Mapping) else None
